@@ -1,0 +1,100 @@
+# Continuous integration: run the local verification battery this project
+# checks with -- ruff check, ruff format --check, mypy, pytest -- unchanged
+# and in the same order, on every push to `main` and every PR targeting it.
+#
+# Shape and action pins copied from jarrah-rehab's
+# `.github/workflows/test.yml` (this project's code ancestor; see CLAUDE.md's
+# port notes), with the jarrah-specific pieces that do not apply to this repo
+# left out rather than carried over unused:
+#
+#   - No `--extra geo` on `uv sync`. jarrah-rehab splits its heavy geospatial
+#     stack into an optional `geo` extra that most of its test suite needs to
+#     even collect; this project's pyproject.toml has no extras at all --
+#     geopandas, shapely, pyarrow etc. are unconditional dependencies -- so a
+#     plain `uv sync --locked` already installs everything the suite imports.
+#   - No PROJ transformation-grid fetch step. That step exists in jarrah-rehab
+#     because one of its own tests exercises a specific CRS transformation
+#     (EPSG:20350 -> EPSG:3577) that silently downgrades to a lower-accuracy
+#     route without a particular grid file present. This project has no such
+#     test yet; a grid-fetch step here would run against a nonexistent
+#     `scripts/fetch_proj_grids.py` and do nothing. Add it if/when a test here
+#     ever depends on a specific PROJ grid being available.
+#   - No `build/**` / `research/**` branch triggers. jarrah-rehab gates its
+#     working-branch namespaces because work reaches `main` through them; this
+#     task's brief specifies push-to-main and PRs-to-main only.
+#   - No CD/deploy workflow alongside this one -- not planned for this repo.
+#
+# Also unchanged from jarrah-rehab's reasoning: both actions are pinned to a
+# full commit SHA rather than a tag (a tag is mutable and can be repointed
+# after review), the job is pinned to `ubuntu-24.04` rather than
+# `ubuntu-latest` (which silently moves between major releases), and
+# `permissions: contents: read` because this job only reads the tree -- it
+# publishes, comments and tags nothing.
+
+name: tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: ruff, mypy, pytest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out the repository
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install uv and Python
+        # astral-sh/setup-uv v9.0.0
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          # Pinned to the version used locally. Left unset, the action resolves
+          # to whatever uv is current, which makes the resolver a moving part.
+          version: "0.9.29"
+          # pyproject.toml declares `requires-python = ">=3.12"` and
+          # `.python-version` pins "3.12"; match that series here rather than
+          # a floating "3.x" so CI tests the same interpreter this project
+          # develops against.
+          python-version: "3.12"
+          # The action's own default is "auto", which turns caching ON for
+          # GitHub-hosted runners. Set explicitly so the choice is visible: a
+          # restored cache is state carried between runs, and this workflow is
+          # meant to prove the tree builds from the lockfile alone.
+          enable-cache: false
+
+      # `--locked` fails the run if uv.lock is out of date with
+      # pyproject.toml rather than quietly re-resolving, so CI tests the
+      # pinned dependency set and a forgotten re-lock surfaces here instead
+      # of as drift.
+      - name: Install the project
+        run: uv sync --locked
+
+      # `--no-sync` on every command below: `uv run` otherwise reconciles the
+      # environment against the flags given on ITS OWN command line, so a
+      # plain `uv run pytest` after `uv sync --locked` is entitled to
+      # re-resolve the environment it was just given. Whether it does is a
+      # property of the uv version in use, not something to depend on.
+      - name: ruff check
+        run: uv run --no-sync ruff check src tests
+
+      - name: ruff format --check
+        run: uv run --no-sync ruff format --check src tests
+
+      - name: mypy
+        run: uv run --no-sync mypy src scripts
+
+      # `-rs` names every skipped test and its reason, so a disappearing
+      # check reads as a named skip rather than as a quiet drop in count.
+      - name: pytest
+        run: uv run --no-sync pytest -q -rs

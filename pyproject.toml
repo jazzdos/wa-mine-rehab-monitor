@@ -1,0 +1,56 @@
+[project]
+name = "wa-mine-monitor"
+version = "0.1.0"
+description = "WA Mine Rehabilitation Spectral Monitor - descriptive spectral chronologies for MINEDEX sites in the monitoring frame"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "typer>=0.12",
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "pyarrow>=16.0",
+    "pandas>=2.2",
+    "geopandas>=1.0",
+    "shapely>=2.0",
+    "duckdb>=1.0",
+    "requests>=2.32",
+    "pyproj>=3.6",
+]
+
+[project.scripts]
+wa-mine-monitor = "wa_mine_monitor.cli:app"
+
+[dependency-groups]
+dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.11", "types-requests", "types-PyYAML"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wa_mine_monitor"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = false
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+# pandas ships no py.typed marker mypy will resolve without stubs installed,
+# and pyarrow ships neither stubs nor a py.typed marker. Both are
+# unconditional project dependencies (not an optional extra), imported by
+# `export_gate.py` and `tables.py`. Same treatment jarrah-rehab (this
+# project's code ancestor) uses for the identical pair. geopandas and
+# pyogrio (its default I/O backend) carry the identical gap -- neither ships
+# a py.typed marker -- and are imported by `sources/tenements.py`. shapely
+# carries the identical gap too -- no py.typed marker -- and is imported by
+# `sources/maus.py` (`shapely.geometry.box`, the WA_BBOX clip mask).
+module = ["pandas.*", "pyarrow.*", "geopandas.*", "pyogrio.*", "shapely.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

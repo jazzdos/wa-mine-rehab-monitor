@@ -1,0 +1,71 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Secrets and local configuration (D9.2 — never committed)
+.env
+.env.*
+.envrc
+config/local.*
+*.local.yaml
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+*credentials*.json
+*service-account*.json
+MACHINES.md
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Logs and notebooks
+*.log
+logs/
+.ipynb_checkpoints/
+*.ipynb
+
+# Bulk data formats (D9.4 — raw snapshots, extracts, derived tables stay in
+# the data root outside the repo; hand-built licence-clean synthetic test
+# fixtures may be re-included with an explicit `!` exception plus an audit
+# note in the adding commit)
+*.tif
+*.tiff
+*.parquet
+*.gpkg
+*.geojson
+*.zip
+*.pmtiles
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.arrow
+*.feather
+*.nc
+*.zarr
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.qix
+SHA256SUMS.txt
+*.run_manifest.json
+
+# Data directories
+data/
+data_root/
+site/build/
