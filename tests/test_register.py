@@ -1862,3 +1862,66 @@ def test_snapshot_verification_covers_only_the_hashed_zip(tmp_path: Path) -> Non
     )
     n_ok, n_bad, n_missing = snapshots.verify_snapshot(snapshot_dir)
     assert (n_ok, n_bad, n_missing) == (2, 0, 0)  # the CSV zip + metadata.txt
+
+
+# =============================================================================
+# ENRICHED_REGISTER_SCHEMA / enrich_register_with_dea_coverage (D13)
+# =============================================================================
+
+
+def _coverage_frame(site_ids, values=1):
+    import pandas as pd
+
+    from wa_mine_monitor.dea_coverage import DEA_EPOCH_COLUMN_BY_SOURCE
+
+    frame = pd.DataFrame({"site_id": list(site_ids)})
+    for column in DEA_EPOCH_COLUMN_BY_SOURCE.values():
+        frame[column] = pd.array([values] * len(site_ids), dtype="Int64")
+    return frame
+
+
+def test_enriched_schema_is_register_schema_plus_four_nullable_int64():
+    import pyarrow as pa
+
+    from wa_mine_monitor.register import (
+        DEA_COVERAGE_COLUMNS,
+        ENRICHED_REGISTER_SCHEMA,
+        REGISTER_SCHEMA,
+    )
+
+    assert ENRICHED_REGISTER_SCHEMA.names == REGISTER_SCHEMA.names + list(DEA_COVERAGE_COLUMNS)
+    for column in DEA_COVERAGE_COLUMNS:
+        field = ENRICHED_REGISTER_SCHEMA.field(column)
+        assert field.type == pa.int64()
+        assert field.nullable
+
+
+def _conforming_register(n_rows: int) -> pd.DataFrame:
+    """A conforming register frame from this file's OWN fixture builders --
+    `_sites_df`/`_owners_df`/`_tenements_gdf` through `build_register`, the
+    same construction every other test in this file uses."""
+    rows = [_sites_row(site_code=f"M{i:04d}", lon=116.0 + i, lat=-32.0 - i) for i in range(n_rows)]
+    return build_register(_sites_df(rows), _owners_df([]), _tenements_gdf([]), "2026-08-15")
+
+
+def test_enrich_appends_columns_preserving_row_identity_and_order():
+    register_df = _conforming_register(3)
+    coverage = _coverage_frame(register_df["site_id"])
+    enriched = register_module.enrich_register_with_dea_coverage(register_df, coverage)
+    assert list(enriched["site_id"]) == list(register_df["site_id"])
+    assert list(enriched.columns[: len(register_df.columns)]) == list(register_df.columns)
+    assert str(enriched["n_dea_fc_pc_epochs"].dtype) == "Int64"
+    # Existing nullable semantics untouched:
+    assert str(enriched["n_tenements_intersecting"].dtype) == "Int64"
+
+
+def test_enrich_refuses_row_loss_gain_and_mismatched_sites():
+    register_df = _conforming_register(2)
+    with pytest.raises(register_module.RegisterEnrichmentError, match="site"):
+        register_module.enrich_register_with_dea_coverage(
+            register_df, _coverage_frame(["NOT-A-SITE", "ALSO-NOT"])
+        )
+    with pytest.raises(register_module.RegisterEnrichmentError, match="row"):
+        register_module.enrich_register_with_dea_coverage(
+            register_df, _coverage_frame(register_df["site_id"][:1])
+        )

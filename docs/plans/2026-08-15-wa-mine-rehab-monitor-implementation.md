@@ -516,6 +516,22 @@ D9 step 1; the run is recorded in that checkpoint — PASSED.)
 
 ## Later batches (heading level only — detail after Tier 0 lands)
 
+> **Reuse review before detailing (added 2026-08-16):** a full reuse
+> assessment of the dataplatform repo
+> (`~/Documents/03. Data modelling/dataplatform`) exists at
+> `~/Documents/08. remote sensing/docs/research/dataplatform-reuse-assessment_2026-08-16.md`.
+> When detailing Batches C–G (D12 step), adjudicate each candidate lift
+> there explicitly — adopt, adapt, or decline with a reason. Headline
+> candidates: ArcGIS-REST client with truncation-refusing pager (Batch F
+> DBCA-060, and the proven no-auth ArcGIS Online mirror route around the
+> SLIP SSO gate — mirror provenance needs licence-evidence adjudication
+> first); `core/zonal.py` memoised zonal stats (Batch E, interacts with
+> D3 pixel support); `core/http.py` + `map_concurrent` (Batch C STAC);
+> three-state licence enum + static conformance test (export gate
+> upgrade); `bin/verify_provenance.py` (evidence-digest convergence).
+> Non-transfers noted there too (4326-canonical lake CRS, `observations`
+> schema, no raster/STAC handling).
+
 - **Batch C — DEA epoch-coverage + volume re-derivation:** STAC catalogue
   module pinning the verified collection names with the non-zero-item
   assertion; per-site epoch coverage counts into the register; re-derive

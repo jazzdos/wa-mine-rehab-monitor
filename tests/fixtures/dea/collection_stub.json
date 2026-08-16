@@ -1,0 +1,12 @@
+{
+  "type": "Collection",
+  "id": "ga_ls5t_gm_cyear_3",
+  "stac_version": "1.0.0",
+  "description": "Synthetic stub-signature fixture.",
+  "license": "CC-BY-4.0",
+  "extent": {
+    "spatial": {"bbox": [[-180.0, -90.0, 180.0, 90.0]]},
+    "temporal": {"interval": [[null, null]]}
+  },
+  "links": []
+}

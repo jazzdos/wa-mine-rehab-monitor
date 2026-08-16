@@ -2,17 +2,22 @@ import json
 import subprocess
 from pathlib import Path
 
+import geopandas as gpd
+import pandas as pd
 import pytest
 import typer
+from shapely.geometry import Polygon
 from typer.testing import CliRunner
 
-from wa_mine_monitor import register, snapshots
+from wa_mine_monitor import manifests, register, snapshots, tables
 from wa_mine_monitor.cli import (
     _collect_git_state_disclosing_gaps,
     _latest_curated_dated_dir,
     _verify_snapshot_or_refuse,
     app,
 )
+from wa_mine_monitor.maus_footprints import MAUS_FOOTPRINT_STATS_SCHEMA
+from wa_mine_monitor.provenance import SourceAsset
 
 runner = CliRunner()
 
@@ -387,3 +392,601 @@ def test_latest_curated_dated_dir_and_verify_snapshot_or_refuse_diverge_on_sha25
     # actually applies to a raw snapshot -- refused, naming "never finalized".
     with pytest.raises(typer.Exit):
         _verify_snapshot_or_refuse(raw_dir, source_id="dmirs_001_minedex")
+
+
+def _dea_fixture_pages():
+    fixtures = Path(__file__).resolve().parent / "fixtures" / "dea"
+
+    def load(name):
+        return json.loads((fixtures / name).read_text(encoding="utf-8"))
+
+    from wa_mine_monitor.source_catalogue import DEA_COLLECTIONS
+    from wa_mine_monitor.sources.dea import collection_url, items_url
+
+    pages = {}
+    for spec in DEA_COLLECTIONS:
+        collection = load("collection_ga_ls5t_gm_cyear_3.json")
+        collection["id"] = spec.collection_id
+        page = load("items_page_2.json")  # single page, no next link
+        for feature in page["features"]:
+            feature["id"] = f"{spec.collection_id}-x11y22-1991"
+            if spec.source_id == "dea_fc_pc":
+                feature["assets"] = {role: {"href": "s3://x/a.tif"} for role in spec.asset_roles}
+        pages[collection_url(spec.collection_id)] = collection
+        pages[items_url(spec.collection_id)] = page
+    return pages
+
+
+class _FakeCatalogueClient:
+    def __init__(self, pages):
+        self._pages = pages
+
+    def get_json(self, url, *, params=None):
+        payload = self._pages[url]
+        if isinstance(payload, BaseException):
+            raise payload
+        return payload
+
+
+def _write_monitor_config(tmp_path):
+    cfg_file = tmp_path / "c.yaml"
+    cfg_file.write_text(
+        f'run:\n  data_root: "{tmp_path / "data"}"\n  redistribute_public: false\n'
+        "sources:\n  minedex_public_export_blocked: true\n"
+    )
+    return cfg_file
+
+
+def test_fetch_dea_catalogue_writes_snapshot_and_manifest(tmp_path, monkeypatch):
+    _init_git_repo(tmp_path)
+    monkeypatch.setattr("wa_mine_monitor.cli._REPO_ROOT", tmp_path)
+    cfg_file = _write_monitor_config(tmp_path)
+    fake = _FakeCatalogueClient(_dea_fixture_pages())
+    monkeypatch.setattr("wa_mine_monitor.cli.new_dea_client", lambda: fake)
+
+    result = runner.invoke(
+        app,
+        ["fetch-dea-catalogue", "--config", str(cfg_file), "--date", "2026-08-16"],
+    )
+    assert result.exit_code == 0, result.output
+    snapshot_dir = tmp_path / "data" / "raw" / "dea_stac" / "2026-08-16"
+    assert (snapshot_dir / "ga_ls5t_gm_cyear_3" / "collection.json").exists()
+    assert (snapshot_dir / "ga_ls5t_gm_cyear_3" / "items_page_0001.json").exists()
+    assert (snapshot_dir / "catalogue_summary.json").exists()
+    assert (snapshot_dir / "SHA256SUMS.txt").exists()
+    manifest_path = snapshot_dir / "SHA256SUMS.txt.run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert len(manifest["inputs"]) == 4
+    payload = json.loads(result.output)
+    assert payload["verify"] == {"ok": payload["verify"]["ok"], "bad": 0, "missing": 0}
+    summary = json.loads((snapshot_dir / "catalogue_summary.json").read_text(encoding="utf-8"))
+    for entry in summary["collections"]:
+        assert entry["n_items"] > 0
+        # D13 C2's recorded snapshot fields, all three present per collection:
+        assert entry["required_assets"]
+        assert entry["reported_item_count_disclosure"] in {
+            "reported-by-source",
+            "absent-from-source",
+        }
+        assert len(entry["collection_response_sha256"]) == 64
+
+
+def test_fetch_dea_catalogue_refuses_when_one_collection_fails(tmp_path, monkeypatch):
+    """One collection failing refuses the WHOLE catalogue -- no partial,
+    no finalized snapshot (the completeness-sensitive caller, end to end)."""
+    _init_git_repo(tmp_path)
+    monkeypatch.setattr("wa_mine_monitor.cli._REPO_ROOT", tmp_path)
+    cfg_file = _write_monitor_config(tmp_path)
+    pages = _dea_fixture_pages()
+    from wa_mine_monitor.sources.dea import collection_url
+
+    pages[collection_url("ga_ls_fc_pc_cyear_3")] = RuntimeError("transport died")
+    fake = _FakeCatalogueClient(pages)
+    monkeypatch.setattr("wa_mine_monitor.cli.new_dea_client", lambda: fake)
+
+    result = runner.invoke(
+        app,
+        ["fetch-dea-catalogue", "--config", str(cfg_file), "--date", "2026-08-16"],
+    )
+    assert result.exit_code == 1
+    assert "refusal" in result.output
+    snapshot_dir = tmp_path / "data" / "raw" / "dea_stac" / "2026-08-16"
+    assert not (snapshot_dir / "SHA256SUMS.txt").exists()
+
+
+def test_fetch_dea_catalogue_refuses_overwrite_of_finalized_snapshot(tmp_path, monkeypatch):
+    _init_git_repo(tmp_path)
+    monkeypatch.setattr("wa_mine_monitor.cli._REPO_ROOT", tmp_path)
+    cfg_file = _write_monitor_config(tmp_path)
+    fake = _FakeCatalogueClient(_dea_fixture_pages())
+    monkeypatch.setattr("wa_mine_monitor.cli.new_dea_client", lambda: fake)
+    first = runner.invoke(
+        app,
+        ["fetch-dea-catalogue", "--config", str(cfg_file), "--date", "2026-08-16"],
+    )
+    assert first.exit_code == 0, first.output
+    second = runner.invoke(
+        app,
+        ["fetch-dea-catalogue", "--config", str(cfg_file), "--date", "2026-08-16"],
+    )
+    assert second.exit_code == 1
+
+
+# --- build-maus-footprint-areas CLI command --------------------------------
+#
+# Seeding follows `tests/test_crosswalk.py::_seed_maus_extract` (the
+# established `raw/maus_v2/<date>/wa_extract.gpkg` seeding technique for
+# `build-crosswalk`'s Maus input): a toy GeoDataFrame in EPSG:4326, written
+# via `gdf.to_file(..., driver="GPKG", layer="wa_extract")`, then
+# `snapshots.write_snapshot_metadata` + `snapshots.finalize_snapshot`.
+
+
+def _seed_maus_extract(data_root, date_str, *, finalize=True):
+    """`finalize=False` leaves the snapshot WITHOUT a `SHA256SUMS.txt` --
+    the state an interrupted `fetch-maus-extract` leaves behind."""
+    snapshot_dir = snapshots.create_snapshot_dir(data_root, "maus_v2", date_str)
+    gdf = gpd.GeoDataFrame(
+        {"maus_id": ["MAUS001", "MAUS002"]},
+        geometry=[
+            Polygon(
+                [
+                    (115.995, -32.005),
+                    (116.005, -32.005),
+                    (116.005, -31.995),
+                    (115.995, -31.995),
+                ]
+            ),
+            Polygon(
+                [
+                    (121.490, -30.705),
+                    (121.510, -30.705),
+                    (121.510, -30.695),
+                    (121.490, -30.695),
+                ]
+            ),
+        ],
+        crs="EPSG:4326",
+    )
+    gdf.to_file(snapshot_dir / "wa_extract.gpkg", driver="GPKG", layer="wa_extract")
+    snapshots.write_snapshot_metadata(
+        snapshot_dir,
+        source="Maus et al. v2 WA extract",
+        endpoint="https://example.test/maus",
+        licence_note="CC-BY-SA-4.0",
+        purpose="test fixture",
+    )
+    if finalize:
+        snapshots.finalize_snapshot(snapshot_dir)
+    return snapshot_dir
+
+
+def test_build_maus_footprint_areas_writes_scalars_and_manifest(tmp_path, monkeypatch):
+    _init_git_repo(tmp_path)
+    monkeypatch.setattr("wa_mine_monitor.cli._REPO_ROOT", tmp_path)
+    cfg_file = _write_monitor_config(tmp_path)
+    data_root = tmp_path / "data"
+    _seed_maus_extract(data_root, "2026-08-15")
+
+    result = runner.invoke(
+        app,
+        ["build-maus-footprint-areas", "--config", str(cfg_file), "--date", "2026-08-16"],
+    )
+    assert result.exit_code == 0, result.output
+
+    out_path = (
+        data_root / "curated" / "maus_footprint_areas" / "2026-08-16" / "footprint_areas.parquet"
+    )
+    stats = tables.read_table(out_path)
+    assert list(stats.columns) == MAUS_FOOTPRINT_STATS_SCHEMA.names
+    assert "geometry" not in stats.columns
+    assert sorted(stats["maus_id"]) == ["MAUS001", "MAUS002"]
+
+    manifest = json.loads(Path(str(out_path) + ".run_manifest.json").read_text(encoding="utf-8"))
+    args = manifest["resolved_args"]
+    assert args["crs"] == "EPSG:3577"
+    assert args["output_share_alike"] is True
+    assert len(args["maus_gpkg_sha256"]) == 64
+    assert manifest["inputs"][0]["licence"] == "CC-BY-SA-4.0"
+
+
+def test_build_maus_footprint_areas_refuses_an_unverifiable_snapshot(tmp_path, monkeypatch):
+    _init_git_repo(tmp_path)
+    monkeypatch.setattr("wa_mine_monitor.cli._REPO_ROOT", tmp_path)
+    cfg_file = _write_monitor_config(tmp_path)
+    data_root = tmp_path / "data"
+    snapshot_dir = _seed_maus_extract(data_root, "2026-08-15")
+    # Corrupt the GeoPackage AFTER finalization -- standing in for tampered
+    # input, the same reproduction `build-crosswalk`'s tests use.
+    with (snapshot_dir / "wa_extract.gpkg").open("ab") as fh:
+        fh.write(b"tampered after finalize")
+
+    result = runner.invoke(
+        app,
+        ["build-maus-footprint-areas", "--config", str(cfg_file), "--date", "2026-08-16"],
+    )
+    assert result.exit_code == 1
+    assert "refusal" in result.output
+
+
+def test_build_maus_footprint_areas_refuses_existing_output(tmp_path, monkeypatch):
+    _init_git_repo(tmp_path)
+    monkeypatch.setattr("wa_mine_monitor.cli._REPO_ROOT", tmp_path)
+    cfg_file = _write_monitor_config(tmp_path)
+    data_root = tmp_path / "data"
+    _seed_maus_extract(data_root, "2026-08-15")
+
+    first = runner.invoke(
+        app,
+        ["build-maus-footprint-areas", "--config", str(cfg_file), "--date", "2026-08-16"],
+    )
+    assert first.exit_code == 0, first.output
+    second = runner.invoke(
+        app,
+        ["build-maus-footprint-areas", "--config", str(cfg_file), "--date", "2026-08-16"],
+    )
+    assert second.exit_code == 1
+    assert "refusal" in second.output
+    assert "refusal" in second.output
+
+
+# --- build-dea-coverage CLI command -----------------------------------------
+#
+# The catalogue snapshot is seeded via the REAL `fetch-dea-catalogue` command
+# against the Task 7 fake client (`_FakeCatalogueClient`/`_dea_fixture_pages`,
+# already used above) -- the same finalized `raw/dea_stac/<date>/` layout a
+# real fetch produces, `items_page_*.json` files included. No CLI command
+# builds a curated register from a two-row toy MINEDEX extract cheaply, so
+# the source register is constructed directly with `tables.write_table` /
+# `manifests.write_run_manifest`, mirroring `_seed_maus_extract`'s
+# directness for the OTHER curated input.
+
+
+def _seed_curated_register(data_root, date_str):
+    """Write a minimal, schema-conforming `curated/register/<date_str>/
+    register.parquet` plus its own immutable run manifest.
+
+    `site-a` sits at (116.5, -32.5), inside every DEA fixture item's bbox
+    (`[116.0, -33.0, 117.0, -32.0]`, see `_dea_fixture_pages`); `site-b`
+    carries no coordinates at all, exercising the located/not-computed
+    split `count_site_epochs` distinguishes. `n_tenements_intersecting` is
+    null for the coordinate-less site (D12.2's not-computed-vs-zero
+    semantic), giving the column its real, nullable-`Int64` round-trip
+    dtype.
+    """
+    register_dir = data_root / "curated" / "register" / date_str
+    register_dir.mkdir(parents=True)
+    register_path = register_dir / "register.parquet"
+    df = pd.DataFrame(
+        {
+            "site_id": ["site-a", "site-b"],
+            "site_name": ["Site A", "Site B"],
+            "commodity": ["Gold", "Iron Ore"],
+            "stage": ["Operating", "Shut"],
+            "owners_at_snapshot": ["Owner A", "Owner B"],
+            "snapshot_date": [date_str, date_str],
+            "lon": [116.5, None],
+            "lat": [-32.5, None],
+            "n_tenements_intersecting": pd.array([0, None], dtype="Int64"),
+            "inclusion_status": ["operating", "closed"],
+        }
+    )
+    tables.write_table(df, register_path, register.REGISTER_SCHEMA)
+    manifests.write_run_manifest(
+        output=register_path,
+        inputs=[SourceAsset(uri="minedex://Sites.csv", sha256=None)],
+        config={"run": {"data_root": str(data_root)}},
+        git_state={"sha": "deadbeef", "dirty": False, "diff": ""},
+    )
+    return register_dir
+
+
+def _seed_dea_catalogue_snapshot(cfg_file, catalogue_date, monkeypatch):
+    """Fetch a real, finalized `raw/dea_stac/<catalogue_date>/` snapshot via
+    the Task 7 fake client -- the seam `test_fetch_dea_catalogue_writes_
+    snapshot_and_manifest` already exercises."""
+    fake = _FakeCatalogueClient(_dea_fixture_pages())
+    monkeypatch.setattr("wa_mine_monitor.cli.new_dea_client", lambda: fake)
+    result = runner.invoke(
+        app,
+        ["fetch-dea-catalogue", "--config", str(cfg_file), "--date", catalogue_date],
+    )
+    assert result.exit_code == 0, result.output
+
+
+def test_build_dea_coverage_writes_new_versioned_register(tmp_path, monkeypatch):
+    _init_git_repo(tmp_path)
+    monkeypatch.setattr("wa_mine_monitor.cli._REPO_ROOT", tmp_path)
+    cfg_file = _write_monitor_config(tmp_path)
+    data_root = tmp_path / "data"
+    _seed_curated_register(data_root, "2026-08-15")
+    _seed_dea_catalogue_snapshot(cfg_file, "2026-08-16", monkeypatch)
+
+    result = runner.invoke(
+        app,
+        [
+            "build-dea-coverage",
+            "--config",
+            str(cfg_file),
+            "--date",
+            "2026-08-17",
+            "--catalogue-date",
+            "2026-08-16",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    out_dir = tmp_path / "data" / "curated" / "register" / "2026-08-17"
+    assert (out_dir / "register.parquet").exists()
+    manifest = json.loads(
+        (out_dir / "register.parquet.run_manifest.json").read_text(encoding="utf-8")
+    )
+    args = manifest["resolved_args"]
+    assert set(args) >= {
+        "source_register_manifest",
+        "source_catalogue_manifest",
+        "dea_coverage_disclosure",
+        "minedex_public_export_blocked",
+        "register_rows_before",
+        "register_rows_after",
+    }
+    assert args["register_rows_before"] == args["register_rows_after"]
+    assert args["minedex_public_export_blocked"] is True
+    # Batch B artefact untouched:
+    source_dir = tmp_path / "data" / "curated" / "register" / "2026-08-15"
+    assert (source_dir / "register.parquet").exists()
+    # Columns preserved + four appended, dtypes nullable:
+    from wa_mine_monitor.register import DEA_COVERAGE_COLUMNS, REGISTER_SCHEMA
+
+    enriched = tables.read_table(out_dir / "register.parquet")
+    assert list(enriched.columns) == REGISTER_SCHEMA.names + list(DEA_COVERAGE_COLUMNS)
+    assert str(enriched["n_tenements_intersecting"].dtype) == "Int64"
+    # `site-a` is located inside the fixture bbox: a genuine computed count;
+    # `site-b` is coordinate-less: not computed (null), never a fabricated
+    # zero.
+    by_site = enriched.set_index("site_id")
+    assert by_site.loc["site-a", "n_dea_gm_ls5t_epochs"] == 1
+    assert pd.isna(by_site.loc["site-b", "n_dea_gm_ls5t_epochs"])
+
+
+def test_build_dea_coverage_refuses_tampered_source_register(tmp_path, monkeypatch):
+    _init_git_repo(tmp_path)
+    monkeypatch.setattr("wa_mine_monitor.cli._REPO_ROOT", tmp_path)
+    cfg_file = _write_monitor_config(tmp_path)
+    data_root = tmp_path / "data"
+    register_dir = _seed_curated_register(data_root, "2026-08-15")
+    _seed_dea_catalogue_snapshot(cfg_file, "2026-08-16", monkeypatch)
+
+    # Tamper AFTER the manifest was written.
+    with (register_dir / "register.parquet").open("ab") as fh:
+        fh.write(b"tampered after manifest")
+
+    result = runner.invoke(
+        app,
+        [
+            "build-dea-coverage",
+            "--config",
+            str(cfg_file),
+            "--date",
+            "2026-08-17",
+            "--catalogue-date",
+            "2026-08-16",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "digest" in result.output
+
+
+def test_build_dea_coverage_refuses_existing_output(tmp_path, monkeypatch):
+    _init_git_repo(tmp_path)
+    monkeypatch.setattr("wa_mine_monitor.cli._REPO_ROOT", tmp_path)
+    cfg_file = _write_monitor_config(tmp_path)
+    data_root = tmp_path / "data"
+    _seed_curated_register(data_root, "2026-08-15")
+    _seed_dea_catalogue_snapshot(cfg_file, "2026-08-16", monkeypatch)
+
+    first = runner.invoke(
+        app,
+        [
+            "build-dea-coverage",
+            "--config",
+            str(cfg_file),
+            "--date",
+            "2026-08-17",
+            "--catalogue-date",
+            "2026-08-16",
+        ],
+    )
+    assert first.exit_code == 0, first.output
+    second = runner.invoke(
+        app,
+        [
+            "build-dea-coverage",
+            "--config",
+            str(cfg_file),
+            "--date",
+            "2026-08-17",
+            "--catalogue-date",
+            "2026-08-16",
+        ],
+    )
+    assert second.exit_code == 1
+    assert "refusal" in second.output
+
+
+# --- derive-dea-volume CLI command -------------------------------------------
+#
+# Chains the already-tested seams end to end: seed register -> fetch
+# catalogue (fake client) -> build-dea-coverage -> seed a Maus extract ->
+# build-maus-footprint-areas -> build-crosswalk. The Maus extract is seeded
+# ONCE, so `build-maus-footprint-areas` and `build-crosswalk` (`register.
+# latest_snapshot`) both read the SAME `raw/maus_v2/<date>/` snapshot -- the
+# guarantee the Maus-digest equality refusal test below relies on to build a
+# MATCHING pair, then tampers with it by hand.
+
+
+def _seed_maus_extract_over_site_a(data_root, date_str):
+    """A single Maus polygon covering `_seed_curated_register`'s `site-a`
+    (116.5, -32.5) -- `derive-dea-volume`'s Tier 1 population needs a
+    high-confidence crosswalk match AND a footprint linked to it."""
+    snapshot_dir = snapshots.create_snapshot_dir(data_root, "maus_v2", date_str)
+    gdf = gpd.GeoDataFrame(
+        {"maus_id": ["MAUSVOL1"]},
+        geometry=[
+            Polygon(
+                [
+                    (116.4, -32.6),
+                    (116.6, -32.6),
+                    (116.6, -32.4),
+                    (116.4, -32.4),
+                ]
+            )
+        ],
+        crs="EPSG:4326",
+    )
+    gdf.to_file(snapshot_dir / "wa_extract.gpkg", driver="GPKG", layer="wa_extract")
+    snapshots.write_snapshot_metadata(
+        snapshot_dir,
+        source="Maus et al. v2 WA extract",
+        endpoint="https://example.test/maus",
+        licence_note="CC-BY-SA-4.0",
+        purpose="test fixture",
+    )
+    snapshots.finalize_snapshot(snapshot_dir)
+    return snapshot_dir
+
+
+def _seed_derive_dea_volume_chain(tmp_path, monkeypatch):
+    """Arrange the full input chain `derive-dea-volume` reads, via the
+    already-tested CLI seams: `build-dea-coverage` enriches the register,
+    then `build-maus-footprint-areas` and `build-crosswalk` both read the
+    SAME (only) Maus snapshot seeded here, so their manifests record
+    identical Maus GeoPackage digests by construction. Returns
+    `(cfg_file, data_root)`."""
+    _init_git_repo(tmp_path)
+    monkeypatch.setattr("wa_mine_monitor.cli._REPO_ROOT", tmp_path)
+    cfg_file = _write_monitor_config(tmp_path)
+    data_root = tmp_path / "data"
+
+    _seed_curated_register(data_root, "2026-08-14")
+    _seed_dea_catalogue_snapshot(cfg_file, "2026-08-15", monkeypatch)
+
+    coverage_result = runner.invoke(
+        app,
+        [
+            "build-dea-coverage",
+            "--config",
+            str(cfg_file),
+            "--date",
+            "2026-08-16",
+            "--catalogue-date",
+            "2026-08-15",
+        ],
+    )
+    assert coverage_result.exit_code == 0, coverage_result.output
+
+    _seed_maus_extract_over_site_a(data_root, "2026-08-16")
+
+    footprints_result = runner.invoke(
+        app,
+        ["build-maus-footprint-areas", "--config", str(cfg_file), "--date", "2026-08-17"],
+    )
+    assert footprints_result.exit_code == 0, footprints_result.output
+
+    crosswalk_result = runner.invoke(
+        app,
+        ["build-crosswalk", "--config", str(cfg_file), "--date", "2026-08-18"],
+    )
+    assert crosswalk_result.exit_code == 0, crosswalk_result.output
+
+    return cfg_file, data_root
+
+
+def test_derive_dea_volume_writes_estimate_with_manifest_digests(tmp_path, monkeypatch):
+    cfg_file, data_root = _seed_derive_dea_volume_chain(tmp_path, monkeypatch)
+
+    result = runner.invoke(
+        app, ["derive-dea-volume", "--config", str(cfg_file), "--date", "2026-08-19"]
+    )
+    assert result.exit_code == 0, result.output
+    estimate_path = data_root / "reports" / "dea-volume" / "2026-08-19" / "estimate.json"
+    estimate = json.loads(estimate_path.read_text(encoding="utf-8"))
+    for key in (
+        "population",
+        "windows",
+        "tiles",
+        "site_year_windows",
+        "selections",
+        "window_policy",
+        "year_ranges",
+        "bytes",
+        "expected_range_requests",
+        "asset_metadata_disclosure",
+        "assumptions",
+        "formulas",
+        "provisional_figures_comparison_only",
+        "source_manifest_digests",
+    ):
+        assert key in estimate
+    assert set(estimate["source_manifest_digests"]) == {
+        "register",
+        "crosswalk",
+        "footprints",
+        "catalogue",
+    }
+    assert (Path(str(estimate_path) + ".run_manifest.json")).exists()
+    # `site-a` is the one high-confidence, footprint-linked site; `site-b`
+    # (no coordinates) was excluded from the crosswalk's input population.
+    assert estimate["population"]["n_sites_eligible"] == 1
+
+
+def test_derive_dea_volume_refuses_an_unenriched_register(tmp_path, monkeypatch):
+    _init_git_repo(tmp_path)
+    monkeypatch.setattr("wa_mine_monitor.cli._REPO_ROOT", tmp_path)
+    cfg_file = _write_monitor_config(tmp_path)
+    data_root = tmp_path / "data"
+
+    # ONLY the Batch B register -- no build-dea-coverage run.
+    _seed_curated_register(data_root, "2026-08-14")
+    _seed_maus_extract_over_site_a(data_root, "2026-08-16")
+
+    footprints_result = runner.invoke(
+        app,
+        ["build-maus-footprint-areas", "--config", str(cfg_file), "--date", "2026-08-17"],
+    )
+    assert footprints_result.exit_code == 0, footprints_result.output
+
+    crosswalk_result = runner.invoke(
+        app,
+        ["build-crosswalk", "--config", str(cfg_file), "--date", "2026-08-18"],
+    )
+    assert crosswalk_result.exit_code == 0, crosswalk_result.output
+
+    result = runner.invoke(
+        app, ["derive-dea-volume", "--config", str(cfg_file), "--date", "2026-08-19"]
+    )
+    assert result.exit_code == 1
+    assert "build-dea-coverage" in result.output
+
+
+def test_derive_dea_volume_refuses_mismatched_maus_digests(tmp_path, monkeypatch):
+    """Crosswalk and footprints built from DIFFERENT Maus snapshots: the ids
+    can still join, so only the digests catch it."""
+    cfg_file, data_root = _seed_derive_dea_volume_chain(tmp_path, monkeypatch)
+
+    footprint_manifest_path = (
+        data_root
+        / "curated"
+        / "maus_footprint_areas"
+        / "2026-08-17"
+        / "footprint_areas.parquet.run_manifest.json"
+    )
+    manifest = json.loads(footprint_manifest_path.read_text(encoding="utf-8"))
+    manifest["resolved_args"]["maus_gpkg_sha256"] = "0" * 64
+    footprint_manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    result = runner.invoke(
+        app, ["derive-dea-volume", "--config", str(cfg_file), "--date", "2026-08-19"]
+    )
+    assert result.exit_code == 1
+    assert "maus" in result.output.lower()

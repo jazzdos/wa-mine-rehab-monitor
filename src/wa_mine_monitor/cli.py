@@ -26,10 +26,28 @@ import typer
 import yaml
 from pydantic import ValidationError
 
-from wa_mine_monitor import crosswalk, licence, manifests, register, snapshots
+from wa_mine_monitor import (
+    crosswalk,
+    dea_coverage,
+    dea_volume,
+    licence,
+    manifests,
+    maus_footprints,
+    register,
+    snapshots,
+)
 from wa_mine_monitor.config import ProjectConfig, load_config
+from wa_mine_monitor.http import map_concurrent
 from wa_mine_monitor.provenance import SourceAsset, collect_git_state, sha256_file
 from wa_mine_monitor.secrets import redact_secrets, scrub_string_leaves
+from wa_mine_monitor.source_catalogue import DEA_COLLECTIONS, SourceSpec
+from wa_mine_monitor.sources.dea import (
+    DEA_RETRY_POLICY,
+    CatalogueValidationError,
+    collection_url,
+    fetch_collection_catalogue,
+    new_dea_client,
+)
 from wa_mine_monitor.sources.maus import (
     SnapshotValidationError as MausSnapshotValidationError,
 )
@@ -64,7 +82,7 @@ from wa_mine_monitor.sources.tenements import (
     download_tenements_zip,
     validate_tenements_zip,
 )
-from wa_mine_monitor.tables import write_table
+from wa_mine_monitor.tables import read_table, write_table
 
 #: `pretty_exceptions_show_locals=False` -- Typer/Click's default
 #: (`True`) prints every local variable's value into an unhandled
@@ -629,6 +647,84 @@ def _write_table_or_refuse(
             )
         )
         raise typer.Exit(1) from None
+
+
+def _digest_verified_manifest(artefact_path: Path) -> dict[str, Any]:
+    """Parse and digest-verify the run manifest beside `artefact_path`, or
+    refuse (structured JSON, exit 1) before anything downstream reads it.
+
+    Every command that consumes an already-built curated artefact needs the
+    SAME check `build-dea-coverage` (Task 11) first applied to its source
+    register: the manifest must exist, must parse, and its recorded
+    `output.sha256` must still match the artefact's CURRENT bytes -- an
+    artefact digest-verified once at build time and never re-checked at
+    consumption time is exactly how a later hand-edit or partial
+    re-generation goes silently unnoticed. Defined once here rather than
+    inlined per command, so the check cannot drift between callers.
+
+    Returns the parsed manifest `dict` on success.
+    """
+    manifest_path = Path(str(artefact_path) + manifests.MANIFEST_SUFFIX)
+    if not manifest_path.exists():
+        typer.echo(
+            json.dumps(
+                {"refusal": f"no run manifest beside {artefact_path}"}, indent=2, sort_keys=True
+            )
+        )
+        raise typer.Exit(1)
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest_sha = manifest["output"]["sha256"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": f"{manifest_path} is missing or unparseable: {exc}",
+                    "stage": "digest-verification",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+    actual_sha = sha256_file(artefact_path)
+    if actual_sha != manifest_sha:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"digest mismatch: {artefact_path} hashes {actual_sha[:12]}..., "
+                        f"its manifest records {manifest_sha[:12]}... -- the artefact "
+                        f"changed after its manifest was written"
+                    ),
+                    "stage": "digest-verification",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    return manifest
+
+
+def _load_dea_items(catalogue_dir: Path) -> dict[str, list[Any]]:
+    """Flatten a captured `raw/dea_stac/<date>/` snapshot's item pages into
+    one `source_id -> [feature, ...]` mapping, over `source_catalogue.
+    DEA_COLLECTIONS`.
+
+    Shared by `build-dea-coverage` and `derive-dea-volume`, both of which
+    rebuild the SAME captured items from a `catalogue_dir` -- one to count
+    epochs, the other to rebuild the item and asset indexes a Tier 1 volume
+    estimate reads.
+    """
+    items_by_source: dict[str, list[Any]] = {}
+    for spec in DEA_COLLECTIONS:
+        features: list[Any] = []
+        for page_path in sorted((catalogue_dir / spec.collection_id).glob("items_page_*.json")):
+            page = json.loads(page_path.read_text(encoding="utf-8"))
+            features.extend(page.get("features") or [])
+        items_by_source[spec.source_id] = features
+    return items_by_source
 
 
 @app.callback()
@@ -2125,6 +2221,850 @@ def build_crosswalk_cmd(config: Path = ConfigOption, date: str = DateOption) -> 
                 "counts": disclosed_counts,
                 "crosswalk_population": crosswalk_population_counts,
                 "manifest_path": str(crosswalk_path) + manifests.MANIFEST_SUFFIX,
+            },
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+    )
+
+
+@app.command("fetch-dea-catalogue")
+def fetch_dea_catalogue(
+    config: Path = ConfigOption,
+    date: str = DateOption,
+) -> None:
+    """Capture the four pinned DEA STAC collections into one dated snapshot.
+
+    Fetches collection JSON + every WA-bbox item page for each collection in
+    `source_catalogue.DEA_COLLECTIONS`, validates health (stub signature,
+    zero/duplicate items, licence consistency, required assets), and writes
+    an immutable snapshot at `<data_root>/raw/dea_stac/<date>/` with one run
+    manifest carrying four SourceAsset inputs. Any single collection failing
+    refuses the WHOLE run before finalization -- a partial catalogue would
+    silently understate coverage downstream (C3/C5).
+    """
+    resolved = _load_config_or_exit(config)
+    resolved_config = resolved.model_dump(mode="json")
+    snapshot_dir = snapshots.create_snapshot_dir(resolved.run.data_root, "dea_stac", date)
+    git_state = _collect_git_state_disclosing_gaps(_REPO_ROOT)
+    _refuse_if_snapshot_already_finalized(snapshot_dir, config=resolved_config, git_state=git_state)
+
+    client = new_dea_client()
+
+    def fetch_one(
+        spec: SourceSpec,
+    ) -> tuple[SourceSpec, tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]]:
+        return spec, fetch_collection_catalogue(client, spec)
+
+    try:
+        fetched = map_concurrent(
+            fetch_one, DEA_COLLECTIONS, max_workers=DEA_RETRY_POLICY.max_workers
+        )
+    except CatalogueValidationError as exc:
+        typer.echo(
+            json.dumps(
+                {"refusal": f"DEA catalogue validation failed: {exc}", "stage": "validation"},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+    except Exception as exc:  # noqa: BLE001 -- surfaced as a structured refusal
+        typer.echo(
+            json.dumps(
+                {"refusal": f"DEA catalogue fetch failed: {exc}", "stage": "download"},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+
+    collection_summaries = []
+    collection_digests: dict[str, str] = {}
+    for spec, (collection, pages, summary) in fetched:
+        subdir = snapshot_dir / spec.collection_id
+        subdir.mkdir(parents=True, exist_ok=True)
+        collection_path = subdir / "collection.json"
+        collection_path.write_text(
+            json.dumps(collection, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        for page_number, page in enumerate(pages, start=1):
+            (subdir / f"items_page_{page_number:04d}.json").write_text(
+                json.dumps(page, indent=2, sort_keys=True), encoding="utf-8"
+            )
+        # D13 C2's "response digest": the digest of the CAPTURED
+        # collection.json bytes as they landed on disk, so the summary and
+        # the snapshot's own SHA256SUMS entry describe the same bytes. Hashed
+        # ONCE here and reused below for both the summary field and the
+        # manifest's SourceAsset -- never re-read from disk a second time.
+        collection_digests[spec.source_id] = sha256_file(collection_path)
+        collection_summaries.append(
+            {
+                **summary,
+                "source_id": spec.source_id,
+                "fetch_date": date,
+                "collection_response_sha256": collection_digests[spec.source_id],
+            }
+        )
+
+    (snapshot_dir / "catalogue_summary.json").write_text(
+        json.dumps({"collections": collection_summaries}, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    licence_notes = "; ".join(
+        f"{spec.collection_id}: {licence.SOURCES[spec.source_id].licence_id}"
+        for spec in DEA_COLLECTIONS
+    )
+    snapshots.write_snapshot_metadata(
+        snapshot_dir,
+        source="DEA Explorer STAC (four pinned annual collections)",
+        endpoint=collection_url(DEA_COLLECTIONS[0].collection_id).rsplit("/", 2)[0],
+        licence_note=f"Licences re-read from each captured collection.json: {licence_notes}",
+        purpose=(
+            "Pinned DEA STAC catalogue snapshot for the WA mine rehabilitation "
+            "spectral monitor's epoch-coverage index and volume estimate."
+        ),
+    )
+    sums_path = snapshots.finalize_snapshot(snapshot_dir)
+    n_ok, n_bad, n_missing = snapshots.verify_snapshot(snapshot_dir)
+
+    input_assets = [
+        SourceAsset(
+            uri=collection_url(spec.collection_id),
+            sha256=collection_digests[spec.source_id],
+            collection=spec.collection_id,
+            snapshot_date=dt_date.fromisoformat(date),
+            licence=licence.SOURCES[spec.source_id].licence_id,
+            redistribute_public=licence.SOURCES[spec.source_id].redistribute_public,
+        )
+        for spec in DEA_COLLECTIONS
+    ]
+    manifests.write_run_manifest(
+        output=sums_path,
+        inputs=input_assets,
+        config=resolved_config,
+        git_state=git_state,
+        resolved_args={"date": date, "collections": collection_summaries},
+    )
+
+    typer.echo(
+        json.dumps(
+            {
+                "snapshot_dir": str(snapshot_dir),
+                "verify": {"ok": n_ok, "bad": n_bad, "missing": n_missing},
+                "collections": collection_summaries,
+                "manifest_path": str(sums_path) + manifests.MANIFEST_SUFFIX,
+            },
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+    )
+
+
+@app.command("build-maus-footprint-areas")
+def build_maus_footprint_areas_cmd(config: Path = ConfigOption, date: str = DateOption) -> None:
+    """Reduce the latest Maus WA extract snapshot to per-`maus_id` footprint SCALARS.
+
+    D13 Batch C direction (`docs/decisions/2026-08-16-batch-c-footprint-input-
+    direction.md`, option C): the Tier 1 volume estimator needs a per-site
+    footprint SIZE, never the CC-BY-SA-4.0 Maus geometry itself, so this
+    artefact carries `maus_id`/`footprint_area_m2`/`footprint_bbox_width_m`/
+    `footprint_bbox_height_m` and nothing else -- no geometry column, ever.
+
+    Mirrors `build-crosswalk`'s Maus handling exactly: `register.
+    latest_snapshot(data_root, "maus_v2")` selects the latest dated `raw/
+    maus_v2/<date>/` snapshot, `_verify_snapshot_or_refuse` integrity-gates
+    it (`required_files=("wa_extract.gpkg",)`, the same gate `build-
+    crosswalk` applies), then `maus_id`/`geometry` are read off `wa_extract.
+    gpkg` and reprojected to `crosswalk.TARGET_CRS` (EPSG:3577, equal-area,
+    metres) HERE, in the CLI -- never inside `maus_footprints.
+    derive_footprint_stats`, which refuses a frame not already in that CRS
+    rather than silently reprojecting a caller that never declared one.
+    `derive_footprint_stats` then reduces each polygon to its three scalars,
+    refusing (not dropping) a null/empty geometry, a non-positive area, or a
+    duplicated `maus_id` -- a dropped footprint would silently become the
+    downstream estimator's floor window rather than a measured size.
+
+    On success, writes `<data_root>/curated/maus_footprint_areas/<date>/
+    footprint_areas.parquet` (declared `maus_footprints.
+    MAUS_FOOTPRINT_STATS_SCHEMA`, via `_write_table_or_refuse`) with an
+    immutable run manifest alongside it: one `SourceAsset` input (the Maus
+    GeoPackage actually read, its `sha256`, the snapshot date, and
+    `licence.SOURCES["maus_v2"]`'s own licence fields), and `resolved_args`
+    carrying the Maus snapshot directory (root-relativised via `manifests.
+    root_relative_path`), the Maus GeoPackage's own `sha256` (recorded again
+    here, separately from `inputs[0].sha256`, so `derive-dea-volume` can
+    later refuse a crosswalk/footprint pair built from different Maus
+    snapshots by comparing this field alone -- see the decision doc's
+    "Rejecting A"), the snapshot verification triple, the CRS, the footprint
+    count, and `output_licence="CC-BY-SA-4.0"` /
+    `output_share_alike=True` -- the artefact stays in the Maus CC-BY-SA
+    lineage even though it carries no geometry. A re-run against a `--date`
+    already built here is refused BEFORE anything is read or written
+    (`_refuse_if_curated_output_already_exists`, the same guard `build-
+    crosswalk` applies).
+    """
+    resolved: ProjectConfig = _load_config_or_exit(config)
+    resolved_config = resolved.model_dump(mode="json")
+    git_state = _collect_git_state_disclosing_gaps(_REPO_ROOT)
+
+    try:
+        maus_snapshot_dir = register.latest_snapshot(resolved.run.data_root, "maus_v2")
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    # Same integrity gate `build-crosswalk` applies to its Maus input: the
+    # snapshot is date-selected, so verify it before reading it.
+    maus_snapshot_verification = _verify_snapshot_or_refuse(
+        maus_snapshot_dir, source_id="maus_v2", required_files=("wa_extract.gpkg",)
+    )
+
+    maus_path = maus_snapshot_dir / "wa_extract.gpkg"
+    try:
+        maus_source_gdf = gpd.read_file(maus_path)
+        # `maus_id`/`geometry` ONLY -- no other Maus attribute ever reaches
+        # this artefact. Reprojected here, never inside `derive_footprint_
+        # stats` (see this command's docstring).
+        maus_gdf = maus_source_gdf[["maus_id", "geometry"]].to_crs(crosswalk.TARGET_CRS)
+    except (pyogrio.errors.DataSourceError, OSError) as exc:
+        # Same failure class `build-crosswalk` catches here: a hash-matching
+        # `wa_extract.gpkg` that is nonetheless unreadable as a datasource.
+        typer.echo(
+            json.dumps(
+                {"refusal": str(exc), "maus_gpkg": str(maus_path)},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+    except KeyError as exc:
+        # `wa_extract.gpkg` missing `maus_id` or `geometry` -- named the same
+        # way `build-crosswalk`'s identical column-slice failure is named.
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": f"wa_extract.gpkg is missing the expected column {exc}",
+                    "maus_gpkg": str(maus_path),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+
+    try:
+        stats = maus_footprints.derive_footprint_stats(maus_gdf)
+    except maus_footprints.FootprintStatsError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    output_dir = resolved.run.data_root / "curated" / "maus_footprint_areas" / date
+    output_path = output_dir / "footprint_areas.parquet"
+    _refuse_if_curated_output_already_exists(
+        output_path, config=resolved_config, git_state=git_state
+    )
+
+    # Every manifest ingredient computed BEFORE the artefact is written (the
+    # ordering `build-dea-coverage` establishes): a `_write_table_or_refuse`
+    # success followed by a manifest-ingredient failure would strand a
+    # manifestless `footprint_areas.parquet` that the existing-output guard
+    # above would then refuse to repair on a re-run.
+    maus_gpkg_sha256 = sha256_file(maus_path)
+    maus_snapshot_dir_relative, maus_snapshot_dir_root = manifests.root_relative_path(
+        maus_snapshot_dir, config=resolved_config
+    )
+    maus_source = licence.SOURCES["maus_v2"]
+    input_assets = [
+        SourceAsset(
+            uri=str(maus_path),
+            sha256=maus_gpkg_sha256,
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(maus_snapshot_dir.name),
+            licence=maus_source.licence_id,
+            redistribute_public=maus_source.redistribute_public,
+        ),
+    ]
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _write_table_or_refuse(
+        stats,
+        output_path,
+        maus_footprints.MAUS_FOOTPRINT_STATS_SCHEMA,
+        payload={"maus_gpkg": str(maus_path)},
+    )
+
+    try:
+        manifests.write_run_manifest(
+            output=output_path,
+            inputs=input_assets,
+            config=resolved_config,
+            git_state=git_state,
+            resolved_args={
+                "date": date,
+                "maus_snapshot_dir": maus_snapshot_dir_relative,
+                "maus_snapshot_dir_root": maus_snapshot_dir_root,
+                "maus_gpkg_sha256": maus_gpkg_sha256,
+                "maus_snapshot_verification": maus_snapshot_verification,
+                "crs": crosswalk.TARGET_CRS,
+                "n_footprints": len(stats),
+                "output_licence": "CC-BY-SA-4.0",
+                "output_share_alike": True,
+            },
+        )
+    except FileExistsError as exc:
+        # See the identical comment in `build_crosswalk_cmd`: the residual
+        # race `_refuse_if_curated_output_already_exists`'s pre-flight
+        # cannot close, rendered as structured JSON rather than a traceback.
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    typer.echo(
+        json.dumps(
+            {
+                "output_path": str(output_path),
+                "n_footprints": len(stats),
+                "maus_gpkg": str(maus_path),
+                "manifest_path": str(output_path) + manifests.MANIFEST_SUFFIX,
+            },
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+    )
+
+
+@app.command("build-dea-coverage")
+def build_dea_coverage(
+    config: Path = ConfigOption,
+    date: str = DateOption,
+    catalogue_date: str = typer.Option(
+        ...,
+        "--catalogue-date",
+        help="Dated raw/dea_stac/<date>/ snapshot to read the catalogue from.",
+        callback=_validate_snapshot_date,
+    ),
+) -> None:
+    """Enrich the latest curated register with DEA epoch coverage.
+
+    Writes a NEW `curated/register/<date>/register.parquet` under
+    `ENRICHED_REGISTER_SCHEMA`; the accepted Batch B artefact is never
+    mutated. Refuses on: source register digest mismatch against its own
+    manifest, catalogue snapshot verification failure, row loss/gain/
+    reorder, or an existing output at `<date>`.
+    """
+    resolved = _load_config_or_exit(config)
+    resolved_config = resolved.model_dump(mode="json")
+    git_state = _collect_git_state_disclosing_gaps(_REPO_ROOT)
+    data_root = resolved.run.data_root
+
+    # 1. Source register: latest curated/register/<date>/, digest-verified
+    #    against its own manifest's output.sha256 (`_digest_verified_
+    #    manifest`, shared with `derive-dea-volume`).
+    register_root = data_root / "curated" / "register"
+    try:
+        register_dir = _latest_curated_dated_dir(register_root, label="curated/register")
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    register_path = register_dir / "register.parquet"
+    register_manifest_path = Path(str(register_path) + manifests.MANIFEST_SUFFIX)
+    register_manifest = _digest_verified_manifest(register_path)
+    actual_sha = register_manifest["output"]["sha256"]
+
+    # 2. Catalogue snapshot: verified via SHA256SUMS.
+    catalogue_dir = data_root / "raw" / "dea_stac" / catalogue_date
+    _verify_snapshot_or_refuse(
+        catalogue_dir, source_id="dea_stac", required_files=("catalogue_summary.json",)
+    )
+    catalogue_manifest_path = catalogue_dir / (
+        snapshots.SHA256SUMS_FILENAME + manifests.MANIFEST_SUFFIX
+    )
+
+    # 3. Load items per source from the snapshot pages (`_load_dea_items`,
+    #    shared with `derive-dea-volume`).
+    items_by_source = _load_dea_items(catalogue_dir)
+
+    # 4. Coverage + enrichment.
+    register_df = read_table(register_path)
+    item_index, duplicates_refused = dea_coverage.build_item_index(items_by_source)
+    coverage_df, disclosures = dea_coverage.count_site_epochs(
+        register_df, item_index, duplicates_refused=duplicates_refused
+    )
+    try:
+        enriched = register.enrich_register_with_dea_coverage(register_df, coverage_df)
+    except register.RegisterEnrichmentError as exc:
+        typer.echo(
+            json.dumps({"refusal": str(exc), "stage": "enrichment"}, indent=2, sort_keys=True)
+        )
+        raise typer.Exit(1) from None
+
+    # 5. Compute EVERY manifest ingredient BEFORE the artefact is written.
+    #    `_write_table_or_refuse` followed by a manifest failure would strand
+    #    a manifestless register.parquet that the existing-output guard then
+    #    refuses to repair on the re-run -- the artefact and its provenance
+    #    must fail together or land together.
+    out_dir = data_root / "curated" / "register" / date
+    out_path = out_dir / "register.parquet"
+    _refuse_if_curated_output_already_exists(out_path, config=resolved_config, git_state=git_state)
+
+    # `root_relative_path` takes a MAPPING (it calls `config.get`) and returns
+    # `(reduced_path, root_name)`; both halves are recorded, the way
+    # `fetch-maus-extract` records `source_local_path`/`_root`.
+    source_register_manifest, source_register_manifest_root = manifests.root_relative_path(
+        register_manifest_path, config=resolved_config
+    )
+    source_catalogue_manifest, source_catalogue_manifest_root = manifests.root_relative_path(
+        catalogue_manifest_path, config=resolved_config
+    )
+    catalogue_sums_path = catalogue_dir / snapshots.SHA256SUMS_FILENAME
+    catalogue_sums_sha = sha256_file(catalogue_sums_path)
+
+    input_assets = [
+        SourceAsset(
+            uri=str(register_path),
+            sha256=actual_sha,
+            collection=None,
+            snapshot_date=None,
+            licence=licence.SOURCES["dmirs_001_minedex"].licence_id,
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(catalogue_sums_path),
+            sha256=catalogue_sums_sha,
+            collection="dea_stac",
+            snapshot_date=dt_date.fromisoformat(catalogue_date),
+            licence="CC-BY-4.0",
+            redistribute_public=True,
+        ),
+    ]
+
+    # 6. Ingredients all in hand -- now write the artefact, then its manifest.
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _write_table_or_refuse(enriched, out_path, register.ENRICHED_REGISTER_SCHEMA)
+    try:
+        manifests.write_run_manifest(
+            output=out_path,
+            inputs=input_assets,
+            config=resolved_config,
+            git_state=git_state,
+            resolved_args={
+                "date": date,
+                "catalogue_date": catalogue_date,
+                "source_register_manifest": source_register_manifest,
+                "source_register_manifest_root": source_register_manifest_root,
+                "source_catalogue_manifest": source_catalogue_manifest,
+                "source_catalogue_manifest_root": source_catalogue_manifest_root,
+                "dea_coverage_disclosure": disclosures,
+                "minedex_public_export_blocked": resolved.sources.minedex_public_export_blocked,
+                "register_rows_before": len(register_df),
+                "register_rows_after": len(enriched),
+            },
+        )
+    except FileExistsError as exc:
+        # See the identical comment in `build_register_cmd`/`build_crosswalk_
+        # cmd`/`build_maus_footprint_areas_cmd`: the residual race `_refuse_
+        # if_curated_output_already_exists`'s pre-flight cannot close,
+        # rendered as structured JSON rather than a traceback.
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    typer.echo(
+        json.dumps(
+            {
+                "output": str(out_path),
+                "register_rows_before": len(register_df),
+                "register_rows_after": len(enriched),
+                "dea_coverage_disclosure": disclosures,
+                "manifest_path": str(out_path) + manifests.MANIFEST_SUFFIX,
+            },
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+    )
+
+
+#: Metric identifiers each pinned collection's `asset_roles` make
+#: computable -- informational only (`dea_volume.derive_volume_estimate`
+#: never branches on these strings; they are echoed into the estimate so a
+#: reader knows WHY these assets were selected). Geomedian's six
+#: reflectance bands make NBR/NDMI/NDVI directly computable
+#: (`source_catalogue.py`'s own docstring); FC-percentile's bare/
+#: photosynthetic/non-photosynthetic bands are the fractional-cover
+#: components themselves.
+_DEA_METRIC_IDS: dict[str, tuple[str, ...]] = {
+    "dea_gm_ls5t": ("nbr", "ndmi", "ndvi"),
+    "dea_gm_ls7e": ("nbr", "ndmi", "ndvi"),
+    "dea_gm_ls8cls9c": ("nbr", "ndmi", "ndvi"),
+    "dea_fc_pc": ("bare_soil", "photosynthetic_vegetation", "non_photosynthetic_vegetation"),
+}
+
+#: DECLARED bytes-per-pixel fallback per collection, used only where the
+#: captured items published no `raster:bands` metadata to observe it from
+#: (`dea_volume.derive_volume_estimate`'s `bytes_per_pixel_source="assumed"`
+#: branch). Geomedian bands are int16 (2 bytes); FC-percentile bands are
+#: uint8 percentages (1 byte) -- both DEA's published product dtypes.
+_DEA_ASSUMED_BYTES_PER_PIXEL: dict[str, int] = {
+    "dea_gm_ls5t": 2,
+    "dea_gm_ls7e": 2,
+    "dea_gm_ls8cls9c": 2,
+    "dea_fc_pc": 1,
+}
+
+#: DECLARED tile-side fallback (pixels), same role as `_DEA_ASSUMED_BYTES_
+#: PER_PIXEL` above -- DEA's standard geomedian/FC-percentile tile size.
+_DEA_ASSUMED_TILE_PIXELS_PER_SIDE = 3200
+
+
+@app.command("derive-dea-volume")
+def derive_dea_volume_cmd(config: Path = ConfigOption, date: str = DateOption) -> None:
+    """Derive the Tier 1 DEA data-volume estimate from real inputs.
+
+    Locates the LATEST `curated/crosswalk/<date>/`, `curated/
+    maus_footprint_areas/<date>/` and `curated/register/<date>/`
+    directories, digest-verifying each artefact against its own manifest
+    (`_digest_verified_manifest` -- the same check `build-dea-coverage`
+    applies to its source register). The register must be DEA-ENRICHED
+    (carry `register.DEA_COVERAGE_COLUMNS`); a bare Batch B register
+    refuses, naming `build-dea-coverage`.
+
+    Refuses unless the crosswalk manifest and the footprint-area manifest
+    record the SAME Maus GeoPackage sha256. This is the whole reason the
+    footprint scalars are their own artefact
+    (`docs/decisions/2026-08-16-batch-c-footprint-input-direction.md`):
+    `maus_id` is derived from clipped geometry (`sources/maus.py::
+    _geometry_id`), so a crosswalk built from one Maus snapshot and
+    footprints derived from another can join cleanly on ids that no longer
+    mean the same polygon -- equal digests are the only cheap proof they
+    came from the same snapshot.
+
+    Rebuilds the item and asset indexes from the DEA STAC snapshot named in
+    the enriched register's own manifest
+    (`resolved_args["catalogue_date"]`), joins the high-confidence
+    crosswalk population to the footprint scalars
+    (`maus_footprints.join_site_footprints`), and calls the pure `dea_volume.
+    derive_volume_estimate` -- everything passed to it is an ordinary pandas
+    frame or a frozen declared input, never geometry.
+
+    Writes `<data_root>/reports/dea-volume/<date>/estimate.json` plus an
+    immutable run manifest (`inputs` = the register/crosswalk/footprints/
+    catalogue assets actually read, `resolved_args` carrying the four
+    source manifests' own digests). No public export: this report stays
+    under `data_root`, exactly like the artefacts it is derived from.
+    """
+    resolved: ProjectConfig = _load_config_or_exit(config)
+    resolved_config = resolved.model_dump(mode="json")
+    git_state = _collect_git_state_disclosing_gaps(_REPO_ROOT)
+    data_root = resolved.run.data_root
+
+    # 1. Latest crosswalk / footprint-areas / register directories.
+    try:
+        crosswalk_dir = _latest_curated_dated_dir(
+            data_root / "curated" / "crosswalk", label="curated/crosswalk"
+        )
+        footprints_dir = _latest_curated_dated_dir(
+            data_root / "curated" / "maus_footprint_areas",
+            label="curated/maus_footprint_areas",
+        )
+        register_dir = _latest_curated_dated_dir(
+            data_root / "curated" / "register", label="curated/register"
+        )
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    crosswalk_path = crosswalk_dir / "crosswalk.parquet"
+    footprints_path = footprints_dir / "footprint_areas.parquet"
+    register_path = register_dir / "register.parquet"
+
+    # Digest-verify all three parquets against their own manifests BEFORE
+    # anything downstream reads them (same order Task 11 established).
+    crosswalk_manifest = _digest_verified_manifest(crosswalk_path)
+    footprints_manifest = _digest_verified_manifest(footprints_path)
+    register_manifest = _digest_verified_manifest(register_path)
+
+    # 2. The register must be DEA-ENRICHED -- build-dea-coverage's output,
+    #    not the bare Batch B register.
+    register_df = read_table(register_path)
+    if any(column not in register_df.columns for column in register.DEA_COVERAGE_COLUMNS):
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        "latest curated register is not DEA-enriched -- run "
+                        "build-dea-coverage first"
+                    ),
+                    "register_path": str(register_path),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+
+    # 3. The Maus-digest equality refusal -- see this command's docstring.
+    #    `build-crosswalk`'s manifest records the Maus GeoPackage's sha256
+    #    on its `inputs` entry carrying the Maus licence (the module never
+    #    writes it into `resolved_args`); `build-maus-footprint-areas`
+    #    records it directly at `resolved_args.maus_gpkg_sha256`.
+    maus_licence_id = licence.SOURCES["maus_v2"].licence_id
+    crosswalk_maus_input = next(
+        (
+            asset
+            for asset in crosswalk_manifest.get("inputs", [])
+            if asset.get("licence") == maus_licence_id
+        ),
+        None,
+    )
+    if crosswalk_maus_input is None:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"{crosswalk_path}'s manifest carries no Maus input (licence "
+                        f"{maus_licence_id!r}) -- cannot verify it was built from the "
+                        "same Maus snapshot as the footprint artefact"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    crosswalk_maus_sha256 = crosswalk_maus_input["sha256"]
+    try:
+        footprints_maus_sha256 = footprints_manifest["resolved_args"]["maus_gpkg_sha256"]
+    except KeyError:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"{footprints_path}'s manifest does not record "
+                        "resolved_args.maus_gpkg_sha256"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+    if crosswalk_maus_sha256 != footprints_maus_sha256:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"crosswalk ({crosswalk_path}) and footprint-areas "
+                        f"({footprints_path}) were built from DIFFERENT Maus GeoPackage "
+                        f"snapshots -- crosswalk records {crosswalk_maus_sha256[:12]}..., "
+                        f"footprints records {footprints_maus_sha256[:12]}.... maus_id is "
+                        "derived from clipped geometry, so a join on maus_id alone cannot "
+                        "detect this; refusing rather than silently mixing two snapshots' "
+                        "geometry."
+                    ),
+                    "crosswalk_maus_gpkg_sha256": crosswalk_maus_sha256,
+                    "footprints_maus_gpkg_sha256": footprints_maus_sha256,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+
+    # 4. Catalogue snapshot the register was enriched from -- verified, then
+    #    rebuilt into the item and asset indexes.
+    try:
+        catalogue_date = register_manifest["resolved_args"]["catalogue_date"]
+    except KeyError:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"{register_path}'s manifest does not record "
+                        "resolved_args.catalogue_date -- not a build-dea-coverage output"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+    catalogue_dir = data_root / "raw" / "dea_stac" / catalogue_date
+    _verify_snapshot_or_refuse(
+        catalogue_dir, source_id="dea_stac", required_files=("catalogue_summary.json",)
+    )
+    catalogue_summary = json.loads(
+        (catalogue_dir / "catalogue_summary.json").read_text(encoding="utf-8")
+    )
+    items_by_source = _load_dea_items(catalogue_dir)
+    item_index, _duplicates_refused = dea_coverage.build_item_index(items_by_source)
+    asset_index, _asset_disclosures = dea_coverage.build_asset_index(items_by_source)
+
+    # 5. Declared inputs -- every constant echoed into the estimate/manifest
+    #    rather than hard-coded inside the estimator (D13 Batch C amendment
+    #    1a/1c). `year_ranges` come from each captured `collection.json`'s
+    #    own temporal extent, recorded in `catalogue_summary.json` at fetch
+    #    time -- never invented here.
+    year_ranges: dict[str, dea_volume.YearRange] = {}
+    for entry in catalogue_summary.get("collections", []):
+        start, end = entry["temporal_extent"]
+        year_ranges[entry["source_id"]] = dea_volume.YearRange(
+            first_year=int(str(start)[:4]), last_year=int(str(end)[:4])
+        )
+    selections = tuple(
+        dea_volume.CollectionSelection(
+            source_id=spec.source_id,
+            metric_ids=_DEA_METRIC_IDS[spec.source_id],
+            asset_keys=tuple(spec.asset_roles),
+            assumed_bytes_per_pixel=_DEA_ASSUMED_BYTES_PER_PIXEL[spec.source_id],
+            assumed_tile_pixels_per_side=_DEA_ASSUMED_TILE_PIXELS_PER_SIDE,
+        )
+        for spec in DEA_COLLECTIONS
+    )
+    window_policy = dea_volume.WindowPolicy()
+
+    # 6. High-confidence crosswalk rows joined to the digest-verified
+    #    footprint scalars, many-to-one on maus_id.
+    crosswalk_df = read_table(crosswalk_path)
+    footprint_stats = read_table(footprints_path)
+    try:
+        footprints_df = maus_footprints.join_site_footprints(
+            crosswalk.tier1_population(crosswalk_df), footprint_stats
+        )
+    except maus_footprints.FootprintStatsError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    try:
+        estimate = dea_volume.derive_volume_estimate(
+            crosswalk_df=crosswalk_df,
+            register_df=register_df,
+            footprints_df=footprints_df,
+            item_index=item_index,
+            asset_index=asset_index,
+            selections=selections,
+            year_ranges=year_ranges,
+            window_policy=window_policy,
+        )
+    except (dea_volume.VolumePopulationError, ValueError) as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    # 7. Every manifest ingredient computed BEFORE the artefact is written
+    #    (the Task 11 ordering rule -- see `build_maus_footprint_areas_cmd`
+    #    and `build_dea_coverage` for the identical discipline).
+    source_manifest_digests = {
+        "register": sha256_file(Path(str(register_path) + manifests.MANIFEST_SUFFIX)),
+        "crosswalk": sha256_file(Path(str(crosswalk_path) + manifests.MANIFEST_SUFFIX)),
+        "footprints": sha256_file(Path(str(footprints_path) + manifests.MANIFEST_SUFFIX)),
+        "catalogue": sha256_file(
+            catalogue_dir / (snapshots.SHA256SUMS_FILENAME + manifests.MANIFEST_SUFFIX)
+        ),
+    }
+    estimate["source_manifest_digests"] = source_manifest_digests
+
+    output_dir = data_root / "reports" / "dea-volume" / date
+    output_path = output_dir / "estimate.json"
+    _refuse_if_curated_output_already_exists(
+        output_path, config=resolved_config, git_state=git_state
+    )
+
+    register_dir_relative, register_dir_root = manifests.root_relative_path(
+        register_dir, config=resolved_config
+    )
+    crosswalk_dir_relative, crosswalk_dir_root = manifests.root_relative_path(
+        crosswalk_dir, config=resolved_config
+    )
+    footprints_dir_relative, footprints_dir_root = manifests.root_relative_path(
+        footprints_dir, config=resolved_config
+    )
+    catalogue_dir_relative, catalogue_dir_root = manifests.root_relative_path(
+        catalogue_dir, config=resolved_config
+    )
+    catalogue_sums_path = catalogue_dir / snapshots.SHA256SUMS_FILENAME
+
+    input_assets = [
+        SourceAsset(
+            uri=str(register_path),
+            sha256=sha256_file(register_path),
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(register_dir.name),
+            licence=None,
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(crosswalk_path),
+            sha256=sha256_file(crosswalk_path),
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(crosswalk_dir.name),
+            licence=None,
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(footprints_path),
+            sha256=sha256_file(footprints_path),
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(footprints_dir.name),
+            licence="CC-BY-SA-4.0",
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(catalogue_sums_path),
+            sha256=sha256_file(catalogue_sums_path),
+            collection="dea_stac",
+            snapshot_date=dt_date.fromisoformat(catalogue_date),
+            licence="CC-BY-4.0",
+            redistribute_public=True,
+        ),
+    ]
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(estimate, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8"
+    )
+
+    try:
+        manifests.write_run_manifest(
+            output=output_path,
+            inputs=input_assets,
+            config=resolved_config,
+            git_state=git_state,
+            resolved_args={
+                "date": date,
+                "register_dir": register_dir_relative,
+                "register_dir_root": register_dir_root,
+                "crosswalk_dir": crosswalk_dir_relative,
+                "crosswalk_dir_root": crosswalk_dir_root,
+                "footprints_dir": footprints_dir_relative,
+                "footprints_dir_root": footprints_dir_root,
+                "catalogue_dir": catalogue_dir_relative,
+                "catalogue_dir_root": catalogue_dir_root,
+                "catalogue_date": catalogue_date,
+                "source_manifest_digests": source_manifest_digests,
+                "selections": estimate["selections"],
+                "year_ranges": estimate["year_ranges"],
+                "window_policy": estimate["window_policy"],
+            },
+        )
+    except FileExistsError as exc:
+        # See the identical comment in `build_maus_footprint_areas_cmd`: the
+        # residual race `_refuse_if_curated_output_already_exists`'s
+        # pre-flight cannot close, rendered as structured JSON rather than a
+        # traceback.
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    typer.echo(
+        json.dumps(
+            {
+                "output_path": str(output_path),
+                "manifest_path": str(output_path) + manifests.MANIFEST_SUFFIX,
+                "population": estimate["population"],
+                "bytes": estimate["bytes"],
+                "tiles": estimate["tiles"],
             },
             indent=2,
             sort_keys=True,
