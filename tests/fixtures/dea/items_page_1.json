@@ -1,0 +1,52 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "id": "ga_ls5t_gm_cyear_3-x11y22-1990",
+      "bbox": [116.0, -33.0, 117.0, -32.0],
+      "properties": {
+        "datetime": "1990-07-02T00:00:00Z",
+        "odc:region_code": "x11y22",
+        "odc:dataset_version": "4.0.0"
+      },
+      "assets": {
+        "nbart_blue": {"href": "s3://x/b.tif"},
+        "nbart_green": {"href": "s3://x/g.tif"},
+        "nbart_red": {"href": "s3://x/r.tif"},
+        "nbart_nir": {"href": "s3://x/n.tif"},
+        "nbart_swir_1": {"href": "s3://x/s1.tif"},
+        "nbart_swir_2": {"href": "s3://x/s2.tif"},
+        "sdev": {"href": "s3://x/sd.tif"},
+        "edev": {"href": "s3://x/ed.tif"},
+        "bcdev": {"href": "s3://x/bc.tif"},
+        "count": {"href": "s3://x/c.tif"}
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "ga_ls5t_gm_cyear_3-x11y23-1990",
+      "bbox": [116.0, -34.0, 117.0, -33.0],
+      "properties": {
+        "datetime": "1990-07-02T00:00:00Z",
+        "odc:region_code": "x11y23",
+        "odc:dataset_version": "4.0.0"
+      },
+      "assets": {
+        "nbart_blue": {"href": "s3://x/b.tif"},
+        "nbart_green": {"href": "s3://x/g.tif"},
+        "nbart_red": {"href": "s3://x/r.tif"},
+        "nbart_nir": {"href": "s3://x/n.tif"},
+        "nbart_swir_1": {"href": "s3://x/s1.tif"},
+        "nbart_swir_2": {"href": "s3://x/s2.tif"},
+        "sdev": {"href": "s3://x/sd.tif"},
+        "edev": {"href": "s3://x/ed.tif"},
+        "bcdev": {"href": "s3://x/bc.tif"},
+        "count": {"href": "s3://x/c.tif"}
+      }
+    }
+  ],
+  "links": [
+    {"rel": "next", "href": "https://example.test/stac/collections/ga_ls5t_gm_cyear_3/items?page=2"}
+  ]
+}

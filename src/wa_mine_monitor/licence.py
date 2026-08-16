@@ -301,6 +301,21 @@ SOURCES: dict[str, SourceLicence] = {
 }
 
 
+def licence_for_collection(collection_id: str) -> SourceLicence:
+    """Return the SourceLicence whose `source_url` pins `collection_id`.
+
+    Used by the DEA catalogue fetch to compare a captured collection's own
+    `license` field against the pinned record: the licence gate re-reads
+    the licence from the captured JSON rather than trusting this table
+    (D13 Batch C gate: "DEA licences must be re-read from the captured
+    collection JSON").
+    """
+    for record in SOURCES.values():
+        if record.source_url.endswith(f"/collections/{collection_id}"):
+            return record
+    raise KeyError(f"no pinned licence record for collection {collection_id!r}")
+
+
 def minedex_redistribution_allowed(evidence_dir: Path, *, require_hashed: bool = True) -> bool:
     """True only when captured evidence explicitly places MINEDEX under CC-BY-4.0.
 

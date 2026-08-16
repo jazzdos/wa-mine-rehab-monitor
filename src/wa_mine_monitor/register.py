@@ -1065,3 +1065,51 @@ def build_reconciliation_report(
     lines.append(f"**{'PASS' if passed else 'FAIL'}**")
 
     return ReconciliationReport(text="\n".join(lines) + "\n", passed=passed)
+
+
+from wa_mine_monitor.dea_coverage import DEA_EPOCH_COLUMN_BY_SOURCE
+
+#: The four appended coverage columns, in declared order (D13 C3/C4).
+DEA_COVERAGE_COLUMNS: tuple[str, ...] = tuple(DEA_EPOCH_COLUMN_BY_SOURCE.values())
+
+#: REGISTER_SCHEMA plus the four nullable epoch counts -- built FROM the
+#: base schema so the two can never drift.
+ENRICHED_REGISTER_SCHEMA = pa.schema(
+    list(REGISTER_SCHEMA)
+    + [pa.field(column, pa.int64(), nullable=True) for column in DEA_COVERAGE_COLUMNS]
+)
+
+
+class RegisterEnrichmentError(ValueError):
+    """Enrichment would change row identity, count or order -- refused."""
+
+
+def enrich_register_with_dea_coverage(
+    register_df: pd.DataFrame, coverage_df: pd.DataFrame
+) -> pd.DataFrame:
+    """Append the four epoch-coverage columns; NEVER touch existing rows.
+
+    Refuses on any site-set or order difference: enrichment is an append of
+    columns, and a merge that drops, adds or reorders rows is a different
+    register wearing the old one's name (D13 C4: before/after row totals
+    equal, order byte-stable apart from the appended fields).
+    """
+    if len(coverage_df) != len(register_df):
+        raise RegisterEnrichmentError(
+            f"coverage has {len(coverage_df)} row(s) against the register's "
+            f"{len(register_df)} -- row loss or gain is refused"
+        )
+    register_sites = register_df["site_id"].tolist()
+    coverage_sites = coverage_df["site_id"].tolist()
+    if register_sites != coverage_sites:
+        if sorted(register_sites) == sorted(coverage_sites):
+            raise RegisterEnrichmentError(
+                "coverage site_id ORDER differs from the register -- reordering is refused"
+            )
+        raise RegisterEnrichmentError(
+            "coverage site_id set differs from the register -- mismatched sites refused"
+        )
+    enriched = register_df.copy()
+    for column in DEA_COVERAGE_COLUMNS:
+        enriched[column] = coverage_df[column].array
+    return enriched
