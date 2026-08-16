@@ -10,10 +10,15 @@ reconciliation before trust.
 
 ## Status
 
-**DONE — all uncommitted.** The repo has ZERO commits by design: commits, the
-private GitHub remote (ruling D2), the public flip (Tier 0 RC) and Pages
-(Tier 1, ruling D5) are decisions delegated to the codex director and not yet
-taken. Everything below is working tree only.
+**DONE — committed and pushed (2026-08-16, later session).** The
+zero-commits period ended with director rulings D9–D12
+(`docs/decisions/2026-08-16-d9-d12-commit-remote-naming-sequencing.md`):
+foundation commit `dd70b54` (51 files, battery green at 407), private
+remote `jazzdos/wa-mine-rehab-monitor` created and pushed per D10 (stays
+private under D10's nine public-flip criteria), first CI run green, and
+the D12.2–3 Batch B closeout merged as `72cf280` (battery green at 440).
+The public flip (Tier 0 RC) and Pages (Tier 1, ruling D5) remain gated.
+The narrative below records the build up to that point.
 
 - Design (`docs/plans/2026-08-15-wa-mine-rehab-monitor-design.md`), approved
   by the delegated codex director with rulings D1–D5. Descriptive claim scope
@@ -79,11 +84,19 @@ direct arithmetic or re-measurement against the parquet. Full record:
 `docs/checkpoints/tier0-result.md`. The stale SLIP-refusal dirs were
 inspected and cleared first, per step 1 as previously written here.
 
-Next: the codex director consult on commits/remote/naming (D9–D11, possibly
-D12 on batch sequencing) — launched detached 2026-08-16; record the rulings
-verbatim in `docs/decisions/` when they land, then act on them. After that,
-the batch detailing pass for Batches C–G, recording a deliberate reuse
-decision (port vs adopt vs build) per batch.
+The director consult landed the same day as rulings D9–D12, recorded
+verbatim in `docs/decisions/2026-08-16-d9-d12-commit-remote-naming-sequencing.md`
+and fully executed: D9 foundation commit `dd70b54`, D10 private remote
+(`jazzdos/wa-mine-rehab-monitor`, CI green), D11 names confirmed
+unchanged, D12.1–3 Batch B closeout built via workflow, merged as
+`72cf280` (440 tests), artefacts rebuilt with the new disclosures
+(`docs/checkpoints/batch-b-closeout.md`).
+
+**Next: D12.4 — the batch detailing pass for Batches C–G**, recording a
+deliberate reuse decision (port vs adopt vs build) per batch; preserve the
+C → D → E → F → G order (D12.5) and stand up the separate Tier 0
+public-RC lane holding the D2 checklist (D12.6). Batch C (DEA
+epoch-coverage) is authorized to start once detailed.
 
 Doc-reconciliation note: implementation-plan Task 11 still says the evidence
 json should show `adjudicated: false` — written before the D6–D8 rework added
