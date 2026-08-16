@@ -398,13 +398,17 @@ def _refuse_if_curated_output_already_exists(
 def _latest_curated_dated_dir(base_dir: Path, *, label: str) -> Path:
     """Return the most recently dated `<base_dir>/<date>/` directory.
 
-    Same "parse the name as a date, don't string-sort it" discipline as
-    `register.latest_snapshot`, generalised to a curated-artefact directory
-    (`<data_root>/curated/<artefact>/<date>/`) rather than a raw snapshot
-    directory (`<data_root>/raw/<source_id>/<date>/`) -- the two sit under
-    different parents but share the identical `<date>`-named-subdirectory
-    shape, so `build-crosswalk`'s "latest curated register" lookup reuses
-    this rather than a second copy of `latest_snapshot`'s loop.
+    Calls `snapshots.latest_dated_subdir` -- the SAME dated-directory scan
+    `register.latest_snapshot` calls for a raw snapshot parent
+    (`<data_root>/raw/<source_id>/`), applied here to a curated-artefact
+    parent (`<data_root>/curated/<artefact>/`) instead. This function does
+    not re-implement that scan; it supplies `base_dir` and turns a `None`
+    into a raise. It also does not check for `SHA256SUMS.txt` -- a curated
+    directory carries a run manifest, not a raw snapshot's checksum
+    manifest, and is never passed through `_verify_snapshot_or_refuse`
+    (`snapshots.latest_dated_subdir`'s own docstring states this split; see
+    `build_crosswalk_cmd`, whose curated register lookup calls this
+    function and is NOT gated the way its Maus raw-snapshot lookup is).
 
     Raises `register.NoSnapshotFoundError`, naming `label` and `base_dir`,
     when `base_dir` does not exist or holds no date-named subdirectory --
@@ -412,22 +416,12 @@ def _latest_curated_dated_dir(base_dir: Path, *, label: str) -> Path:
     `except` clause at the call site handles both a missing raw snapshot
     and a missing curated directory.
     """
-    candidates: list[tuple[dt_date, Path]] = []
-    if base_dir.is_dir():
-        for entry in base_dir.iterdir():
-            if not entry.is_dir():
-                continue
-            try:
-                parsed = dt_date.fromisoformat(entry.name)
-            except ValueError:
-                continue
-            candidates.append((parsed, entry))
-
-    if not candidates:
+    result = snapshots.latest_dated_subdir(base_dir)
+    if result is None:
         raise register.NoSnapshotFoundError(
             f"no dated directory found for {label!r} under {base_dir} -- build it first"
         )
-    return max(candidates, key=lambda pair: pair[0])[1]
+    return result
 
 
 def _verify_snapshot_or_refuse(
@@ -1520,7 +1514,26 @@ def build_register_cmd(config: Path = ConfigOption, date: str = DateOption) -> N
     three ever decides the verdict, and all are echoed on stdout and
     recorded in the run manifest (`resolved_args["owner_join_
     disclosures"]`, `resolved_args["n_sites_null_coordinates"]`,
-    `resolved_args["site_id_duplication"]`). Either reconciliation
+    `resolved_args["site_id_duplication"]`). A fourth is echoed on stdout
+    and recorded in the manifest the same way, but is not (yet) rendered
+    into `reconciliation.md`: `register.tenement_count_disclosure`
+    (`resolved_args["tenement_count_disclosure"]`, D12.2) -- how many
+    register rows had `n_tenements_intersecting` actually computed
+    (located sites) versus NOT COMPUTED (coordinate-less sites, `pd.NA`,
+    never a fabricated `0`), plus how many of the computed rows are a
+    genuine zero; the three counts always reconcile against `sites_total`
+    by construction (see that function's docstring). A fifth, `register.
+    owner_row_composition` (`resolved_args["owner_row_composition"]`,
+    D12.2), is disclosed the same way -- echoed on stdout and recorded in
+    the manifest, not rendered into `reconciliation.md` -- and splits the
+    `ProjectsOwners.csv` frame this command already has in hand into
+    CURRENT (blank `EndDate`) and ENDED (non-blank `EndDate`) row counts,
+    reconciling against that frame's own row total by construction; see
+    that function's docstring for why this matters (the real 2026-08-14
+    extract happens to be current-only, so D8's `owners_at_snapshot`
+    'current owner' filter has had no bite, and nothing pinned or disclosed
+    that property until now). None of the five ever decides the
+    reconciliation verdict. Either reconciliation
     check failing refuses the whole run (structured JSON error, exit 1)
     before any artefact is written -- the same validate-before-finalize
     discipline `fetch-minedex`/`fetch-tenements` apply to a bad download. A
@@ -1669,6 +1682,12 @@ def build_register_cmd(config: Path = ConfigOption, date: str = DateOption) -> N
         raise typer.Exit(1) from None
     counts = register.register_counts(df)
     owner_join_disclosures = register.owner_join_disclosures(sites_df, owners_df)
+    # D12.2: the ProjectsOwners.csv current/ended split, computed directly
+    # off the frame this command already has in hand -- see
+    # `register.owner_row_composition`'s docstring for why this is disclosed
+    # here too, alongside `owner_join_disclosures`, rather than left for a
+    # reader to re-derive from the MINEDEX snapshot's own validation summary.
+    owner_row_composition = register.owner_row_composition(owners_df)
     report = register.build_reconciliation_report(
         df,
         counts,
@@ -1727,6 +1746,13 @@ def build_register_cmd(config: Path = ConfigOption, date: str = DateOption) -> N
     # record -- see `register.site_id_duplication_counts`'s docstring.
     # Disclosed rather than refused; `build-crosswalk` is what acts on it.
     site_id_duplication = register.site_id_duplication_counts(df)
+    # D12.2 (`docs/decisions/2026-08-16-d9-d12-commit-remote-naming-
+    # sequencing.md`): NOT COMPUTED (coordinate-less sites) disclosed
+    # separately from a genuine computed zero -- see `register.
+    # tenement_count_disclosure`'s docstring for the reconciliation identity
+    # (`n_sites_tenement_count_computed + n_sites_tenement_count_not_computed
+    # == sites_total`) this always satisfies by construction.
+    tenement_count_disclosure = register.tenement_count_disclosure(df)
 
     minedex_source = licence.SOURCES["dmirs_001_minedex"]
     tenements_source = licence.SOURCES["dmirs_003_tenements"]
@@ -1777,8 +1803,10 @@ def build_register_cmd(config: Path = ConfigOption, date: str = DateOption) -> N
                 "register_lonlat_crs": register.REGISTER_LONLAT_CRS,
                 "minedex_source_crs": register.MINEDEX_SITES_SOURCE_CRS,
                 "owner_join_disclosures": owner_join_disclosures,
+                "owner_row_composition": owner_row_composition,
                 "n_sites_null_coordinates": n_sites_null_coordinates,
                 "site_id_duplication": site_id_duplication,
+                "tenement_count_disclosure": tenement_count_disclosure,
                 # The (ok, bad, missing) verification triple per input
                 # snapshot, as measured by `_verify_snapshot_or_refuse`
                 # before anything was read -- the artefact's own manifest
@@ -1805,8 +1833,10 @@ def build_register_cmd(config: Path = ConfigOption, date: str = DateOption) -> N
                 "reconciliation": "PASS" if report.passed else "FAIL",
                 "minedex_public_export_blocked": minedex_public_export_blocked,
                 "owner_join_disclosures": owner_join_disclosures,
+                "owner_row_composition": owner_row_composition,
                 "n_sites_null_coordinates": n_sites_null_coordinates,
                 "site_id_duplication": site_id_duplication,
+                "tenement_count_disclosure": tenement_count_disclosure,
                 "manifest_path": str(register_path) + manifests.MANIFEST_SUFFIX,
             },
             indent=2,
@@ -1953,15 +1983,26 @@ def build_crosswalk_cmd(config: Path = ConfigOption, date: str = DateOption) -> 
             )
         )
         raise typer.Exit(1) from None
-    except KeyError as exc:
-        # `register.parquet` read successfully but is missing an expected
-        # column (`site_id`, `lon` or `lat`) -- a schema-drifted or
-        # hand-built register. Named the same way `build_register_cmd`
-        # names a renamed MINEDEX column via its `ValueError` branch.
+    except (KeyError, crosswalk.CrosswalkInputError) as exc:
+        # Two distinct schema-drift shapes, reduced to the same structured
+        # refusal. `crosswalk.CrosswalkInputError` is `crosswalk.
+        # filter_register_for_crosswalk`'s own explicit check over
+        # `register.parquet` (`site_id`/`lon`/`lat`) -- its message already
+        # names every missing column, so it is used verbatim. A bare
+        # `KeyError` can still reach here only from the `wa_extract.gpkg`
+        # column-slice above (`maus_id`/`geometry`), which has no such
+        # explicit check and raises on direct bracket access -- named the
+        # same way `build_register_cmd` names a renamed MINEDEX column via
+        # its `ValueError` branch.
+        detail = (
+            str(exc)
+            if isinstance(exc, crosswalk.CrosswalkInputError)
+            else f"wa_extract.gpkg is missing the expected column {exc}"
+        )
         typer.echo(
             json.dumps(
                 {
-                    "refusal": f"register.parquet is missing the expected column {exc}",
+                    "refusal": detail,
                     "register_parquet": str(register_path),
                     "maus_gpkg": str(maus_path),
                 },
@@ -1973,15 +2014,30 @@ def build_crosswalk_cmd(config: Path = ConfigOption, date: str = DateOption) -> 
 
     try:
         df = crosswalk.build_crosswalk(minedex_gdf, maus_gdf)
-    except ValueError as exc:
-        # `build_crosswalk`'s input guards (duplicate/null `site_id`,
-        # duplicate/null `maus_id`, a site with no usable point) all raise
-        # `ValueError` naming the offending values. Rendered as the same
+    except crosswalk.CrosswalkInputError as exc:
+        # `build_crosswalk`'s own declared input guards (duplicate/null
+        # `site_id`, duplicate/null `maus_id`, a site with no usable point,
+        # a missing required column) all raise `crosswalk.
+        # CrosswalkInputError` -- a `ValueError` subclass, never a bare
+        # `ValueError` -- naming the offending values. Rendered as the same
         # structured JSON refusal every other refusal in this module emits,
-        # rather than reaching the terminal as a traceback with empty stdout.
+        # rather than reaching the terminal as a traceback with empty
+        # stdout. Catching this specific subclass, not bare `ValueError`,
+        # is deliberate: an unrelated `ValueError` raised inside the
+        # matching passes (a pandas/shapely internal, not an input-shape
+        # problem) must propagate uncaught rather than being reported as a
+        # clean refusal that misattributes a real defect. See
+        # `crosswalk.CrosswalkInputError`'s own docstring.
         typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
         raise typer.Exit(1) from None
     counts = crosswalk.crosswalk_counts(df)
+    row_total = crosswalk.crosswalk_row_total(df)
+    # `crosswalk_counts` deliberately does NOT carry `row_total` (see that
+    # function's docstring -- mixing it in broke `register.reconcile_
+    # counts`'s round-trip invariant on the returned dict). This CLI-level
+    # merge is a TERMINAL disclosure dict for `crosswalk_counts.json`, the
+    # run manifest and stdout only -- never re-fed into `reconcile_counts`.
+    disclosed_counts = {**counts, "row_total": row_total}
 
     output_dir = resolved.run.data_root / "curated" / "crosswalk" / date
     crosswalk_path = output_dir / "crosswalk.parquet"
@@ -2003,7 +2059,7 @@ def build_crosswalk_cmd(config: Path = ConfigOption, date: str = DateOption) -> 
     )
 
     counts_path = output_dir / "crosswalk_counts.json"
-    counts_path.write_text(json.dumps(counts, indent=2, sort_keys=True) + "\n")
+    counts_path.write_text(json.dumps(disclosed_counts, indent=2, sort_keys=True) + "\n")
 
     maus_source = licence.SOURCES["maus_v2"]
     input_assets = [
@@ -2044,7 +2100,7 @@ def build_crosswalk_cmd(config: Path = ConfigOption, date: str = DateOption) -> 
                 "register_dir_root": register_dir_root,
                 "maus_snapshot_dir": maus_snapshot_dir_relative,
                 "maus_snapshot_dir_root": maus_snapshot_dir_root,
-                "counts": counts,
+                "counts": disclosed_counts,
                 # See `build_register_cmd`: the input snapshot's verification
                 # triple, measured before anything was read.
                 "maus_snapshot_verification": maus_snapshot_verification,
@@ -2066,7 +2122,7 @@ def build_crosswalk_cmd(config: Path = ConfigOption, date: str = DateOption) -> 
         json.dumps(
             {
                 "crosswalk_path": str(crosswalk_path),
-                "counts": counts,
+                "counts": disclosed_counts,
                 "crosswalk_population": crosswalk_population_counts,
                 "manifest_path": str(crosswalk_path) + manifests.MANIFEST_SUFFIX,
             },

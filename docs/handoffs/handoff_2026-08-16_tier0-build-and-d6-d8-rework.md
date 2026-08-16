@@ -100,7 +100,11 @@ SLIP/DASC route references.
 - D8 owners semantics rest on a property of the 2026-08-14 extract (every
   ProjectsOwners row has an empty EndDate, i.e. current-only); a future
   extract that includes historical rows changes the "current owner" filter's
-  bite, and validation does not currently pin that property.
+  bite. Closed by the D12.2 closeout (2026-08-16): the composition is now
+  disclosed as `n_owner_rows_current` / `n_owner_rows_ended` in the
+  fetch-minedex validation summary and the build-register manifest
+  (`owner_row_composition`), pinned by tests against a mixed extract — see
+  `docs/checkpoints/batch-b-closeout.md`.
 - The DASC numeric file ids (2056/3978/3981) are pinned with product-identity
   validation per D6, but DMIRS could renumber; a refusal naming missing
   members is the designed failure mode.
@@ -108,10 +112,14 @@ SLIP/DASC route references.
 ## Open threads
 
 - Seven MINOR review findings deliberately deferred in the workflow ledger
-  (recorded there); one was made live by real data — `n_tenements_intersecting`
-  conflating not-computed with a fired zero for the 353 coordinate-less
-  sites — TB's disclosure counts cover the reporting half; the semantic
-  split remains open.
+  are now triaged per D12 item 3 — six closed with a pinning test each, one
+  (export-boundary drift: `REGISTER_SCHEMA` lon/lat vs `export_gate.
+  GEOMETRY_NAME_TOKENS`, design §4's licence-fields-non-null criterion,
+  `export_gate.export_public` having no caller) explicitly deferred to
+  Batch G / the Tier 0 public-RC lane, where `export_public` gains its
+  first caller. The `n_tenements_intersecting` not-computed-vs-fired-zero
+  split named here previously is one of the six now closed. Full record,
+  findings table and rationale: `docs/checkpoints/batch-b-closeout.md`.
 - Surface to Jarrod: the jarrah repo's `CLAUDE.md` licence-gate list still
   calls DMIRS-001 "clean"; the current Data WA record says cc-nc, and this
   project's D7 adjudication records the conflict formally. The jarrah file

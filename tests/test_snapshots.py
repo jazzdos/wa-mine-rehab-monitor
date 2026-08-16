@@ -22,11 +22,66 @@ from wa_mine_monitor.snapshots import (
     SHA256SUMS_FILENAME,
     create_snapshot_dir,
     finalize_snapshot,
+    latest_dated_subdir,
     snapshot_entries,
     update_snapshot_entry,
     verify_snapshot,
     write_snapshot_metadata,
 )
+
+# --- latest_dated_subdir --------------------------------------------------
+#
+# The one dated-directory scan `register.latest_snapshot` (a raw snapshot
+# parent, `<root>/raw/<source_id>/`) and `cli._latest_curated_dated_dir` (a
+# curated-artefact parent, `<data_root>/curated/<artefact>/`) both call --
+# pinned here directly, once, rather than as a duplicated loop under each
+# caller's own test file.
+
+
+def test_latest_dated_subdir_returns_the_most_recent_by_parsed_date(tmp_path: Path) -> None:
+    for date_str in ["2026-07-01", "2026-08-15", "2026-01-01"]:
+        (tmp_path / date_str).mkdir()
+
+    result = latest_dated_subdir(tmp_path)
+
+    assert result == tmp_path / "2026-08-15"
+
+
+def test_latest_dated_subdir_ignores_non_date_named_entries(tmp_path: Path) -> None:
+    (tmp_path / "2026-01-01").mkdir()
+    (tmp_path / "scratch").mkdir()  # junk dir name, must not string-sort above a date
+    (tmp_path / "2026-01-01.tmp").touch()  # a FILE, not a directory
+
+    result = latest_dated_subdir(tmp_path)
+
+    assert result == tmp_path / "2026-01-01"
+
+
+def test_latest_dated_subdir_returns_none_when_parent_holds_no_dated_dir(tmp_path: Path) -> None:
+    (tmp_path / "scratch").mkdir()
+
+    assert latest_dated_subdir(tmp_path) is None
+
+
+def test_latest_dated_subdir_returns_none_when_parent_does_not_exist(tmp_path: Path) -> None:
+    assert latest_dated_subdir(tmp_path / "does-not-exist") is None
+
+
+def test_latest_dated_subdir_selects_a_dated_dir_with_no_sha256sums(tmp_path: Path) -> None:
+    """Selection has no opinion on `SHA256SUMS.txt` -- a curated-artefact
+    directory (a run manifest, never a snapshot checksum manifest) is
+    selected exactly like a finalized raw snapshot would be; the SHA256SUMS
+    requirement lives entirely in `cli._verify_snapshot_or_refuse`, applied
+    only to raw snapshot directories after one is selected, never here."""
+    dated_dir = tmp_path / "2026-08-14"
+    dated_dir.mkdir()
+    (dated_dir / "register.parquet").write_bytes(b"not a real parquet file")
+
+    result = latest_dated_subdir(tmp_path)
+
+    assert result == dated_dir
+    assert not (result / SHA256SUMS_FILENAME).exists()
+
 
 # --- create_snapshot_dir -------------------------------------------------
 

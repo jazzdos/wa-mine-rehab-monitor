@@ -43,7 +43,6 @@ crosswalk's input population, recording the excluded count, rather than
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date as dt_date
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -51,6 +50,8 @@ import geopandas as gpd
 import pandas as pd
 import pyarrow as pa
 from shapely.geometry import Point
+
+from wa_mine_monitor.snapshots import latest_dated_subdir
 
 #: The single declared CRS `build_register`'s `lon`/`lat` output columns are
 #: always in -- WGS84 geographic coordinates. `build_register` reprojects
@@ -77,6 +78,25 @@ MINEDEX_SITES_SOURCE_CRS = "EPSG:7844"
 #: geometry-column check (`export_gate.has_geometry`, `GEOMETRY_NAME_TOKENS`)
 #: never fires on this table. `owners_at_snapshot` is a NULLABLE string --
 #: `pd.NA` on a site with no resolvable current owner (D8).
+#:
+#: `n_tenements_intersecting` is a NULLABLE int64 (D12.2,
+#: `docs/decisions/2026-08-16-d9-d12-commit-remote-naming-sequencing.md`):
+#: `pa.field`'s default `nullable=True` already permits this without any
+#: extra declaration, but the semantics it now carries are stated here
+#: because they changed -- `pd.NA` for a site with no usable location (the
+#: intersection was NEVER COMPUTED for it), and a genuine, computed
+#: `0`/`1`/... only for a site the spatial join actually ran against. A
+#: diagnostic that could not be computed is not a diagnostic that fired
+#: (CLAUDE.md's rule); before this ruling the column wrote a fabricated `0`
+#: for every coordinate-less site, conflating "no tenement intersects this
+#: located site" with "this site could not be located so the count was
+#: never computed". `build_register` constructs the column under pandas'
+#: nullable `"Int64"` dtype so this distinction survives in memory before
+#: it ever reaches `tables.write_table`; the write path needs no extra
+#: nullable-column registry (unlike a nullable BOOLEAN, `astype("Int64")`
+#: does not coerce `pd.NA` into a fabricated value the way `astype("bool")`
+#: does) -- verified end to end through `write_table`/`pd.read_parquet` in
+#: `tests/test_register.py`.
 REGISTER_SCHEMA = pa.schema(
     [
         pa.field("site_id", pa.string()),
@@ -154,29 +174,23 @@ def latest_snapshot(root: Path, source_id: str) -> Path:
     Snapshot directories are named `YYYY-MM-DD` (`snapshots.create_snapshot_
     dir`), so the most recent is found by comparing PARSED dates, not by
     lexicographic string sort. Only directories whose name parses as
-    `date.fromisoformat` are considered.
+    `date.fromisoformat` are considered -- both handled by `snapshots.
+    latest_dated_subdir`, which this function calls; it never re-implements
+    that scan (`cli._latest_curated_dated_dir` calls the identical shared
+    function for the curated-artefact case, and neither loop is a copy of
+    the other's).
 
     Raises `NoSnapshotFoundError`, naming `source_id`, when `<root>/raw/
     <source_id>/` does not exist or contains no date-named subdirectory.
     """
     source_dir = Path(root) / "raw" / source_id
-    candidates: list[tuple[dt_date, Path]] = []
-    if source_dir.is_dir():
-        for entry in source_dir.iterdir():
-            if not entry.is_dir():
-                continue
-            try:
-                parsed = dt_date.fromisoformat(entry.name)
-            except ValueError:
-                continue
-            candidates.append((parsed, entry))
-
-    if not candidates:
+    result = latest_dated_subdir(source_dir)
+    if result is None:
         raise NoSnapshotFoundError(
             f"no dated snapshot directory found for source {source_id!r} under "
             f"{source_dir} -- fetch a snapshot for this source first"
         )
-    return max(candidates, key=lambda pair: pair[0])[1]
+    return result
 
 
 def _classify_inclusion_status(stage: object) -> str:
@@ -532,6 +546,66 @@ OWNER_JOIN_DISCLOSURE_KEYS: tuple[str, ...] = (
 )
 
 
+#: Keys, in a fixed order, `owner_row_composition` always returns -- same
+#: discipline as `OWNER_JOIN_DISCLOSURE_KEYS`/`TENEMENT_COUNT_DISCLOSURE_KEYS`.
+OWNER_ROW_COMPOSITION_KEYS: tuple[str, ...] = (
+    "owner_rows_total",
+    "n_owner_rows_current",
+    "n_owner_rows_ended",
+)
+
+
+def owner_row_composition(owners_df: pd.DataFrame) -> dict[str, int]:
+    """Split `owners_df` (`ProjectsOwners.csv`) rows into CURRENT (blank
+    `EndDate`) and ENDED (non-blank `EndDate`) -- D12.2
+    (`docs/decisions/2026-08-16-d9-d12-commit-remote-naming-sequencing.md`).
+
+    `owners_by_project`'s CURRENT filter (D8: `EndDate` null or blank) is
+    what `owners_at_snapshot` is built from, and the real 2026-08-14 extract
+    happens to be current-only -- every `ProjectsOwners.csv` row carries a
+    blank `EndDate` -- so that filter has had no bite and nothing pinned or
+    disclosed the property. This is the identical disclosure `sources.
+    minedex.validate_minedex_bundles` makes at fetch time
+    (`n_owner_rows_current`/`n_owner_rows_ended`), computed here directly off
+    the `ProjectsOwners.csv` frame `build-register` already has in hand --
+    the register manifest is where a reader adjudicates owner semantics, so
+    the composition is disclosed there too rather than left to be re-derived
+    from the MINEDEX snapshot's own validation summary.
+
+    Disclosure, not refusal: an extract carrying ended rows is a valid
+    extract, and `owner_join_disclosures`/`owners_by_project`'s CURRENT-only
+    selection is unaffected either way.
+
+    - `owner_rows_total`: every row of `owners_df` -- the population the
+      other two keys are counted against.
+    - `n_owner_rows_current`: rows whose `EndDate` is null or blank (empty
+      after `str().strip()`) -- the same `end_date_blank` condition
+      `owners_by_project` filters on.
+    - `n_owner_rows_ended`: rows whose `EndDate` is non-blank.
+
+    Reconciles by construction: `n_owner_rows_current + n_owner_rows_ended
+    == owner_rows_total`, since the two are exact complements of the same
+    boolean partition.
+
+    Raises `ValueError`, naming the column, when `owners_df` carries no
+    `EndDate` column.
+    """
+    if "EndDate" not in owners_df.columns:
+        raise ValueError(
+            f"owners_df is missing required column 'EndDate' "
+            f"(columns present: {sorted(owners_df.columns)})"
+        )
+
+    end_date_blank = owners_df["EndDate"].isna() | (
+        owners_df["EndDate"].astype(str).str.strip() == ""
+    )
+    return {
+        "owner_rows_total": len(owners_df),
+        "n_owner_rows_current": int(end_date_blank.sum()),
+        "n_owner_rows_ended": int((~end_date_blank).sum()),
+    }
+
+
 def _count_intersecting_tenements(
     located_gdf: gpd.GeoDataFrame, tenements_gdf: gpd.GeoDataFrame
 ) -> pd.Series:
@@ -553,9 +627,32 @@ def _count_intersecting_tenements(
     fall through to `sjoin` on two frames GeoPandas treats as compatible
     only by silently assuming they share a CRS would silently produce
     `n_tenements_intersecting = 0` for every site.
+
+    `located_gdf.index` must be UNIQUE -- refused, naming every duplicated
+    value, otherwise. D12.3 triage, finding 5: the reduction below groups
+    `sjoin`'s output by `level=0` (index LABEL, not row), so two rows
+    sharing an index value are silently merged into one group and each
+    reports the UNION of both rows' matches rather than its own count.
+    `build_register` (this function's only CLI-reachable caller) always
+    builds `located_gdf` off a de-duplicated subset of its own frame's
+    `RangeIndex`, so this never fires through the CLI today -- it is a
+    latent trap for any other caller, closed here rather than left for the
+    next one to rediscover.
     """
     if len(tenements_gdf) == 0:
         return pd.Series(0, index=located_gdf.index, dtype="int64")
+
+    if not located_gdf.index.is_unique:
+        duplicated = sorted(
+            located_gdf.index[located_gdf.index.duplicated(keep=False)].unique().tolist()
+        )
+        raise ValueError(
+            f"located_gdf has a non-unique index -- duplicated value(s) {duplicated} -- "
+            "_count_intersecting_tenements groups its sjoin output by index level 0, so a "
+            "duplicated index label silently merges the rows sharing it into one group and "
+            "reports the union of their matches as each row's own count; pass a located_gdf "
+            "with a unique index (e.g. reset_index() to a fresh RangeIndex first)"
+        )
 
     if tenements_gdf.crs is None:
         raise ValueError(
@@ -610,9 +707,13 @@ def build_register(
       never dropped, and is COUNTED by `count_rows_without_location`).
     - `n_tenements_intersecting`: a spatial join (point-in-tenement-polygon)
       against `tenements_gdf`, computed ONLY over rows that carry both
-      coordinates -- a coordinate-less row takes NO part in the join and is
-      `0` by definition (not "not computed": there is no ambiguity about
-      whether a point with no coordinates intersects anything).
+      coordinates. A coordinate-less row takes NO part in the join and is
+      `pd.NA` -- NOT COMPUTED, D12.2 -- never a fabricated `0`: "no tenement
+      intersects this located site" (a fired zero) and "this site could not
+      be located so the count was never computed" are different facts, and
+      conflating them was the defect this ruling closes. A located row's
+      count is a genuine computed integer, including `0` when the join
+      found no intersecting tenement.
     - `inclusion_status` is `Stage` classified via `STAGE_TO_INCLUSION`
       (`_classify_inclusion_status`) -- an unmapped stage lands in `other`
       and the row is never dropped.
@@ -645,7 +746,13 @@ def build_register(
         index=located_index, geometry=located_points, crs=MINEDEX_SITES_SOURCE_CRS
     )
 
-    n_tenements = pd.Series(0, index=minedex_sites_df.index, dtype="int64")
+    # `pd.NA` for every row, under pandas' nullable "Int64" dtype -- D12.2:
+    # NOT COMPUTED is the default, and only a row that actually goes through
+    # `_count_intersecting_tenements` below (i.e. carries usable coordinates)
+    # is overwritten with a genuine computed integer, including `0`. See
+    # `REGISTER_SCHEMA`'s docstring for why this dtype survives the write
+    # path without a separate nullable-column registry.
+    n_tenements = pd.Series(pd.NA, index=minedex_sites_df.index, dtype="Int64")
     lon = pd.Series(float("nan"), index=minedex_sites_df.index, dtype="float64")
     lat = pd.Series(float("nan"), index=minedex_sites_df.index, dtype="float64")
     if len(located_gdf) > 0:
@@ -702,6 +809,52 @@ def count_rows_without_location(df: pd.DataFrame) -> int:
     the register is counted by the same definition.
     """
     return int((df["lon"].isna() | df["lat"].isna()).sum())
+
+
+#: Keys `tenement_count_disclosure` always returns, in a fixed order -- same
+#: discipline as `OWNER_JOIN_DISCLOSURE_KEYS`/`SITE_ID_DUPLICATION_KEYS`.
+TENEMENT_COUNT_DISCLOSURE_KEYS: tuple[str, ...] = (
+    "sites_total",
+    "n_sites_tenement_count_computed",
+    "n_sites_tenement_count_zero",
+    "n_sites_tenement_count_not_computed",
+)
+
+
+def tenement_count_disclosure(df: pd.DataFrame) -> dict[str, int]:
+    """Count `df["n_tenements_intersecting"]` by NOT COMPUTED vs. computed
+    (D12.2): the same "a diagnostic that could not be computed is not a
+    diagnostic that fired" discipline `owner_join_disclosures` and
+    `site_id_duplication_counts` already apply to their own columns.
+
+    - `sites_total`: every row of `df` -- the population the other three
+      keys are counted against, so a caller can check the reconciliation
+      identity below without a separate `len(df)` call.
+    - `n_sites_tenement_count_computed`: rows whose `n_tenements_
+      intersecting` is NOT null -- the spatial join actually ran for these
+      (the row carried usable coordinates).
+    - `n_sites_tenement_count_zero`: the SUBSET of computed rows whose
+      count is exactly `0` -- a genuine "no tenement intersects this
+      located site" result, never confused with a not-computed row.
+    - `n_sites_tenement_count_not_computed`: rows whose `n_tenements_
+      intersecting` IS null -- coordinate-less rows the join never ran
+      against (`build_register` never fabricates a `0` for these).
+
+    Reconciles by construction: `n_sites_tenement_count_computed +
+    n_sites_tenement_count_not_computed == sites_total`, since "computed"
+    and "not computed" are defined as exact complements of the same
+    null/non-null partition of `df["n_tenements_intersecting"]`.
+    """
+    computed = df["n_tenements_intersecting"].notna()
+    not_computed = ~computed
+    return {
+        "sites_total": len(df),
+        "n_sites_tenement_count_computed": int(computed.sum()),
+        "n_sites_tenement_count_zero": int(
+            (df.loc[computed, "n_tenements_intersecting"] == 0).sum()
+        ),
+        "n_sites_tenement_count_not_computed": int(not_computed.sum()),
+    }
 
 
 #: Keys `site_id_duplication_counts` always returns, in a fixed order --

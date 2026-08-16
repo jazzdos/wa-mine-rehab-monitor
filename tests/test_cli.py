@@ -3,9 +3,16 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
-from wa_mine_monitor.cli import _collect_git_state_disclosing_gaps, app
+from wa_mine_monitor import register, snapshots
+from wa_mine_monitor.cli import (
+    _collect_git_state_disclosing_gaps,
+    _latest_curated_dated_dir,
+    _verify_snapshot_or_refuse,
+    app,
+)
 
 runner = CliRunner()
 
@@ -288,3 +295,95 @@ def test_no_command_creates_a_snapshot_directory_on_a_config_error(
 
     assert result.exit_code == 1
     assert not (data_root / "raw").exists()
+
+
+# =============================================================================
+# _latest_curated_dated_dir
+#
+# Pins the same selection behaviour as `register.latest_snapshot`
+# (`tests/test_register.py`'s `latest_snapshot` section) -- both now call
+# the one shared `snapshots.latest_dated_subdir` scan -- plus the
+# curated-vs-raw finalization difference: a curated directory is selected
+# with no `SHA256SUMS.txt` at all, while a raw snapshot directory in the
+# same shape is refused by `_verify_snapshot_or_refuse`, the gate build
+# commands apply only to raw snapshot inputs.
+# =============================================================================
+
+
+def test_latest_curated_dated_dir_returns_the_most_recent_dated_dir(tmp_path: Path) -> None:
+    base_dir = tmp_path / "curated" / "register"
+    for date_str in ["2026-07-01", "2026-08-15", "2026-01-01"]:
+        (base_dir / date_str).mkdir(parents=True)
+
+    result = _latest_curated_dated_dir(base_dir, label="curated/register")
+
+    assert result == base_dir / "2026-08-15"
+
+
+def test_latest_curated_dated_dir_ignores_non_date_directories(tmp_path: Path) -> None:
+    base_dir = tmp_path / "curated" / "register"
+    (base_dir / "2026-01-01").mkdir(parents=True)
+    (base_dir / "scratch").mkdir(parents=True)
+
+    result = _latest_curated_dated_dir(base_dir, label="curated/register")
+
+    assert result.name == "2026-01-01"
+
+
+def test_latest_curated_dated_dir_raises_naming_the_label_when_none_exists(
+    tmp_path: Path,
+) -> None:
+    base_dir = tmp_path / "curated" / "register"
+    with pytest.raises(register.NoSnapshotFoundError, match="curated/register"):
+        _latest_curated_dated_dir(base_dir, label="curated/register")
+
+
+def test_latest_curated_dated_dir_raises_when_the_base_directory_itself_is_absent(
+    tmp_path: Path,
+) -> None:
+    base_dir = tmp_path / "curated" / "crosswalk"
+    with pytest.raises(register.NoSnapshotFoundError, match="curated/crosswalk"):
+        _latest_curated_dated_dir(base_dir, label="curated/crosswalk")
+
+
+def test_latest_curated_dated_dir_selects_a_dated_dir_with_no_sha256sums(
+    tmp_path: Path,
+) -> None:
+    """A curated directory carries a run manifest, not a raw snapshot's
+    `SHA256SUMS.txt` -- selection must succeed on one with no checksum file
+    at all, the state a real `curated/register/<date>/` directory is
+    always in."""
+    base_dir = tmp_path / "curated" / "register"
+    dated_dir = base_dir / "2026-08-14"
+    dated_dir.mkdir(parents=True)
+    (dated_dir / "register.parquet").write_bytes(b"not a real parquet file")
+
+    result = _latest_curated_dated_dir(base_dir, label="curated/register")
+
+    assert result == dated_dir
+    assert not (result / snapshots.SHA256SUMS_FILENAME).exists()
+
+
+def test_latest_curated_dated_dir_and_verify_snapshot_or_refuse_diverge_on_sha256sums(
+    tmp_path: Path,
+) -> None:
+    """The distinction that makes these two loops different callers, pinned
+    directly: the SAME dated-dir shape (a directory with no `SHA256SUMS.
+    txt`) is selected without complaint as a curated directory, and refused
+    by `_verify_snapshot_or_refuse` as a raw snapshot -- the raw-snapshot
+    integrity gate `build-register`/`build-crosswalk` apply only to their
+    RAW inputs, never to a curated one selected via
+    `_latest_curated_dated_dir`."""
+    curated_dir = tmp_path / "curated" / "register" / "2026-08-14"
+    curated_dir.mkdir(parents=True)
+    raw_dir = tmp_path / "raw" / "dmirs_001_minedex" / "2026-08-14"
+    raw_dir.mkdir(parents=True)  # identical shape: dated, no SHA256SUMS.txt
+
+    # Curated: selection alone, no integrity gate applied -- passes.
+    selected = _latest_curated_dated_dir(curated_dir.parent, label="curated/register")
+    assert selected == curated_dir
+
+    # Raw: the same directory shape, run through the gate a build command
+    # actually applies to a raw snapshot -- refused, naming "never finalized".
+    with pytest.raises(typer.Exit):
+        _verify_snapshot_or_refuse(raw_dir, source_id="dmirs_001_minedex")
