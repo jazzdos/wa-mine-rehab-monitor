@@ -1925,3 +1925,69 @@ def test_enrich_refuses_row_loss_gain_and_mismatched_sites():
         register_module.enrich_register_with_dea_coverage(
             register_df, _coverage_frame(register_df["site_id"][:1])
         )
+
+
+# =============================================================================
+# ELIGIBLE_REGISTER_SCHEMA / validate_eligible_register (D13 D5)
+# =============================================================================
+
+
+def test_eligible_schema_is_enriched_schema_plus_four_fields():
+    import pyarrow as pa
+
+    from wa_mine_monitor.register import (
+        D3_ELIGIBILITY_COLUMNS,
+        ELIGIBLE_REGISTER_SCHEMA,
+        ENRICHED_REGISTER_SCHEMA,
+    )
+
+    assert ELIGIBLE_REGISTER_SCHEMA.names == ENRICHED_REGISTER_SCHEMA.names + list(
+        D3_ELIGIBILITY_COLUMNS
+    )
+    for column in ("effective_pixel_support_px", "d3_threshold_px"):
+        field = ELIGIBLE_REGISTER_SCHEMA.field(column)
+        assert field.type == pa.int64()
+        assert field.nullable
+    d3_eligible_field = ELIGIBLE_REGISTER_SCHEMA.field("d3_eligible")
+    assert d3_eligible_field.type == pa.bool_()
+    assert d3_eligible_field.nullable
+    trajectory_field = ELIGIBLE_REGISTER_SCHEMA.field("trajectory_status")
+    assert trajectory_field.type == pa.string()
+    assert not trajectory_field.nullable
+
+
+def _eligibility_frame(rows: list[dict]) -> pd.DataFrame:
+    return pd.DataFrame(rows)
+
+
+def test_validate_eligible_register_rejects_unknown_status():
+    frame = _eligibility_frame([{"trajectory_status": "not_a_real_status", "d3_eligible": pd.NA}])
+    with pytest.raises(register_module.TrajectoryStatusError, match="unknown"):
+        register_module.validate_eligible_register(frame)
+
+
+def test_validate_eligible_register_rejects_eligible_true_on_non_eligible_status():
+    frame = _eligibility_frame(
+        [{"trajectory_status": "insufficient_pixel_support", "d3_eligible": True}]
+    )
+    with pytest.raises(register_module.TrajectoryStatusError, match="d3_eligible=True"):
+        register_module.validate_eligible_register(frame)
+
+
+def test_validate_eligible_register_rejects_null_eligible_on_judged_status():
+    frame = _eligibility_frame([{"trajectory_status": "eligible", "d3_eligible": pd.NA}])
+    with pytest.raises(register_module.TrajectoryStatusError, match="judged"):
+        register_module.validate_eligible_register(frame)
+
+
+def test_validate_eligible_register_accepts_a_conforming_frame():
+    frame = _eligibility_frame(
+        [
+            {"trajectory_status": "eligible", "d3_eligible": True},
+            {"trajectory_status": "insufficient_pixel_support", "d3_eligible": False},
+            {"trajectory_status": "threshold_not_computed", "d3_eligible": False},
+            {"trajectory_status": "no_usable_footprint", "d3_eligible": pd.NA},
+            {"trajectory_status": "crosswalk_not_high_confidence", "d3_eligible": pd.NA},
+        ]
+    )
+    register_module.validate_eligible_register(frame)  # must not raise

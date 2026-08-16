@@ -8,33 +8,40 @@ against the real project config in operation.
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import io
 import json
 import os
 import subprocess
 import zipfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import date as dt_date
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyogrio
+import rasterio  # type: ignore[import-untyped]
 import typer
 import yaml
 from pydantic import ValidationError
 
 from wa_mine_monitor import (
     crosswalk,
+    d3_inputs,
     d3_protocol,
+    d3_threshold,
     dea_coverage,
+    dea_raster,
     dea_volume,
     licence,
     manifests,
     maus_footprints,
+    pixel_support,
     register,
     snapshots,
 )
@@ -3317,6 +3324,1744 @@ def cmd_freeze_d3_protocol(
             },
             indent=2,
             sort_keys=True,
+        )
+    )
+
+
+def _capture_asset_http_headers(
+    dataset: rasterio.DatasetReader, href: str
+) -> tuple[str | None, str | None]:
+    """Best-effort HTTP ETag/Last-Modified for `href`.
+
+    A local-file href (the only kind any fixture ever uses) never touches
+    the HTTP layer at all -- both fields stay `None`, disclosed as null
+    rather than a fabricated "unchanged" sentinel. A genuine `http(s)` href
+    is read through GDAL's `/vsicurl/` layer, which -- when it populated
+    one -- caches the response headers on the dataset under the `HEADERS`
+    metadata domain; a driver/version that never populated it leaves both
+    fields `None`, exactly like a local file.
+    """
+    if not href.startswith(("http://", "https://")):
+        return None, None
+    try:
+        headers = dataset.tags(ns="HEADERS")
+    except Exception:  # noqa: BLE001 -- best-effort only, never a run refusal
+        return None, None
+    return headers.get("ETag"), headers.get("Last-Modified")
+
+
+def _decode_d3_bands(band_values: Mapping[str, np.ndarray], *, kind: str) -> dict[str, np.ndarray]:
+    """`dea_raster`'s decode rule for `kind` ("geomedian" | "fc"), applied
+    to every band array. FC's out-of-range count is intentionally not
+    returned here -- Phase A/B only need computability and metric values;
+    a future FC-specific disclosure can read `dea_raster.decode_fc` directly."""
+    if kind == "geomedian":
+        return {band: dea_raster.decode_geomedian(values) for band, values in band_values.items()}
+    return {band: dea_raster.decode_fc(values)[0] for band, values in band_values.items()}
+
+
+def _read_footprint_year_bands(
+    *,
+    source_id: str,
+    kind: str,
+    year: int,
+    touched_tiles: Sequence[str],
+    members: Sequence[d3_inputs.Member],
+    item_index: Mapping[tuple[str, str, int], Mapping[str, Any]],
+    phase: str,
+) -> tuple[dict[str, np.ndarray], list[dict[str, object]]]:
+    """Read this footprint's `members` from every band asset the
+    `(source_id, year)` items on `touched_tiles` carry.
+
+    One windowed read per (band, tile) via `d3_inputs.read_member_values`;
+    returns the RAW (undecoded) band arrays keyed by asset key, plus one
+    `D3_EXTRACTION_ASSETS_SCHEMA` row per (tile, band) asset actually
+    opened, phase-tagged so Phase B can refuse an asset whose ETag changed
+    since Phase A read it.
+    """
+    hrefs_by_tile: dict[str, dict[str, str]] = {}
+    for tile_id in touched_tiles:
+        try:
+            hrefs_by_tile[tile_id] = d3_inputs.resolve_band_hrefs(
+                item_index[(source_id, tile_id, year)], kind=kind
+            )
+        except d3_inputs.D3InputsError as exc:
+            raise d3_inputs.D3InputsError(
+                f"failed to resolve raster band asset(s) for "
+                f"(source_id={source_id!r}, tile_id={tile_id!r}, year={year}): {exc}"
+            ) from exc
+    band_keys = sorted(next(iter(hrefs_by_tile.values())).keys())
+    band_values: dict[str, np.ndarray] = {}
+    extraction_rows: list[dict[str, object]] = []
+    for band_key in band_keys:
+        with contextlib.ExitStack() as stack:
+            datasets: dict[str, Any] = {}
+            for tile_id in touched_tiles:
+                href = hrefs_by_tile[tile_id][band_key]
+                try:
+                    dataset = stack.enter_context(rasterio.open(href))
+                except (rasterio.errors.RasterioError, OSError) as exc:
+                    raise d3_inputs.D3InputsError(
+                        f"failed to open raster asset for "
+                        f"(source_id={source_id!r}, tile_id={tile_id!r}, year={year}, "
+                        f"band={band_key!r}, href={href!r}): {exc}"
+                    ) from exc
+                datasets[tile_id] = dataset
+                etag, last_modified = _capture_asset_http_headers(dataset, href)
+                extraction_rows.append(
+                    {
+                        "source_id": source_id,
+                        "tile_id": tile_id,
+                        "year": year,
+                        "asset_key": band_key,
+                        "href": href,
+                        "etag": etag,
+                        "last_modified": last_modified,
+                        "phase": phase,
+                    }
+                )
+            try:
+                band_values[band_key] = d3_inputs.read_member_values(datasets, members)
+            except (rasterio.errors.RasterioError, OSError) as exc:
+                raise d3_inputs.D3InputsError(
+                    f"failed reading raster asset(s) for "
+                    f"(source_id={source_id!r}, tile_id(s)={sorted(datasets)!r}, "
+                    f"year={year}, band={band_key!r}): {exc}"
+                ) from exc
+    return band_values, extraction_rows
+
+
+@app.command("build-d3-inputs")
+def build_d3_inputs_cmd(
+    config: Path = ConfigOption,
+    protocol_config: Path = ProtocolConfigOption,
+    date: str = DateOption,
+) -> None:
+    """Build the D3 reduced-support simulation inputs from real DEA rasters.
+
+    The full pipeline (D13 task D3): footprint strata (region/commodity/
+    shape) over the Tier 1 population, ACTUAL pixel support per footprint
+    against each intersecting tile's ACTUAL grid, one selected catalogue
+    item per (collection, tile, year), Phase A validity-only reads over
+    every candidate footprint (support >= 144 AND at least one epoch
+    covered), stratum adequacy and selection over the frozen 54-stratum
+    space, Phase B value reads and 100-replicate reduced-support simulation
+    for SELECTED footprints only, and per-footprint Spearman rank
+    correlation between full- and reduced-support metric series.
+
+    Every gate mirrors `derive-dea-volume`'s discipline (digest-verified
+    latest curated inputs, a Maus-snapshot sha256 equality gate) plus two
+    the frozen D3 protocol adds: single-lineage frozen-protocol lookup with
+    a recomputed-digest drift check, and a code/procedures-text consistency
+    check (`d3_inputs.check_procedures_consistency`) -- the protocol digest
+    alone proves the YAML has not changed since freezing, not that the CODE
+    consuming it still agrees with what the YAML documents.
+
+    Writes FIVE tables under `<data_root>/curated/d3-inputs/<date>/`
+    (`support_inputs.parquet`, `support_spearman.parquet`, `footprint_support.
+    parquet`, `stratum_summary.parquet`, `extraction_assets.parquet`),
+    assembled in a `.tmp` sibling directory and `os.replace`d into place
+    only once every table and its run manifest wrote cleanly -- a partial
+    five-table write must never be mistaken for a completed run.
+    """
+    resolved: ProjectConfig = _load_config_or_exit(config)
+    resolved_config = resolved.model_dump(mode="json")
+    git_state = _collect_git_state_disclosing_gaps(_REPO_ROOT)
+    data_root = resolved.run.data_root
+
+    # GATE 0 -- preflight existing-output, BEFORE any snapshot or raster
+    # access (not even the frozen protocol is read yet).
+    output_dir = data_root / "curated" / "d3-inputs" / date
+    if output_dir.exists():
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"{output_dir} already exists -- this curated artefact was already "
+                        "built by an earlier run. Refusing before any snapshot or raster "
+                        "access. Move the existing output directory aside, or choose a "
+                        "different --date, to build again."
+                    ),
+                    "output_dir": str(output_dir),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+
+    # GATE 1 -- the frozen protocol: exactly one dated lineage, digest
+    # verified, recomputed digest must match (drift check), and the
+    # procedures text must still name this module's own frozen constants.
+    d3_protocol_root = data_root / "curated" / "d3-protocol"
+    dated_protocol_dirs = (
+        sorted(d3_protocol_root.glob("????-??-??")) if d3_protocol_root.exists() else []
+    )
+    if not dated_protocol_dirs:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"no frozen D3 protocol under {d3_protocol_root} -- run "
+                        "freeze-d3-protocol first"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    if len(dated_protocol_dirs) > 1:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"curated/d3-protocol has {len(dated_protocol_dirs)} dated "
+                        f"directories {[d.name for d in dated_protocol_dirs]} -- single "
+                        "lineage violated: a frozen protocol may never be superseded "
+                        "silently. Move all but one dated directory aside."
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    protocol_dir = dated_protocol_dirs[0]
+    protocol_artifact_path = protocol_dir / "protocol.json"
+    _digest_verified_manifest(protocol_artifact_path)
+    frozen_digest = json.loads(protocol_artifact_path.read_text(encoding="utf-8"))[
+        "protocol_digest"
+    ]
+
+    try:
+        protocol = d3_protocol.load_protocol(protocol_config)
+    except (d3_protocol.D3ProtocolError, OSError, yaml.YAMLError) as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    recomputed_digest = d3_protocol.protocol_digest(protocol)
+    if recomputed_digest != frozen_digest:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"protocol drift: --protocol-config ({protocol_config}) recomputes "
+                        f"digest {recomputed_digest[:12]}..., the frozen artefact at "
+                        f"{protocol_artifact_path} records {frozen_digest[:12]}... -- the "
+                        "config changed after freeze-d3-protocol ran. No accuracy result may "
+                        "change sample definitions or criteria after freezing."
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    try:
+        d3_inputs.check_procedures_consistency(protocol.procedures)
+    except d3_inputs.D3InputsError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    # GATE 2 -- the enriched register: latest, digest-verified, must carry
+    # register.DEA_COVERAGE_COLUMNS.
+    try:
+        register_dir = _latest_curated_dated_dir(
+            data_root / "curated" / "register", label="curated/register"
+        )
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    register_path = register_dir / "register.parquet"
+    register_manifest = _digest_verified_manifest(register_path)
+    register_df = read_table(register_path)
+    if any(column not in register_df.columns for column in register.DEA_COVERAGE_COLUMNS):
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        "latest curated register is not DEA-enriched -- run "
+                        "build-dea-coverage first"
+                    ),
+                    "register_path": str(register_path),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+
+    # GATE 3 -- the crosswalk: latest, digest-verified; Tier 1 population.
+    try:
+        crosswalk_dir = _latest_curated_dated_dir(
+            data_root / "curated" / "crosswalk", label="curated/crosswalk"
+        )
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    crosswalk_path = crosswalk_dir / "crosswalk.parquet"
+    crosswalk_manifest = _digest_verified_manifest(crosswalk_path)
+    crosswalk_df = read_table(crosswalk_path)
+    tier1_df = crosswalk.tier1_population(crosswalk_df)
+
+    # GATE 4 -- footprint areas: latest, digest-verified; Maus sha256
+    # equality gate between the crosswalk and footprint-areas manifests
+    # (mirrors `derive-dea-volume`'s identical check verbatim).
+    try:
+        footprints_dir = _latest_curated_dated_dir(
+            data_root / "curated" / "maus_footprint_areas",
+            label="curated/maus_footprint_areas",
+        )
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    footprints_path = footprints_dir / "footprint_areas.parquet"
+    footprints_manifest = _digest_verified_manifest(footprints_path)
+
+    maus_licence_id = licence.SOURCES["maus_v2"].licence_id
+    crosswalk_maus_input = next(
+        (
+            asset
+            for asset in crosswalk_manifest.get("inputs", [])
+            if asset.get("licence") == maus_licence_id
+        ),
+        None,
+    )
+    if crosswalk_maus_input is None:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"{crosswalk_path}'s manifest carries no Maus input (licence "
+                        f"{maus_licence_id!r}) -- cannot verify it was built from the "
+                        "same Maus snapshot as the footprint artefact"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    crosswalk_maus_sha256 = crosswalk_maus_input["sha256"]
+    try:
+        footprints_maus_sha256 = footprints_manifest["resolved_args"]["maus_gpkg_sha256"]
+    except KeyError:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"{footprints_path}'s manifest does not record "
+                        "resolved_args.maus_gpkg_sha256"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+    if crosswalk_maus_sha256 != footprints_maus_sha256:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"crosswalk ({crosswalk_path}) and footprint-areas "
+                        f"({footprints_path}) were built from DIFFERENT Maus GeoPackage "
+                        f"snapshots -- crosswalk records {crosswalk_maus_sha256[:12]}..., "
+                        f"footprints records {footprints_maus_sha256[:12]}.... maus_id is "
+                        "derived from clipped geometry, so a join on maus_id alone cannot "
+                        "detect this; refusing rather than silently mixing two snapshots' "
+                        "geometry."
+                    ),
+                    "crosswalk_maus_gpkg_sha256": crosswalk_maus_sha256,
+                    "footprints_maus_gpkg_sha256": footprints_maus_sha256,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+
+    # GATE 5 -- the RDC regions snapshot: latest raw snapshot, integrity
+    # verified, loaded via `wa_regions.load_regions`.
+    try:
+        regions_dir = register.latest_snapshot(data_root, "wa_rdc_regions")
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    _verify_snapshot_or_refuse(
+        regions_dir, source_id="wa_rdc_regions", required_files=("regions.gpkg",)
+    )
+    regions_path = regions_dir / "regions.gpkg"
+    try:
+        regions_gdf = wa_regions.load_regions(regions_path)
+    except wa_regions.RegionExtractError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    # GATE 6 -- the Maus geometry snapshot: verified, AND its sha256 must
+    # ALSO equal the crosswalk manifest's own Maus digest (gate 4 already
+    # tied the footprint-areas artefact to that same digest).
+    try:
+        maus_snapshot_dir = register.latest_snapshot(data_root, "maus_v2")
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    _verify_snapshot_or_refuse(
+        maus_snapshot_dir, source_id="maus_v2", required_files=("wa_extract.gpkg",)
+    )
+    maus_path = maus_snapshot_dir / "wa_extract.gpkg"
+    maus_gpkg_sha256 = sha256_file(maus_path)
+    if maus_gpkg_sha256 != crosswalk_maus_sha256:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"latest maus_v2 raw snapshot ({maus_path}) hashes "
+                        f"{maus_gpkg_sha256[:12]}..., but the crosswalk's manifest records "
+                        f"Maus sha256 {crosswalk_maus_sha256[:12]}... -- the latest raw Maus "
+                        "snapshot is not the one the crosswalk was built from"
+                    ),
+                    "maus_gpkg_sha256": maus_gpkg_sha256,
+                    "crosswalk_maus_gpkg_sha256": crosswalk_maus_sha256,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    try:
+        maus_source_gdf = gpd.read_file(maus_path)
+        maus_gdf = maus_source_gdf[["maus_id", "geometry"]].to_crs(crosswalk.TARGET_CRS)
+    except (pyogrio.errors.DataSourceError, OSError) as exc:
+        typer.echo(
+            json.dumps({"refusal": str(exc), "maus_gpkg": str(maus_path)}, indent=2, sort_keys=True)
+        )
+        raise typer.Exit(1) from None
+    except KeyError as exc:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": f"wa_extract.gpkg is missing the expected column {exc}",
+                    "maus_gpkg": str(maus_path),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+
+    # GATE 7 -- the DEA STAC catalogue snapshot named by the enriched
+    # register's own manifest.
+    try:
+        catalogue_date = register_manifest["resolved_args"]["catalogue_date"]
+    except KeyError:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"{register_path}'s manifest does not record "
+                        "resolved_args.catalogue_date -- not a build-dea-coverage output"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+    catalogue_dir = data_root / "raw" / "dea_stac" / catalogue_date
+    _verify_snapshot_or_refuse(
+        catalogue_dir, source_id="dea_stac", required_files=("catalogue_summary.json",)
+    )
+    items_by_source = _load_dea_items(catalogue_dir)
+
+    # --- Footprint strata (decisions 9-10): region / commodity / shape. ---
+    maus_geom_by_id: dict[str, Any] = dict(
+        zip(maus_gdf["maus_id"].astype(str), maus_gdf.geometry, strict=True)
+    )
+    tier1_maus_ids = sorted(set(tier1_df["maus_id"].dropna().astype(str)))
+
+    footprint_geometry: dict[str, Any] = {}
+    support_not_computed_reason: dict[str, str] = {}
+    for maus_id in tier1_maus_ids:
+        geometry = maus_geom_by_id.get(maus_id)
+        if geometry is None:
+            support_not_computed_reason[maus_id] = "maus_id absent from the latest Maus snapshot"
+        elif geometry.is_empty:
+            support_not_computed_reason[maus_id] = "empty geometry"
+        elif not geometry.is_valid:
+            support_not_computed_reason[maus_id] = "invalid geometry"
+        else:
+            footprint_geometry[maus_id] = geometry
+
+    try:
+        shape_class_by_id = {
+            maus_id: d3_protocol.shape_class(d3_inputs.footprint_compactness(geometry), protocol)
+            for maus_id, geometry in footprint_geometry.items()
+        }
+    except (d3_inputs.D3InputsError, d3_protocol.D3ProtocolError) as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    region_by_id: dict[str, str] = {}
+    region_disclosure: dict[str, int] = {"n_ambiguous_boundary_points": 0}
+    if footprint_geometry:
+        points_gdf = gpd.GeoDataFrame(
+            {"site_id": list(footprint_geometry.keys())},
+            geometry=[geometry.representative_point() for geometry in footprint_geometry.values()],
+            crs=crosswalk.TARGET_CRS,
+        )
+        try:
+            region_series, region_disclosure = d3_protocol.assign_regions(
+                points_gdf, regions_gdf, protocol
+            )
+        except d3_protocol.D3ProtocolError as exc:
+            typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+            raise typer.Exit(1) from None
+        region_by_id = dict(zip(points_gdf["site_id"], region_series, strict=True))
+
+    try:
+        commodity_by_id, commodity_disclosure = d3_inputs.assign_footprint_commodities(
+            tier1_maus_ids, tier1_df, register_df, protocol
+        )
+    except d3_protocol.D3ProtocolError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    # --- Support (decision 7): pixel support per footprint against each
+    # intersecting tile's ACTUAL grid, read from a catalogue item asset. ---
+    tile_grids: dict[str, pixel_support.GridSpec] = {}
+    tile_bounds: dict[str, tuple[float, float, float, float]] = {}
+    for source_id, items in items_by_source.items():
+        kind = d3_inputs.D3_COLLECTION_KIND.get(source_id)
+        if kind is None:
+            continue
+        for item in items:
+            properties = item.get("properties") or {}
+            tile_id = str(properties.get("odc:region_code") or "")
+            if not tile_id or tile_id in tile_grids:
+                continue
+            try:
+                hrefs = d3_inputs.resolve_band_hrefs(item, kind=kind)
+            except d3_inputs.D3InputsError:
+                continue
+            href = next(iter(hrefs.values()))
+            stamp = str(properties.get("datetime") or "")
+            item_year = int(stamp[:4]) if len(stamp) >= 4 and stamp[:4].isdigit() else None
+            try:
+                with rasterio.open(href) as dataset:
+                    tile_grids[tile_id] = d3_inputs.grid_spec_from_dataset(dataset, tile_id=tile_id)
+                    bounds = dataset.bounds
+                    tile_bounds[tile_id] = (bounds.left, bounds.bottom, bounds.right, bounds.top)
+            except (rasterio.errors.RasterioError, OSError) as exc:
+                typer.echo(
+                    json.dumps(
+                        {
+                            "refusal": (
+                                "failed to open raster asset during tile-grid discovery "
+                                f"for (source_id={source_id!r}, tile_id={tile_id!r}, "
+                                f"year={item_year!r}, href={href!r}): {exc}"
+                            )
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+                raise typer.Exit(1) from None
+
+    effective_support: dict[str, int] = {}
+    footprint_members: dict[str, tuple[d3_inputs.Member, ...]] = {}
+    footprint_tiles: dict[str, set[str]] = {}
+    try:
+        for maus_id, geometry in footprint_geometry.items():
+            minx, miny, maxx, maxy = geometry.bounds
+            member_set: set[d3_inputs.Member] = set()
+            touched_set: set[str] = set()
+            for tile_id, grid in tile_grids.items():
+                tminx, tminy, tmaxx, tmaxy = tile_bounds[tile_id]
+                if maxx < tminx or minx > tmaxx or maxy < tminy or miny > tmaxy:
+                    continue
+                support = pixel_support.build_pixel_support(geometry, crosswalk.TARGET_CRS, grid)
+                if support is None or support.effective_pixel_support_px == 0:
+                    continue
+                touched_set.add(tile_id)
+                member_set.update((tile_id, r, c) for r, c in support.member_indices)
+            if member_set:
+                footprint_members[maus_id] = tuple(sorted(member_set))
+                footprint_tiles[maus_id] = touched_set
+                effective_support[maus_id] = len(member_set)
+            else:
+                support_not_computed_reason[maus_id] = (
+                    "no pixel centre of any intersecting tile is covered by this footprint"
+                )
+    except pixel_support.PixelSupportError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    # --- Item selection rule (frozen in procedures.item_selection). ---
+    touched_tile_ids = sorted({t for tiles in footprint_tiles.values() for t in tiles})
+    try:
+        item_index = d3_inputs.select_catalogue_items(items_by_source, touched_tile_ids)
+    except d3_inputs.D3InputsError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    years_by_source_tile: dict[tuple[str, str], set[int]] = {}
+    for source_id, tile_id, year in item_index:
+        years_by_source_tile.setdefault((source_id, tile_id), set()).add(year)
+
+    def _epoch_covered_years(touched_tiles: Sequence[str]) -> set[int]:
+        covered: set[int] = set()
+        for source_id in d3_inputs.D3_COLLECTION_KIND:
+            common: set[int] | None = None
+            for tile_id in touched_tiles:
+                tile_years = years_by_source_tile.get((source_id, tile_id), set())
+                common = tile_years if common is None else (common & tile_years)
+            if common:
+                covered |= common
+        return covered
+
+    # --- Phase A (validity): candidate footprints only. ---
+    _GEOMEDIAN_SOURCES = ("dea_gm_ls5t", "dea_gm_ls7e", "dea_gm_ls8cls9c")
+    computable_by_footprint: dict[str, dict[int, dict[str, bool]]] = {}
+    n_epoch_covered_by_id: dict[str, int] = {}
+    n_full_support_by_id: dict[str, int] = {}
+    phase_a_extraction_rows: list[dict[str, object]] = []
+    n_footprint_years_not_computable = 0
+
+    for maus_id, members in footprint_members.items():
+        touched = sorted(footprint_tiles[maus_id])
+        candidate_years = _epoch_covered_years(touched)
+        n_epoch_covered_by_id[maus_id] = len(candidate_years)
+        n_full = 0
+        computable_by_footprint[maus_id] = {}
+        if effective_support[maus_id] >= d3_protocol.MIN_FULL_SUPPORT_PX and candidate_years:
+            for year in sorted(candidate_years):
+                by_source: dict[str, bool] = {}
+                for source_id, kind in d3_inputs.D3_COLLECTION_KIND.items():
+                    if not all((source_id, tile_id, year) in item_index for tile_id in touched):
+                        continue
+                    try:
+                        raw_bands, extraction_rows = _read_footprint_year_bands(
+                            source_id=source_id,
+                            kind=kind,
+                            year=year,
+                            touched_tiles=touched,
+                            members=members,
+                            item_index=item_index,
+                            phase="a",
+                        )
+                    except (rasterio.errors.RasterioError, OSError, d3_inputs.D3InputsError) as exc:
+                        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+                        raise typer.Exit(1) from None
+                    phase_a_extraction_rows.extend(extraction_rows)
+                    decoded = _decode_d3_bands(raw_bands, kind=kind)
+                    by_source[source_id] = d3_inputs.year_computable(decoded, kind=kind)
+                computable_by_footprint[maus_id][year] = by_source
+                fc_ok = by_source.get("dea_fc_pc", False)
+                gm_ok = any(by_source.get(s, False) for s in _GEOMEDIAN_SOURCES)
+                if fc_ok and gm_ok:
+                    n_full += 1
+                else:
+                    n_footprint_years_not_computable += 1
+        n_full_support_by_id[maus_id] = n_full
+
+    # --- Footprint strata frame -- one row per Tier 1 footprint. ---
+    footprint_rows: list[dict[str, object]] = []
+    for maus_id in tier1_maus_ids:
+        support_px = effective_support.get(maus_id)
+        n_epoch = n_epoch_covered_by_id.get(maus_id, 0)
+        footprint_rows.append(
+            {
+                "maus_id": maus_id,
+                "region": region_by_id.get(maus_id),
+                "commodity_group": commodity_by_id.get(maus_id),
+                "shape_class": shape_class_by_id.get(maus_id),
+                "effective_pixel_support_px": support_px,
+                "support_not_computed_reason": support_not_computed_reason.get(maus_id),
+                "n_epoch_covered_years": n_epoch,
+                "n_full_support_years": n_full_support_by_id.get(maus_id, 0),
+                "candidate": bool(
+                    support_px is not None
+                    and support_px >= d3_protocol.MIN_FULL_SUPPORT_PX
+                    and n_epoch > 0
+                ),
+            }
+        )
+    footprints_frame = pd.DataFrame(footprint_rows)
+    stratified = footprints_frame.dropna(subset=["region", "commodity_group", "shape_class"])
+
+    # --- Adequacy + selection (full 54-stratum space). ---
+    adequacy = d3_protocol.stratum_adequacy(stratified, protocol)
+    selected = d3_protocol.select_stratum_footprints(stratified, protocol)
+    selected_maus_ids = sorted({mid for members in selected.values() for mid in members})
+
+    input_digests_json = d3_inputs.canonical_input_digests(
+        catalogue=sha256_file(
+            catalogue_dir / (snapshots.SHA256SUMS_FILENAME + manifests.MANIFEST_SUFFIX)
+        ),
+        register=sha256_file(Path(str(register_path) + manifests.MANIFEST_SUFFIX)),
+        crosswalk=sha256_file(Path(str(crosswalk_path) + manifests.MANIFEST_SUFFIX)),
+        footprint_areas=sha256_file(Path(str(footprints_path) + manifests.MANIFEST_SUFFIX)),
+        maus=sha256_file(
+            maus_snapshot_dir / (snapshots.SHA256SUMS_FILENAME + manifests.MANIFEST_SUFFIX)
+        ),
+        regions=sha256_file(
+            regions_dir / (snapshots.SHA256SUMS_FILENAME + manifests.MANIFEST_SUFFIX)
+        ),
+        protocol=sha256_file(Path(str(protocol_artifact_path) + manifests.MANIFEST_SUFFIX)),
+    )
+
+    total_counts = (
+        stratified.groupby(["region", "commodity_group", "shape_class"])["maus_id"].nunique()
+        if not stratified.empty
+        else pd.Series(dtype="int64")
+    )
+    stratum_rows: list[dict[str, object]] = []
+    for region in protocol.regions:
+        for commodity_group in protocol.commodity_groups:
+            for shape_cls in ("elongated", "intermediate", "compact"):
+                stratum = (region, commodity_group, shape_cls)
+                info = adequacy[stratum]
+                stratum_rows.append(
+                    {
+                        "region": region,
+                        "commodity_group": commodity_group,
+                        "shape_class": shape_cls,
+                        "n_footprints": int(total_counts.get(stratum, 0)),
+                        "n_adequate_footprints": cast(int, info["n_footprints_meeting_years"]),
+                        "adequate": bool(info["adequate"]),
+                        "n_selected": len(selected.get(stratum, ())),
+                        "protocol_digest": frozen_digest,
+                        "input_manifest_digests": input_digests_json,
+                    }
+                )
+    stratum_summary_df = pd.DataFrame(stratum_rows)
+    n_strata_adequate = int(stratum_summary_df["adequate"].sum())
+    n_strata_inadequate = int((~stratum_summary_df["adequate"]).sum())
+
+    footprint_support_rows = [
+        {
+            **row,
+            "selected": row["maus_id"] in selected_maus_ids,
+            "protocol_digest": frozen_digest,
+            "input_manifest_digests": input_digests_json,
+        }
+        for row in footprint_rows
+    ]
+    footprint_support_df = pd.DataFrame(footprint_support_rows)
+    n_candidate_footprints = int(footprint_support_df["candidate"].sum())
+    n_selected_footprints = int(footprint_support_df["selected"].sum())
+    n_footprints_support_not_computed = int(
+        footprint_support_df["effective_pixel_support_px"].isna().sum()
+    )
+
+    # --- Phase B (values): SELECTED footprints only. ---
+    phase_a_etag_by_asset = {
+        (r["source_id"], r["tile_id"], r["year"], r["asset_key"]): r["etag"]
+        for r in phase_a_extraction_rows
+    }
+    support_inputs_rows: list[dict[str, object]] = []
+    spearman_rows: list[dict[str, object]] = []
+    phase_b_extraction_rows: list[dict[str, object]] = []
+    n_footprint_years_simulated = 0
+    n_spearman_not_computable = 0
+
+    for maus_id in selected_maus_ids:
+        touched = sorted(footprint_tiles[maus_id])
+        members = footprint_members[maus_id]
+        region = region_by_id[maus_id]
+        commodity_group = commodity_by_id[maus_id]
+        shape_cls = shape_class_by_id[maus_id]
+
+        full_support_years = sorted(
+            year
+            for year, by_source in computable_by_footprint[maus_id].items()
+            if by_source.get("dea_fc_pc", False)
+            and any(by_source.get(s, False) for s in _GEOMEDIAN_SOURCES)
+        )
+        reduced_by_source_metric_support: dict[tuple[str, str, int], dict[int, list[float]]] = {}
+        full_value_by_key: dict[tuple[int, str, str], float] = {}
+
+        for year in full_support_years:
+            by_source = computable_by_footprint[maus_id][year]
+            for source_id, kind in d3_inputs.D3_COLLECTION_KIND.items():
+                if not by_source.get(source_id, False):
+                    continue
+                try:
+                    raw_bands, extraction_rows = _read_footprint_year_bands(
+                        source_id=source_id,
+                        kind=kind,
+                        year=year,
+                        touched_tiles=touched,
+                        members=members,
+                        item_index=item_index,
+                        phase="b",
+                    )
+                except (rasterio.errors.RasterioError, OSError, d3_inputs.D3InputsError) as exc:
+                    typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+                    raise typer.Exit(1) from None
+                for row in extraction_rows:
+                    key = (row["source_id"], row["tile_id"], row["year"], row["asset_key"])
+                    prior_etag = phase_a_etag_by_asset.get(key)
+                    if (
+                        prior_etag is not None
+                        and row["etag"] is not None
+                        and prior_etag != row["etag"]
+                    ):
+                        typer.echo(
+                            json.dumps(
+                                {
+                                    "refusal": (
+                                        f"asset {row['href']} ETag changed between Phase A "
+                                        f"and Phase B: {prior_etag} -> {row['etag']}"
+                                    )
+                                },
+                                indent=2,
+                                sort_keys=True,
+                            )
+                        )
+                        raise typer.Exit(1)
+                phase_b_extraction_rows.extend(extraction_rows)
+                decoded = _decode_d3_bands(raw_bands, kind=kind)
+                result = d3_inputs.simulate_footprint_year(
+                    maus_id=maus_id,
+                    year=year,
+                    source_id=source_id,
+                    members=members,
+                    band_values=decoded,
+                    kind=kind,
+                    supports=protocol.supports,
+                    replicates=protocol.replicates,
+                    protocol_digest=frozen_digest,
+                )
+                if result is None:
+                    continue
+                rows, reduced_series = result
+                n_footprint_years_simulated += 1
+                for row in rows:
+                    full_value_by_key[(year, source_id, cast(str, row["metric_id"]))] = cast(
+                        float, row["full_value"]
+                    )
+                    support_inputs_rows.append(
+                        {
+                            **row,
+                            "region": region,
+                            "commodity_group": commodity_group,
+                            "shape_class": shape_cls,
+                            "input_manifest_digests": input_digests_json,
+                        }
+                    )
+                for (metric_id, support_px), values in reduced_series.items():
+                    reduced_by_source_metric_support.setdefault(
+                        (source_id, metric_id, support_px), {}
+                    )[year] = values
+
+        for (source_id, metric_id, support_px), by_year in reduced_by_source_metric_support.items():
+            years = sorted(by_year)
+            if len(years) < d3_inputs.MIN_SPEARMAN_YEARS:
+                continue
+            full_series = pd.Series(
+                [full_value_by_key[(year, source_id, metric_id)] for year in years]
+            )
+            for replicate in range(protocol.replicates):
+                reduced_series_r = pd.Series([by_year[year][replicate] for year in years])
+                rho = d3_inputs.spearman(full_series, reduced_series_r)
+                if rho is None:
+                    n_spearman_not_computable += 1
+                    continue
+                spearman_rows.append(
+                    {
+                        "maus_id": maus_id,
+                        "source_id": source_id,
+                        "metric_id": metric_id,
+                        "support_px": support_px,
+                        "replicate": replicate,
+                        "spearman": rho,
+                        "n_years": len(years),
+                        "protocol_digest": frozen_digest,
+                        "input_manifest_digests": input_digests_json,
+                    }
+                )
+
+    support_inputs_df = pd.DataFrame(
+        support_inputs_rows, columns=list(d3_inputs.D3_SUPPORT_INPUTS_SCHEMA.names)
+    )
+    spearman_df = pd.DataFrame(spearman_rows, columns=list(d3_inputs.D3_SPEARMAN_SCHEMA.names))
+    extraction_assets_df = pd.DataFrame(
+        phase_a_extraction_rows + phase_b_extraction_rows,
+        columns=list(d3_inputs.D3_EXTRACTION_ASSETS_SCHEMA.names),
+    )
+
+    # --- Assemble outputs atomically: `.tmp` dir, five tables + manifests,
+    # then `os.replace` (decision 15). ---
+    maus_source = licence.SOURCES["maus_v2"]
+    regions_source = licence.SOURCES["wa_rdc_regions"]
+    input_assets = [
+        SourceAsset(
+            uri=str(protocol_artifact_path),
+            sha256=sha256_file(protocol_artifact_path),
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(protocol_dir.name),
+            licence=None,
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(register_path),
+            sha256=sha256_file(register_path),
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(register_dir.name),
+            licence=None,
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(crosswalk_path),
+            sha256=sha256_file(crosswalk_path),
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(crosswalk_dir.name),
+            licence=None,
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(footprints_path),
+            sha256=sha256_file(footprints_path),
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(footprints_dir.name),
+            licence="CC-BY-SA-4.0",
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(maus_path),
+            sha256=maus_gpkg_sha256,
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(maus_snapshot_dir.name),
+            licence=maus_source.licence_id,
+            redistribute_public=maus_source.redistribute_public,
+        ),
+        SourceAsset(
+            uri=str(regions_path),
+            sha256=sha256_file(regions_path),
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(regions_dir.name),
+            licence=regions_source.licence_id,
+            redistribute_public=regions_source.redistribute_public,
+        ),
+        SourceAsset(
+            uri=str(catalogue_dir / snapshots.SHA256SUMS_FILENAME),
+            sha256=sha256_file(catalogue_dir / snapshots.SHA256SUMS_FILENAME),
+            collection="dea_stac",
+            snapshot_date=dt_date.fromisoformat(catalogue_date),
+            licence="CC-BY-4.0",
+            redistribute_public=True,
+        ),
+    ]
+    resolved_args = {
+        "date": date,
+        "protocol_digest": frozen_digest,
+        "input_manifest_digests": json.loads(input_digests_json),
+        "catalogue_date": catalogue_date,
+        "region_ambiguity": region_disclosure,
+        "commodity_ties": commodity_disclosure,
+        "n_candidate_footprints": n_candidate_footprints,
+        "n_selected_footprints": n_selected_footprints,
+    }
+
+    tmp_dir = output_dir.parent / f"{output_dir.name}.tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    table_specs: tuple[tuple[str, pd.DataFrame, pa.Schema], ...] = (
+        ("support_inputs.parquet", support_inputs_df, d3_inputs.D3_SUPPORT_INPUTS_SCHEMA),
+        ("support_spearman.parquet", spearman_df, d3_inputs.D3_SPEARMAN_SCHEMA),
+        ("footprint_support.parquet", footprint_support_df, d3_inputs.D3_FOOTPRINT_SUPPORT_SCHEMA),
+        ("stratum_summary.parquet", stratum_summary_df, d3_inputs.D3_STRATUM_SUMMARY_SCHEMA),
+        ("extraction_assets.parquet", extraction_assets_df, d3_inputs.D3_EXTRACTION_ASSETS_SCHEMA),
+    )
+    manifest_paths: list[str] = []
+    for filename, frame, schema in table_specs:
+        tmp_path = tmp_dir / filename
+        _write_table_or_refuse(frame, tmp_path, schema, payload={"table": filename})
+        try:
+            manifests.write_run_manifest(
+                output=tmp_path,
+                inputs=input_assets,
+                config=resolved_config,
+                git_state=git_state,
+                resolved_args=resolved_args,
+            )
+        except FileExistsError as exc:
+            typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+            raise typer.Exit(1) from None
+        manifest_paths.append(str(output_dir / filename) + manifests.MANIFEST_SUFFIX)
+
+    if output_dir.exists():
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"{output_dir} already exists -- this curated artefact was already "
+                        "built by an earlier run. Refusing before rename."
+                    ),
+                    "output_dir": str(output_dir),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(tmp_dir, output_dir)
+
+    typer.echo(
+        json.dumps(
+            {
+                "output_dir": str(output_dir),
+                "protocol_digest": frozen_digest,
+                "n_candidate_footprints": n_candidate_footprints,
+                "n_selected_footprints": n_selected_footprints,
+                "n_strata_adequate": n_strata_adequate,
+                "n_strata_inadequate": n_strata_inadequate,
+                "n_footprint_years_simulated": n_footprint_years_simulated,
+                "n_footprint_years_not_computable": n_footprint_years_not_computable,
+                "n_footprints_support_not_computed": n_footprints_support_not_computed,
+                "n_spearman_not_computable": n_spearman_not_computable,
+                "region_ambiguity": region_disclosure,
+                "commodity_ties": commodity_disclosure,
+                "manifest_paths": manifest_paths,
+            },
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+    )
+
+
+def _d3_threshold_stratum_records(frame: pd.DataFrame) -> list[dict[str, object]]:
+    """`stratum_summary` rows -> plain-Python-typed records (explicit `int()`
+    casts, matching this module's existing convention elsewhere, rather than
+    leaning on `json.dumps(default=str)` and silently turning a count into a
+    string)."""
+    return [
+        {
+            "region": row.region,
+            "commodity_group": row.commodity_group,
+            "shape_class": row.shape_class,
+            "n_footprints": int(row.n_footprints),
+            "n_adequate_footprints": int(row.n_adequate_footprints),
+            "n_selected": int(row.n_selected),
+        }
+        for row in frame.itertuples(index=False)
+    ]
+
+
+@app.command("derive-d3-threshold")
+def derive_d3_threshold_cmd(
+    config: Path = ConfigOption,
+    protocol_config: Path = ProtocolConfigOption,
+    date: str = DateOption,
+) -> None:
+    """Evaluate the D3 reduced-support accuracy threshold (D13 Batch D task D4).
+
+    Reads the five `build-d3-inputs` tables from the latest curated
+    `d3-inputs/<date>/` directory and the single frozen D3 protocol, then
+    finds the smallest pixel support strictly below the full-support floor
+    (144) at which every accuracy criterion passes for every adequate
+    stratum (`d3_threshold.evaluate_threshold`).
+
+    Gates mirror `build-d3-inputs`'s discipline: (1) the frozen protocol --
+    single dated lineage, digest-verified, recomputed from
+    `--protocol-config` and checked against the frozen digest (identical to
+    `build-d3-inputs` gate 1, including its procedures-text consistency
+    check); (2) the latest curated `d3-inputs/<date>/` directory, with ALL
+    FIVE tables digest-verified via their run manifests; (3) every table's
+    `protocol_digest` column must equal the frozen digest -- refusing an
+    input set built before the protocol was (re-)frozen; (4) the four
+    digest-bearing tables' `input_manifest_digests` values must be
+    identical across tables -- refusing a mixed input set assembled from
+    two different `build-d3-inputs` runs.
+
+    Writes `curated/d3-threshold/<date>/threshold.json`: the serialized
+    `ThresholdResult` (n*, criteria_passed, nominal_area_m2, protocol_digest,
+    per-support detail with counts, failed_criteria), `adequate_strata`/
+    `inadequate_strata` (with counts, from `stratum_summary`), and the input
+    table paths + digests -- assembled in a `.tmp` sibling directory and
+    `os.replace`d into place only once the artefact and its run manifest
+    both wrote cleanly.
+    """
+    resolved: ProjectConfig = _load_config_or_exit(config)
+    resolved_config = resolved.model_dump(mode="json")
+    git_state = _collect_git_state_disclosing_gaps(_REPO_ROOT)
+    data_root = resolved.run.data_root
+
+    # GATE 0 -- preflight existing-output, BEFORE any protocol or input read.
+    output_dir = data_root / "curated" / "d3-threshold" / date
+    if output_dir.exists():
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"{output_dir} already exists -- this curated artefact was already "
+                        "built by an earlier run. Refusing before any input access. Move "
+                        "the existing output directory aside, or choose a different --date, "
+                        "to build again."
+                    ),
+                    "output_dir": str(output_dir),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+
+    # GATE 1 -- the frozen protocol: identical to `build-d3-inputs` gate 1.
+    d3_protocol_root = data_root / "curated" / "d3-protocol"
+    dated_protocol_dirs = (
+        sorted(d3_protocol_root.glob("????-??-??")) if d3_protocol_root.exists() else []
+    )
+    if not dated_protocol_dirs:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"no frozen D3 protocol under {d3_protocol_root} -- run "
+                        "freeze-d3-protocol first"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    if len(dated_protocol_dirs) > 1:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"curated/d3-protocol has {len(dated_protocol_dirs)} dated "
+                        f"directories {[d.name for d in dated_protocol_dirs]} -- single "
+                        "lineage violated: a frozen protocol may never be superseded "
+                        "silently. Move all but one dated directory aside."
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    protocol_dir = dated_protocol_dirs[0]
+    protocol_artifact_path = protocol_dir / "protocol.json"
+    _digest_verified_manifest(protocol_artifact_path)
+    frozen_digest = json.loads(protocol_artifact_path.read_text(encoding="utf-8"))[
+        "protocol_digest"
+    ]
+
+    try:
+        protocol = d3_protocol.load_protocol(protocol_config)
+    except (d3_protocol.D3ProtocolError, OSError, yaml.YAMLError) as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    recomputed_digest = d3_protocol.protocol_digest(protocol)
+    if recomputed_digest != frozen_digest:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"protocol drift: --protocol-config ({protocol_config}) recomputes "
+                        f"digest {recomputed_digest[:12]}..., the frozen artefact at "
+                        f"{protocol_artifact_path} records {frozen_digest[:12]}... -- the "
+                        "config changed after freeze-d3-protocol ran. No accuracy result may "
+                        "change sample definitions or criteria after freezing."
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    try:
+        d3_inputs.check_procedures_consistency(protocol.procedures)
+    except d3_inputs.D3InputsError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    # GATE 2 -- the latest curated d3-inputs directory: ALL FIVE tables
+    # digest-verified via their run manifests.
+    try:
+        d3_inputs_dir = _latest_curated_dated_dir(
+            data_root / "curated" / "d3-inputs", label="curated/d3-inputs"
+        )
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    table_filenames = (
+        "support_inputs.parquet",
+        "support_spearman.parquet",
+        "footprint_support.parquet",
+        "stratum_summary.parquet",
+        "extraction_assets.parquet",
+    )
+    table_paths = {name: d3_inputs_dir / name for name in table_filenames}
+    table_manifests: dict[str, dict[str, Any]] = {
+        name: _digest_verified_manifest(path) for name, path in table_paths.items()
+    }
+    digest_bearing_tables = (
+        "support_inputs.parquet",
+        "support_spearman.parquet",
+        "footprint_support.parquet",
+        "stratum_summary.parquet",
+    )
+    table_frames: dict[str, pd.DataFrame] = {
+        name: read_table(table_paths[name]) for name in digest_bearing_tables
+    }
+
+    # GATE 3 -- every table's protocol_digest column must equal the frozen
+    # digest -- refuse an input set built under a different protocol.
+    observed_protocol_digests: set[str] = set()
+    for name in digest_bearing_tables:
+        frame = table_frames[name]
+        if len(frame):
+            observed_protocol_digests.update(str(v) for v in frame["protocol_digest"].unique())
+    if len(observed_protocol_digests) > 1:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"{d3_inputs_dir} carries MIXED protocol_digest values across its "
+                        f"tables {sorted(observed_protocol_digests)} -- these tables were "
+                        "built under a different protocol from each other, not a single "
+                        "consistent run."
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    if observed_protocol_digests:
+        (actual_protocol_digest,) = observed_protocol_digests
+        if actual_protocol_digest != frozen_digest:
+            typer.echo(
+                json.dumps(
+                    {
+                        "refusal": (
+                            f"{d3_inputs_dir} was built under a different protocol: its "
+                            f"tables record protocol_digest {actual_protocol_digest[:12]}..., "
+                            f"the currently frozen protocol at {protocol_artifact_path} "
+                            f"records {frozen_digest[:12]}.... Run build-d3-inputs again "
+                            "under the currently frozen protocol before deriving a "
+                            "threshold from it."
+                        ),
+                        "d3_inputs_protocol_digest": actual_protocol_digest,
+                        "frozen_protocol_digest": frozen_digest,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            raise typer.Exit(1)
+
+    # GATE 4 -- the four digest-bearing tables' input_manifest_digests
+    # values must be identical across tables -- refuse a mixed input set.
+    observed_input_digests: set[str] = set()
+    for name in digest_bearing_tables:
+        frame = table_frames[name]
+        if len(frame):
+            observed_input_digests.update(str(v) for v in frame["input_manifest_digests"].unique())
+    if len(observed_input_digests) > 1:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"{d3_inputs_dir} carries MIXED input_manifest_digests values across "
+                        "its tables -- these tables were assembled from different "
+                        "build-d3-inputs runs (or a partially overwritten one), not a "
+                        "single consistent input set."
+                    ),
+                    "observed_input_manifest_digests": sorted(observed_input_digests),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+
+    # --- Evaluate the threshold. ---
+    threshold_inputs = d3_threshold.ThresholdInputs(
+        support_inputs=table_frames["support_inputs.parquet"],
+        support_spearman=table_frames["support_spearman.parquet"],
+        footprint_support=table_frames["footprint_support.parquet"],
+        stratum_summary=table_frames["stratum_summary.parquet"],
+    )
+    try:
+        result = d3_threshold.evaluate_threshold(threshold_inputs, protocol)
+    except d3_threshold.D3ThresholdError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    stratum_summary_df = table_frames["stratum_summary.parquet"]
+    adequate_strata = _d3_threshold_stratum_records(
+        stratum_summary_df[stratum_summary_df["adequate"]]
+    )
+    inadequate_strata = _d3_threshold_stratum_records(
+        stratum_summary_df[~stratum_summary_df["adequate"]]
+    )
+
+    input_tables_disclosure = {
+        name: {
+            "path": str(table_paths[name]),
+            "sha256": table_manifests[name]["output"]["sha256"],
+        }
+        for name in table_filenames
+    }
+
+    threshold_payload: dict[str, object] = {
+        "n_star": result.n_star,
+        "criteria_passed": result.criteria_passed,
+        "nominal_area_m2": result.nominal_area_m2,
+        "protocol_digest": result.protocol_digest,
+        "per_support": list(result.per_support),
+        "failed_criteria": list(result.failed_criteria),
+        "adequate_strata": adequate_strata,
+        "inadequate_strata": inadequate_strata,
+        "input_tables": input_tables_disclosure,
+    }
+
+    # --- Assemble output atomically: `.tmp` dir, artefact + manifest, then
+    # `os.replace` (mirrors `build-d3-inputs` decision 15). ---
+    tmp_dir = output_dir.parent / f"{output_dir.name}.tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_output_path = tmp_dir / "threshold.json"
+    tmp_output_path.write_text(json.dumps(threshold_payload, indent=2, sort_keys=True, default=str))
+
+    input_assets = [
+        SourceAsset(
+            uri=str(protocol_artifact_path),
+            sha256=sha256_file(protocol_artifact_path),
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(protocol_dir.name),
+            licence=None,
+            redistribute_public=False,
+        ),
+        *[
+            SourceAsset(
+                uri=str(table_paths[name]),
+                sha256=table_manifests[name]["output"]["sha256"],
+                collection=None,
+                snapshot_date=dt_date.fromisoformat(d3_inputs_dir.name),
+                licence=None,
+                redistribute_public=False,
+            )
+            for name in table_filenames
+        ],
+    ]
+
+    try:
+        manifests.write_run_manifest(
+            output=tmp_output_path,
+            inputs=input_assets,
+            config=resolved_config,
+            git_state=git_state,
+            resolved_args={
+                "date": date,
+                "protocol_digest": frozen_digest,
+                "d3_inputs_dir": str(d3_inputs_dir),
+                "n_star": result.n_star,
+                "criteria_passed": result.criteria_passed,
+            },
+        )
+    except FileExistsError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    if output_dir.exists():
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"{output_dir} already exists -- this curated artefact was already "
+                        "built by an earlier run. Refusing before rename."
+                    ),
+                    "output_dir": str(output_dir),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(tmp_dir, output_dir)
+
+    output_path = output_dir / "threshold.json"
+    manifest_path = str(output_path) + manifests.MANIFEST_SUFFIX
+    typer.echo(
+        json.dumps(
+            {
+                "output_path": str(output_path),
+                "n_star": result.n_star,
+                "criteria_passed": result.criteria_passed,
+                "nominal_area_m2": result.nominal_area_m2,
+                "n_strata_adequate": len(adequate_strata),
+                "n_strata_inadequate": len(inadequate_strata),
+                "manifest_path": manifest_path,
+            },
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+    )
+
+
+@app.command("apply-d3-threshold")
+def apply_d3_threshold_cmd(config: Path = ConfigOption, date: str = DateOption) -> None:
+    """Apply the derived D3 reduced-support threshold to the latest register
+    (D13 D5): every register row gets exactly one `trajectory_status`
+    (`register._TRAJECTORY_STATUSES`) plus `effective_pixel_support_px`/
+    `d3_threshold_px`/`d3_eligible` (`register.assign_trajectory_
+    eligibility`).
+
+    Gates, all digest-verified before anything downstream reads them: (1)
+    the latest curated register -- must be DEA-enriched (`register.
+    DEA_COVERAGE_COLUMNS`), the same check `derive-dea-volume` applies to
+    its own register input; (2) the latest curated crosswalk -- loaded
+    WHOLE (every confidence tier, never filtered to `tier1_population`), so
+    a site matched at medium/low/none confidence is distinguishable from
+    one absent from the crosswalk altogether; (3) the single frozen D3
+    protocol; (4) the latest curated `d3-threshold/<date>/threshold.json`,
+    whose own `protocol_digest` must equal the frozen protocol's --
+    refused (missing artefact, altered artefact, or protocol mismatch)
+    rather than applied; a `criteria_passed=False` artefact is itself
+    APPLIED, never refused (decision 14); (5) the latest curated
+    `d3-inputs/<date>/footprint_support.parquet`, digest-verified via its
+    OWN manifest, whose `protocol_digest` column must match the
+    threshold's -- an unverified support table must never determine
+    eligibility.
+
+    Writes a NEW dated `curated/register/<date>/register.parquet` under
+    `register.ELIGIBLE_REGISTER_SCHEMA` (the accepted enriched register is
+    never mutated -- the same distinct-date convention `build-dea-coverage`
+    uses). The run manifest records per-status counts, computed/zero/
+    not-computed pixel-support counts, the threshold artefact's own
+    digest, `criteria_passed`, and (copied verbatim from the threshold
+    artefact) its `failed_criteria` disclosure.
+    """
+    resolved: ProjectConfig = _load_config_or_exit(config)
+    resolved_config = resolved.model_dump(mode="json")
+    git_state = _collect_git_state_disclosing_gaps(_REPO_ROOT)
+    data_root = resolved.run.data_root
+
+    # GATE 1 -- latest curated register: digest-verified, DEA-enriched
+    # (mirrors derive_dea_volume_cmd's identical check).
+    try:
+        register_dir = _latest_curated_dated_dir(
+            data_root / "curated" / "register", label="curated/register"
+        )
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    register_path = register_dir / "register.parquet"
+    register_manifest = _digest_verified_manifest(register_path)
+    register_df = read_table(register_path)
+    if any(column not in register_df.columns for column in register.DEA_COVERAGE_COLUMNS):
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        "latest curated register is not DEA-enriched -- run "
+                        "build-dea-coverage first"
+                    ),
+                    "register_path": str(register_path),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+
+    # GATE 2 -- latest curated crosswalk: digest-verified, ALL confidence
+    # tiers loaded, so rule 1 (unmatched entirely) is distinguishable from
+    # rule 2 (matched, not high confidence).
+    try:
+        crosswalk_dir = _latest_curated_dated_dir(
+            data_root / "curated" / "crosswalk", label="curated/crosswalk"
+        )
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    crosswalk_path = crosswalk_dir / "crosswalk.parquet"
+    crosswalk_manifest = _digest_verified_manifest(crosswalk_path)
+    crosswalk_df = read_table(crosswalk_path)
+
+    # GATE 3 -- the single frozen D3 protocol (identical single-lineage
+    # discipline to derive_d3_threshold_cmd's gate 1, minus the
+    # --protocol-config recompute -- this command only needs the frozen
+    # digest itself, to compare against the threshold artefact's).
+    d3_protocol_root = data_root / "curated" / "d3-protocol"
+    dated_protocol_dirs = (
+        sorted(d3_protocol_root.glob("????-??-??")) if d3_protocol_root.exists() else []
+    )
+    if not dated_protocol_dirs:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"no frozen D3 protocol under {d3_protocol_root} -- run "
+                        "freeze-d3-protocol first"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    if len(dated_protocol_dirs) > 1:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"curated/d3-protocol has {len(dated_protocol_dirs)} dated "
+                        f"directories {[d.name for d in dated_protocol_dirs]} -- single "
+                        "lineage violated: a frozen protocol may never be superseded "
+                        "silently. Move all but one dated directory aside."
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    protocol_dir = dated_protocol_dirs[0]
+    protocol_artifact_path = protocol_dir / "protocol.json"
+    _digest_verified_manifest(protocol_artifact_path)
+    frozen_digest = json.loads(protocol_artifact_path.read_text(encoding="utf-8"))[
+        "protocol_digest"
+    ]
+
+    # GATE 4 -- latest curated d3-threshold artefact: digest-verified,
+    # protocol_digest equal to the frozen protocol's. `criteria_passed`
+    # False is APPLIED here, never refused (decision 14).
+    try:
+        threshold_dir = _latest_curated_dated_dir(
+            data_root / "curated" / "d3-threshold", label="curated/d3-threshold"
+        )
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    threshold_path = threshold_dir / "threshold.json"
+    threshold_manifest = _digest_verified_manifest(threshold_path)
+    threshold_payload = json.loads(threshold_path.read_text(encoding="utf-8"))
+    threshold_protocol_digest = threshold_payload.get("protocol_digest")
+    if threshold_protocol_digest != frozen_digest:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"{threshold_path} was derived under a different protocol: it "
+                        f"records protocol_digest {str(threshold_protocol_digest)[:12]}..., "
+                        f"the currently frozen protocol at {protocol_artifact_path} records "
+                        f"{frozen_digest[:12]}.... Run derive-d3-threshold again under the "
+                        "currently frozen protocol before applying it."
+                    ),
+                    "threshold_protocol_digest": threshold_protocol_digest,
+                    "frozen_protocol_digest": frozen_digest,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    n_star = int(threshold_payload["n_star"])
+    criteria_passed = bool(threshold_payload["criteria_passed"])
+    failed_criteria = list(threshold_payload.get("failed_criteria", []))
+    applied_threshold_px = n_star if criteria_passed else d3_protocol.MIN_FULL_SUPPORT_PX
+
+    # GATE 5 -- latest curated d3-inputs footprint_support.parquet:
+    # digest-verified via its OWN manifest; its protocol_digest column
+    # must match the threshold's -- an unverified support table must never
+    # determine eligibility.
+    try:
+        d3_inputs_dir = _latest_curated_dated_dir(
+            data_root / "curated" / "d3-inputs", label="curated/d3-inputs"
+        )
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    footprint_support_path = d3_inputs_dir / "footprint_support.parquet"
+    footprint_support_manifest = _digest_verified_manifest(footprint_support_path)
+    footprint_support_df = read_table(footprint_support_path)
+    observed_support_digests: set[str] = set()
+    if len(footprint_support_df):
+        observed_support_digests.update(
+            str(v) for v in footprint_support_df["protocol_digest"].unique()
+        )
+    if len(observed_support_digests) > 1:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"{footprint_support_path} carries MIXED protocol_digest values "
+                        f"{sorted(observed_support_digests)} -- not a single consistent "
+                        "build-d3-inputs run."
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    if observed_support_digests:
+        (actual_support_digest,) = observed_support_digests
+        if actual_support_digest != threshold_protocol_digest:
+            typer.echo(
+                json.dumps(
+                    {
+                        "refusal": (
+                            f"{footprint_support_path} was built under a different protocol: "
+                            f"it records protocol_digest {actual_support_digest[:12]}..., the "
+                            f"threshold artefact at {threshold_path} records "
+                            f"{str(threshold_protocol_digest)[:12]}.... An unverified support "
+                            "table must not determine eligibility -- run build-d3-inputs and "
+                            "derive-d3-threshold again under the same protocol before "
+                            "applying."
+                        ),
+                        "footprint_support_protocol_digest": actual_support_digest,
+                        "threshold_protocol_digest": threshold_protocol_digest,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            raise typer.Exit(1)
+
+    # --- Join + assign D5 status/eligibility (pure logic in register.py). ---
+    try:
+        eligible_df = register.assign_trajectory_eligibility(
+            register_df,
+            crosswalk_df,
+            footprint_support_df,
+            n_star=n_star,
+            criteria_passed=criteria_passed,
+        )
+    except ValueError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    try:
+        register.validate_eligible_register(eligible_df)
+    except register.TrajectoryStatusError as exc:
+        typer.echo(
+            json.dumps({"refusal": str(exc), "stage": "self-check"}, indent=2, sort_keys=True)
+        )
+        raise typer.Exit(1) from None
+
+    if len(eligible_df) != len(register_df):
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"apply-d3-threshold changed the register's row count: "
+                        f"{len(register_df)} row(s) in, {len(eligible_df)} out -- this is a "
+                        "defect in assign_trajectory_eligibility; refusing rather than "
+                        "writing a corrupted register"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+
+    n_by_status = {
+        status: int((eligible_df["trajectory_status"] == status).sum())
+        for status in register._TRAJECTORY_STATUSES
+    }
+    n_eligible = n_by_status["eligible"]
+
+    support_computed = eligible_df["effective_pixel_support_px"].notna()
+    n_support_computed = int(support_computed.sum())
+    n_support_zero = int(
+        (eligible_df.loc[support_computed, "effective_pixel_support_px"] == 0).sum()
+    )
+    n_support_not_computed = int((~support_computed).sum())
+
+    # --- Ingredients all computed -- write the artefact, then its manifest. ---
+    out_dir = data_root / "curated" / "register" / date
+    out_path = out_dir / "register.parquet"
+    _refuse_if_curated_output_already_exists(out_path, config=resolved_config, git_state=git_state)
+
+    input_assets = [
+        SourceAsset(
+            uri=str(register_path),
+            sha256=register_manifest["output"]["sha256"],
+            collection=None,
+            snapshot_date=None,
+            licence=licence.SOURCES["dmirs_001_minedex"].licence_id,
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(crosswalk_path),
+            sha256=crosswalk_manifest["output"]["sha256"],
+            collection=None,
+            snapshot_date=None,
+            licence=None,
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(threshold_path),
+            sha256=threshold_manifest["output"]["sha256"],
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(threshold_dir.name),
+            licence=None,
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(footprint_support_path),
+            sha256=footprint_support_manifest["output"]["sha256"],
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(d3_inputs_dir.name),
+            licence=None,
+            redistribute_public=False,
+        ),
+    ]
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _write_table_or_refuse(eligible_df, out_path, register.ELIGIBLE_REGISTER_SCHEMA)
+    try:
+        manifests.write_run_manifest(
+            output=out_path,
+            inputs=input_assets,
+            config=resolved_config,
+            git_state=git_state,
+            resolved_args={
+                "date": date,
+                "protocol_digest": frozen_digest,
+                "threshold_dir": str(threshold_dir),
+                "d3_inputs_dir": str(d3_inputs_dir),
+                "n_star": n_star,
+                "d3_threshold_px": applied_threshold_px,
+                "criteria_passed": criteria_passed,
+                "failed_criteria": failed_criteria,
+                "n_by_status": n_by_status,
+                "n_support_computed": n_support_computed,
+                "n_support_zero": n_support_zero,
+                "n_support_not_computed": n_support_not_computed,
+                "register_rows_before": len(register_df),
+                "register_rows_after": len(eligible_df),
+            },
+        )
+    except FileExistsError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    typer.echo(
+        json.dumps(
+            {
+                "output_path": str(out_path),
+                "d3_threshold_px": applied_threshold_px,
+                "criteria_passed": criteria_passed,
+                "n_eligible": n_eligible,
+                "n_by_status": n_by_status,
+                "rows": len(eligible_df),
+                "manifest_path": str(out_path) + manifests.MANIFEST_SUFFIX,
+            },
+            indent=2,
+            sort_keys=True,
+            default=str,
         )
     )
 
