@@ -599,8 +599,12 @@ def validate_minedex_bundles(shp_zip_path: Path, csv_zip_path: Path) -> dict[str
     `coordinate_columns_present`, `n_projects`, `n_projects_with_current_owner`
     (current = `EndDate` null or blank), `n_sites_absent_from_shapefile`
     (distinct `Sites.csv`-only `SiteCode`s, i.e. (e)'s reconciled excess),
-    `n_duplicate_site_code_values`, `n_site_code_rows_duplicated` and
-    `n_orphan_owner_project_codes`. `n_sites_null_coordinates` is `None` --
+    `n_duplicate_site_code_values`, `n_site_code_rows_duplicated`,
+    `n_orphan_owner_project_codes`, `n_owner_rows_current` (D12.2, disclosure
+    not refusal: `ProjectsOwners.csv` rows with a blank `EndDate`) and
+    `n_owner_rows_ended` (rows with a non-blank `EndDate`) -- the latter two
+    always reconcile exactly against `ProjectsOwners.csv`'s own row total.
+    `n_sites_null_coordinates` is `None` --
     never a number -- when `coordinate_columns_present` is `False`: unlike
     every refusal above, a site genuinely lacking coordinates is not a
     validation failure, so this cannot refuse when the `Latitude`/
@@ -817,6 +821,19 @@ def validate_minedex_bundles(shp_zip_path: Path, csv_zip_path: Path) -> dict[str
         owners_df.loc[end_date_blank, "ProjectCode"].dropna().nunique()
     )
 
+    # Disclosed, not refused (D12.2): the split of ProjectsOwners.csv's own
+    # rows into CURRENT (blank EndDate) and ENDED (non-blank EndDate). The
+    # real 2026-08-14 extract is current-only -- every row of `end_date_
+    # blank` is True -- so `owners_at_snapshot`'s 'current owner' filter
+    # (`register.owners_by_project`) has had no bite against it, and nothing
+    # pinned or disclosed that property until now. A future extract carrying
+    # ended relationships changes what 'current owner' actually selects; the
+    # two counts reconcile EXACTLY against ProjectsOwners.csv's own row total
+    # by construction, since `end_date_blank` is a boolean partition of every
+    # row.
+    n_owner_rows_current = int(end_date_blank.sum())
+    n_owner_rows_ended = int((~end_date_blank).sum())
+
     return {
         "shp_members": sorted(shp_members),
         "csv_members": sorted(csv_members),
@@ -834,4 +851,6 @@ def validate_minedex_bundles(shp_zip_path: Path, csv_zip_path: Path) -> dict[str
         "n_duplicate_site_code_values": n_duplicate_site_code_values,
         "n_site_code_rows_duplicated": n_site_code_rows_duplicated,
         "n_orphan_owner_project_codes": n_orphan_owner_project_codes,
+        "n_owner_rows_current": n_owner_rows_current,
+        "n_owner_rows_ended": n_owner_rows_ended,
     }

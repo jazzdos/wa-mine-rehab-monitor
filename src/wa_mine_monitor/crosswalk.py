@@ -11,10 +11,13 @@ recurring rule that a reduction over ambiguous candidates must never drop
 the ambiguity itself.
 
 This is the pure, testable core (`build_crosswalk`, `crosswalk_counts`,
-`tier1_population`); the `build-crosswalk` CLI command (`cli.py`) wires it
-to the latest curated register and the latest Maus WA extract snapshot, the
-declared-schema parquet writer (`tables.write_table`) and the run-manifest
-sidecar.
+`crosswalk_row_total`, `tier1_population`); the `build-crosswalk` CLI
+command (`cli.py`) wires it to the latest curated register and the latest
+Maus WA extract snapshot, the declared-schema parquet writer
+(`tables.write_table`) and the run-manifest sidecar. Every input-shape
+refusal this module raises is `CrosswalkInputError` (a `ValueError`
+subclass) -- see that class's docstring for why the CLI catches it
+specifically rather than bare `ValueError`.
 
 Both inputs must already be projected to `TARGET_CRS` (`EPSG:3577`, GDA94 /
 Australian Albers -- the CRS the design doc's §5 DEA probe measured the
@@ -95,8 +98,21 @@ CROSSWALK_SCHEMA = pa.schema(
 #: never drift apart.
 _COLUMNS: tuple[str, ...] = tuple(CROSSWALK_SCHEMA.names)
 
-_REQUIRED_MINEDEX_COLUMNS: frozenset[str] = frozenset({"site_id"})
-_REQUIRED_MAUS_COLUMNS: frozenset[str] = frozenset({"maus_id"})
+#: `geometry` is declared here alongside `site_id`/`maus_id` -- see
+#: `CrosswalkInputError`'s docstring for why: `_assert_target_crs` reads
+#: `gdf.crs`, a property that raises a bare `AttributeError` (not
+#: `ValueError`) on a GeoDataFrame with no active geometry column, so the
+#: required-column check (which reads `.columns`, never `.crs`/`.geometry`,
+#: and cannot raise that way) must run, and catch a missing `geometry`
+#: column, BEFORE the CRS check ever touches `.crs`. `build_crosswalk`'s
+#: guard order enforces this.
+_REQUIRED_MINEDEX_COLUMNS: frozenset[str] = frozenset({"site_id", "geometry"})
+_REQUIRED_MAUS_COLUMNS: frozenset[str] = frozenset({"maus_id", "geometry"})
+
+#: `filter_register_for_crosswalk`'s own required columns -- the raw
+#: register frame, before point geometry is built from `lon`/`lat`. See
+#: that function's docstring.
+_REQUIRED_REGISTER_COLUMNS: frozenset[str] = frozenset({"site_id", "lon", "lat"})
 
 #: How many offending `site_id`s a refusal message names before truncating.
 #: A refusal naming every id in a statewide register would be unreadable;
@@ -104,9 +120,30 @@ _REQUIRED_MAUS_COLUMNS: frozenset[str] = frozenset({"maus_id"})
 _MAX_NAMED_SITES = 10
 
 
+class CrosswalkInputError(ValueError):
+    """Raised ONLY by this module's own declared input guards
+    (`_assert_required_columns`, `_assert_target_crs`, `_assert_no_null_or_
+    duplicate_site_ids`, `_assert_no_null_or_duplicate_maus_ids`,
+    `_assert_every_site_has_a_usable_location`, and `filter_register_for_
+    crosswalk`'s own column check) -- never by an unrelated failure inside
+    pandas, geopandas or shapely that happens to raise a bare `ValueError`.
+
+    A `ValueError` subclass, not an unrelated new exception type: every
+    existing `pytest.raises(ValueError, ...)` / `except ValueError` caller
+    keeps working unchanged. The reason for the dedicated subclass is the
+    CLI boundary (`build_crosswalk_cmd` in `cli.py`): catching bare
+    `ValueError` around `build_crosswalk` used to also catch an unrelated
+    `ValueError` raised deep inside the matching passes (a pandas/shapely
+    internal, not an input-shape problem) and report it as a clean
+    structured "refusal" -- indistinguishable from a genuine bad input.
+    Catching `CrosswalkInputError` specifically closes that hole: anything
+    NOT raised by a declared guard now propagates uncaught, as it should.
+    """
+
+
 def _assert_target_crs(gdf: gpd.GeoDataFrame, *, name: str) -> None:
-    """Raise `ValueError`, naming `name` and the CRS actually found, unless
-    `gdf` is already in `TARGET_CRS`.
+    """Raise `CrosswalkInputError`, naming `name` and the CRS actually
+    found, unless `gdf` is already in `TARGET_CRS`.
 
     Reprojection happens in the CLI, never here -- see this module's
     docstring. Comparing via `gdf.crs == TARGET_CRS` (a `pyproj.CRS`
@@ -114,15 +151,33 @@ def _assert_target_crs(gdf: gpd.GeoDataFrame, *, name: str) -> None:
     equivalent CRS however it was constructed (EPSG code, WKT, proj4)
     rather than only the one spelling this module happens to write in its
     own error messages.
+
+    Callers MUST run `_assert_required_columns` (naming `geometry`) over
+    `gdf` before calling this: `gdf.crs` is a GeoPandas property that raises
+    a bare `AttributeError` -- not `ValueError`, and so not a
+    `CrosswalkInputError` -- when `gdf` has no active geometry column at
+    all. `build_crosswalk` orders its guards accordingly.
     """
     if gdf.crs is None or gdf.crs != TARGET_CRS:
-        raise ValueError(f"{name} must be in {TARGET_CRS}, got {gdf.crs!r}")
+        raise CrosswalkInputError(f"{name} must be in {TARGET_CRS}, got {gdf.crs!r}")
 
 
-def _assert_required_columns(gdf: gpd.GeoDataFrame, *, name: str, required: frozenset[str]) -> None:
+def _assert_required_columns(gdf: pd.DataFrame, *, name: str, required: frozenset[str]) -> None:
+    """Raise `CrosswalkInputError`, naming every missing column, unless
+    every column in `required` is present in `gdf.columns`.
+
+    Typed `pd.DataFrame`, not `gpd.GeoDataFrame`, deliberately: a
+    `GeoDataFrame` is a `DataFrame` subclass, so this same check runs, with
+    the identical guarantee, over `filter_register_for_crosswalk`'s raw
+    register frame (no geometry yet) as well as `build_crosswalk`'s two
+    GeoDataFrame inputs. `.columns` alone is read here -- never `.crs` or
+    `.geometry` -- so this check itself never raises on a GeoDataFrame with
+    no active geometry column; see `_assert_target_crs`'s docstring for why
+    that ordering matters.
+    """
     missing = sorted(required - set(gdf.columns))
     if missing:
-        raise ValueError(
+        raise CrosswalkInputError(
             f"{name} is missing required column(s) {missing} "
             f"(columns present: {sorted(gdf.columns)})"
         )
@@ -153,14 +208,14 @@ def _assert_no_null_or_duplicate_site_ids(minedex_gdf: gpd.GeoDataFrame) -> None
     certifies a population that lost a member: its own total reconciles,
     because the dropped site was never counted anywhere.
 
-    Raises `ValueError`, naming every duplicated value, when any `site_id`
-    appears more than once; raises `ValueError` when any `site_id` is null.
+    Raises `CrosswalkInputError`, naming every duplicated value, when any `site_id`
+    appears more than once; raises `CrosswalkInputError` when any `site_id` is null.
     An empty `minedex_gdf` passes trivially (no ids to collide).
     """
     site_id = minedex_gdf["site_id"]
     if site_id.isna().any():
         n_null = int(site_id.isna().sum())
-        raise ValueError(
+        raise CrosswalkInputError(
             f"minedex_gdf['site_id'] contains {n_null} null value(s) -- build_crosswalk "
             "requires every site to carry a non-null site_id: a null site_id is grouped "
             "inconsistently between the containment pass (which drops a null-site_id group "
@@ -171,7 +226,7 @@ def _assert_no_null_or_duplicate_site_ids(minedex_gdf: gpd.GeoDataFrame) -> None
         )
     duplicated_values = sorted(site_id[site_id.duplicated(keep=False)].unique())
     if duplicated_values:
-        raise ValueError(
+        raise CrosswalkInputError(
             f"minedex_gdf['site_id'] contains duplicate value(s) {duplicated_values} -- "
             "build_crosswalk requires site_id to uniquely identify a MINEDEX site: a "
             "duplicate lets the containment pass's already_matched exclusion drop an "
@@ -204,8 +259,8 @@ def _assert_no_null_or_duplicate_maus_ids(maus_gdf: gpd.GeoDataFrame) -> None:
     genuine candidate carrying a null id would be counted as no candidate at
     all and its site classified `unmatched`.
 
-    Raises `ValueError`, naming every duplicated value, when any `maus_id`
-    appears more than once; raises `ValueError`, naming the count, when any
+    Raises `CrosswalkInputError`, naming every duplicated value, when any `maus_id`
+    appears more than once; raises `CrosswalkInputError`, naming the count, when any
     is null. An empty `maus_gdf` passes trivially.
 
     If duplicate geometries turn out to be a real property of the Maus v2 WA
@@ -216,7 +271,7 @@ def _assert_no_null_or_duplicate_maus_ids(maus_gdf: gpd.GeoDataFrame) -> None:
     maus_id = maus_gdf["maus_id"]
     if maus_id.isna().any():
         n_null = int(maus_id.isna().sum())
-        raise ValueError(
+        raise CrosswalkInputError(
             f"maus_gdf['maus_id'] contains {n_null} null value(s) -- build_crosswalk requires "
             "every candidate polygon to carry a non-null maus_id: the nearest-match pass uses "
             "a non-null maus_id as its 'this row matched a polygon' test, so a genuine "
@@ -226,7 +281,7 @@ def _assert_no_null_or_duplicate_maus_ids(maus_gdf: gpd.GeoDataFrame) -> None:
         )
     duplicated_values = sorted(maus_id[maus_id.duplicated(keep=False)].unique())
     if duplicated_values:
-        raise ValueError(
+        raise CrosswalkInputError(
             f"maus_gdf['maus_id'] contains duplicate value(s) {duplicated_values} -- "
             "build_crosswalk requires maus_id to uniquely identify a candidate polygon: the "
             "nearest-match pass merges each sjoin hit against maus_id, so a duplicate makes "
@@ -246,8 +301,8 @@ def _assert_every_site_has_a_usable_location(minedex_gdf: gpd.GeoDataFrame) -> N
     A MINEDEX record with a null geometry reaches this module as `lon`/`lat`
     = `NaN` in the register (`register.build_register`, which counts and
     discloses them) and is rebuilt by the CLI as a `POINT (NaN NaN)`. Such a
-    point survives the `predicate="within"` pass (no match) and then kills
-    the `predicate="dwithin"` pass with a bare `shapely.errors.
+    point survives the `predicate="covered_by"` pass (no match) and then
+    kills the `predicate="dwithin"` pass with a bare `shapely.errors.
     GEOSException`, which through the CLI is an uncaught traceback with
     empty stdout -- the same failure shape `sources/maus.py`'s `clip_to_wa`
     docstring records having already been fixed once.
@@ -262,7 +317,7 @@ def _assert_every_site_has_a_usable_location(minedex_gdf: gpd.GeoDataFrame) -> N
     decides what to do about them rather than finding them silently
     reclassified.
 
-    Raises `ValueError`, naming the count and up to `_MAX_NAMED_SITES` of
+    Raises `CrosswalkInputError`, naming the count and up to `_MAX_NAMED_SITES` of
     the offending `site_id`s.
     """
     if len(minedex_gdf) == 0:
@@ -294,7 +349,7 @@ def _assert_every_site_has_a_usable_location(minedex_gdf: gpd.GeoDataFrame) -> N
     offending = [str(value) for value in minedex_gdf.loc[unusable, "site_id"]]
     named = sorted(offending)[:_MAX_NAMED_SITES]
     suffix = "" if len(offending) <= _MAX_NAMED_SITES else f" (first {_MAX_NAMED_SITES} shown)"
-    raise ValueError(
+    raise CrosswalkInputError(
         f"minedex_gdf carries {len(offending)} site(s) with no usable point geometry "
         f"(null, empty, or a non-finite coordinate): {named}{suffix} -- build_crosswalk "
         "cannot score such a site against any polygon, and the dwithin pass raises a bare "
@@ -348,11 +403,16 @@ def filter_register_for_crosswalk(
     does a hand-built `minedex_gdf` fed to `build_crosswalk` directly,
     bypassing this function entirely).
 
-    Requires `register_df` to carry `site_id`, `lon` and `lat` -- raises
-    the same `KeyError` a missing column would raise on direct access,
-    naming the column, so a schema-drifted or hand-built register frame is
-    caught here rather than inside a later spatial join.
+    Requires `register_df` to carry `site_id`, `lon` and `lat`
+    (`_REQUIRED_REGISTER_COLUMNS`) -- raises `CrosswalkInputError`, naming
+    every missing column, via `_assert_required_columns`, the SAME declared
+    guard `build_crosswalk` runs over its own two inputs, so a schema-
+    drifted or hand-built register frame is caught here, explicitly and by
+    name, rather than by an incidental `KeyError` from the bracket access
+    below.
     """
+    _assert_required_columns(register_df, name="register_df", required=_REQUIRED_REGISTER_COLUMNS)
+
     site_id = register_df["site_id"]
     lon = register_df["lon"]
     lat = register_df["lat"]
@@ -393,6 +453,19 @@ def _containment_rows(
     its own row, and `ambiguity_n` on each is the count of polygons that
     site fell inside -- the same "keep it explicit" discipline this
     module's docstring states for the nearest-match pass.
+
+    Uses `predicate="covered_by"` (the point-side name for the polygon-side
+    `covers`), NOT `"within"`. D12.3 triage, finding 4: `within` is a STRICT
+    interior predicate that excludes a point sitting exactly ON a polygon's
+    boundary (an edge or a vertex) -- such a site fell through to
+    `_nearest_rows` instead, which reports `distance_m=0.0` (a boundary
+    point really is zero distance from the polygon) under
+    `match_method="nearest_within_2000m"`/`confidence="medium"`, so
+    `distance_m == 0.0` no longer implied containment. `covered_by` is
+    boundary-inclusive (verified directly against geopandas 1.1.4/shapely
+    2.1.2: a point on a square's edge joins under `covered_by` and not under
+    `within`), so `distance_m == 0.0` now always means `point_in_polygon`/
+    `high`.
     """
     if len(minedex_gdf) == 0 or len(maus_gdf) == 0:
         return [], set()
@@ -401,7 +474,7 @@ def _containment_rows(
         minedex_gdf[["site_id", "geometry"]],
         maus_gdf[["maus_id", "geometry"]],
         how="inner",
-        predicate="within",
+        predicate="covered_by",
     )
 
     rows: list[dict[str, object]] = []
@@ -558,11 +631,28 @@ def _shared_by_n(df: pd.DataFrame) -> pd.Series:
 def build_crosswalk(minedex_gdf: gpd.GeoDataFrame, maus_gdf: gpd.GeoDataFrame) -> pd.DataFrame:
     """Build the MINEDEX-Maus crosswalk: one or more rows per MINEDEX site.
 
-    Both inputs must already be projected to `TARGET_CRS` -- raises
-    `ValueError`, naming which frame and the CRS actually found, otherwise.
     `minedex_gdf` needs `site_id`/`geometry` (point geometry); `maus_gdf`
-    needs `maus_id`/`geometry` (polygon geometry). Raises `ValueError`,
-    naming every missing column, when either is absent.
+    needs `maus_id`/`geometry` (polygon geometry). Required columns are
+    checked FIRST, before anything else -- raises `CrosswalkInputError`,
+    naming every missing column, when either is absent. This ordering is
+    deliberate, not incidental: the CRS check below reads `gdf.crs`, a
+    GeoPandas property that raises a bare `AttributeError` (not
+    `ValueError`, and so not catchable as a `CrosswalkInputError`) on a
+    GeoDataFrame with no active geometry column, so `geometry` must already
+    be confirmed present before that check ever runs.
+
+    Both inputs must already be projected to `TARGET_CRS` -- raises
+    `CrosswalkInputError`, naming which frame and the CRS actually found,
+    otherwise.
+
+    `CrosswalkInputError` (a `ValueError` subclass) is raised ONLY by this
+    function's own declared guards, listed below -- never by an unrelated
+    failure inside `gpd.sjoin`, `pd.merge` or similar that happens to raise
+    a bare `ValueError`. That distinction is what lets `build-crosswalk`'s
+    CLI command catch `CrosswalkInputError` specifically for its structured
+    refusal, rather than catching every `ValueError` and risking reporting
+    a real defect as a clean input-shape refusal. See `CrosswalkInputError`'s
+    own docstring.
 
     Three further refusals, each closing a way an unenforced input property
     corrupts the matching passes below silently rather than loudly. The
@@ -591,9 +681,12 @@ def build_crosswalk(minedex_gdf: gpd.GeoDataFrame, maus_gdf: gpd.GeoDataFrame) -
 
     Matching, in order:
 
-    1. **Containment** (`gpd.sjoin`, `predicate="within"`): a site point
-       falling inside a Maus polygon -> `match_method="point_in_polygon"`,
-       `distance_m=0.0`, `confidence="high"`.
+    1. **Containment** (`gpd.sjoin`, `predicate="covered_by"`): a site point
+       falling inside OR exactly on the boundary of a Maus polygon ->
+       `match_method="point_in_polygon"`, `distance_m=0.0`, `confidence=
+       "high"`. `covered_by` (not the stricter, boundary-excluding `within`)
+       is what keeps `distance_m == 0.0` and `match_method="point_in_polygon"`
+       in agreement for a boundary point -- see `_containment_rows`.
     2. **Within-`MAX_MATCH_DISTANCE_M`** (`gpd.sjoin`, `predicate="dwithin"`),
        for every site NOT matched by containment ->
        `match_method="nearest_within_2000m"`, `confidence="medium"` (exactly
@@ -616,10 +709,13 @@ def build_crosswalk(minedex_gdf: gpd.GeoDataFrame, maus_gdf: gpd.GeoDataFrame) -
     (nulls last) with a reset integer index, so calling this twice over the
     same input in any row order yields byte-identical frames.
     """
-    _assert_target_crs(minedex_gdf, name="minedex_gdf")
-    _assert_target_crs(maus_gdf, name="maus_gdf")
+    # Required columns FIRST, `geometry` included -- `_assert_target_crs`
+    # reads `gdf.crs`, which raises a bare `AttributeError` on a frame with
+    # no active geometry column at all; see both functions' docstrings.
     _assert_required_columns(minedex_gdf, name="minedex_gdf", required=_REQUIRED_MINEDEX_COLUMNS)
     _assert_required_columns(maus_gdf, name="maus_gdf", required=_REQUIRED_MAUS_COLUMNS)
+    _assert_target_crs(minedex_gdf, name="minedex_gdf")
+    _assert_target_crs(maus_gdf, name="maus_gdf")
     _assert_no_null_or_duplicate_site_ids(minedex_gdf)
     _assert_no_null_or_duplicate_maus_ids(maus_gdf)
     _assert_every_site_has_a_usable_location(minedex_gdf)
@@ -651,14 +747,22 @@ def crosswalk_counts(df: pd.DataFrame) -> dict[str, int]:
     CLAUDE.md's rule that a count table reconciles against its own total
     before it is trusted.
 
-    `row_total` (total ROW count) is added to the returned dict only AFTER
-    that reconciliation succeeds, and is deliberately never one of the
-    keys reconciliation sums over: a `low`-confidence site contributes
-    MULTIPLE rows (one per ambiguous candidate polygon), so `row_total` can
-    legitimately exceed the site total -- summing it into `register.
-    reconcile_counts`'s category total would make a correct crosswalk fail
-    its own reconciliation. Reporting both, explicitly, is CLAUDE.md's
-    "state both, since one-to-many inflates rows" rule.
+    The returned dict carries EXACTLY `CONFIDENCE_LEVELS` plus `register.
+    TOTAL_KEY` -- the same fixed key set `register_counts` returns -- and
+    the same invariant `test_register_counts_reconciles_against_its_own_
+    total` asserts of that function holds here too:
+    `register.reconcile_counts(crosswalk_counts(df)) == crosswalk_counts(df)`.
+    An earlier version of this function added a `row_total` key (total ROW
+    count) to this SAME dict after reconciling, which broke that round-trip
+    for any caller handed the return value: `row_total` is not a category,
+    a `low`-confidence site legitimately contributes MULTIPLE rows (one per
+    ambiguous candidate polygon), and summing it into `reconcile_counts`'s
+    category total would make a correct crosswalk fail its own
+    reconciliation the SECOND time it was checked. `row_total` is now
+    `crosswalk_row_total`'s own return value -- a structural separation,
+    not a wider checker, per CLAUDE.md's "state both, since one-to-many
+    inflates rows" rule: both counts are still available, just never mixed
+    into the one dict that must itself reconcile cleanly.
     """
     counts = {
         level: int(df.loc[df["confidence"] == level, "site_id"].nunique())
@@ -666,9 +770,18 @@ def crosswalk_counts(df: pd.DataFrame) -> dict[str, int]:
     }
     counts[register.TOTAL_KEY] = int(df["site_id"].nunique())
     register.reconcile_counts(counts)
-
-    counts["row_total"] = len(df)
     return counts
+
+
+def crosswalk_row_total(df: pd.DataFrame) -> int:
+    """`df`'s total ROW count -- deliberately kept OUT of `crosswalk_counts`'s
+    reconciling dict; see that function's docstring for why. A `low`-
+    confidence site contributes one row per ambiguous candidate polygon, so
+    this can legitimately exceed `crosswalk_counts(df)[register.TOTAL_KEY]`
+    (a distinct-SITE count) -- that is the expected, one-to-many shape, not
+    a reconciliation failure.
+    """
+    return len(df)
 
 
 def tier1_population(crosswalk_df: pd.DataFrame) -> pd.DataFrame:

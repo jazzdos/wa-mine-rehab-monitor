@@ -80,6 +80,59 @@ def _polygons_gdf(rows: list[tuple[str, Polygon]]) -> gpd.GeoDataFrame:
     )
 
 
+# --- CrosswalkInputError / required-column presence -----------------------------
+#
+# D12.3 triage, finding "crosswalk ValueError refusal boundary too
+# broad/narrow": `_assert_target_crs` reads `gdf.crs`, a GeoPandas property
+# that raises a bare `AttributeError` (not `ValueError`) when the frame has
+# no active geometry column at all -- measured directly against geopandas
+# 1.1.4 below. Because `build_crosswalk` used to check CRS BEFORE required
+# columns, a `minedex_gdf`/`maus_gdf` missing `geometry` blew up with that
+# uncaught `AttributeError` rather than the library's own structured
+# refusal, and the CLI's `except ValueError` around the build call (too
+# NARROW in the opposite direction -- see the tests below) could never have
+# caught it anyway. `geometry` is now declared alongside `site_id`/`maus_id`
+# in `_REQUIRED_MINEDEX_COLUMNS`/`_REQUIRED_MAUS_COLUMNS`, and the required-
+# column check runs BEFORE the CRS check, so this is now a clean
+# `CrosswalkInputError`, naming the missing column, every time.
+
+
+def test_a_geodataframe_with_no_geometry_column_raises_attributeerror_on_crs() -> None:
+    """The counterfactual this guard-ordering fix rests on: `.crs` really
+    does raise a bare `AttributeError`, not `ValueError`, on a GeoDataFrame
+    with no active geometry column -- if a future geopandas version changes
+    this, this test goes red and the guard order's stated reason gets
+    re-read rather than silently outliving its cause."""
+    gdf = gpd.GeoDataFrame({"site_id": ["S1"]})
+    with pytest.raises(AttributeError):
+        _ = gdf.crs
+
+
+def test_build_crosswalk_raises_crosswalkinputerror_naming_missing_geometry_on_minedex_gdf() -> (
+    None
+):
+    minedex_gdf = gpd.GeoDataFrame({"site_id": ["S1"]})
+    maus_gdf = _polygons_gdf([("M1", _square(0.0, 0.0, 100.0))])
+
+    with pytest.raises(crosswalk_module.CrosswalkInputError, match="minedex_gdf.*geometry"):
+        build_crosswalk(minedex_gdf, maus_gdf)
+
+
+def test_build_crosswalk_raises_crosswalkinputerror_naming_missing_geometry_on_maus_gdf() -> None:
+    minedex_gdf = _sites_gdf([("S1", 0.0, 0.0)])
+    maus_gdf = gpd.GeoDataFrame({"maus_id": ["M1"]})
+
+    with pytest.raises(crosswalk_module.CrosswalkInputError, match="maus_gdf.*geometry"):
+        build_crosswalk(minedex_gdf, maus_gdf)
+
+
+def test_crosswalkinputerror_is_a_valueerror_subclass() -> None:
+    """Compatibility: existing callers catching plain `ValueError` (and
+    every `pytest.raises(ValueError, ...)` test in this file predating this
+    finding) keep working unchanged."""
+    assert issubclass(crosswalk_module.CrosswalkInputError, ValueError)
+
+
 # --- CRS assertion ------------------------------------------------------------
 
 
@@ -304,6 +357,50 @@ def test_site_inside_polygon_is_point_in_polygon_high_confidence() -> None:
     assert row["manual_review_status"] == "unreviewed"
 
 
+# D12.3 triage, finding 4: "`_containment_rows` `within` predicate excludes
+# boundary points (`distance_m==0` no longer implies containment)". `within`
+# is a STRICT interior predicate -- a point sitting exactly ON a polygon's
+# boundary (an edge or a vertex) is not `within` it, so such a site fell
+# through to `_nearest_rows` instead, which computes `distance_m=0.0` via
+# `GeoSeries.distance` (a point on the boundary is zero distance from the
+# polygon) but reports `match_method="nearest_within_2000m"`/`confidence=
+# "medium"` -- `distance_m == 0.0` and `match_method != "point_in_polygon"`
+# on the same row, the two signals disagreeing about the same geometry.
+# `covered_by` (the point-side name for the polygon-side `covers`) is
+# boundary-inclusive and is what `_containment_rows` now uses.
+
+
+def test_site_exactly_on_polygon_boundary_edge_is_point_in_polygon_high_confidence() -> None:
+    # Square centred (0, 0), half-width 100 -> right edge runs x=100,
+    # y in [-100, 100]. The site sits exactly on that edge, not inside it.
+    minedex_gdf = _sites_gdf([("S1E", 100.0, 0.0)])
+    maus_gdf = _polygons_gdf([("M1", _square(0.0, 0.0, 100.0))])
+
+    df = build_crosswalk(minedex_gdf, maus_gdf)
+
+    assert len(df) == 1
+    row = df.iloc[0]
+    assert row["match_method"] == MATCH_POINT_IN_POLYGON
+    assert row["distance_m"] == 0.0
+    assert row["confidence"] == "high"
+    assert row["ambiguity_n"] == 1
+
+
+def test_site_exactly_on_polygon_boundary_vertex_is_point_in_polygon_high_confidence() -> None:
+    # Square centred (0, 0), half-width 100 -> corner vertex at (100, 100).
+    minedex_gdf = _sites_gdf([("S1V", 100.0, 100.0)])
+    maus_gdf = _polygons_gdf([("M1", _square(0.0, 0.0, 100.0))])
+
+    df = build_crosswalk(minedex_gdf, maus_gdf)
+
+    assert len(df) == 1
+    row = df.iloc[0]
+    assert row["match_method"] == MATCH_POINT_IN_POLYGON
+    assert row["distance_m"] == 0.0
+    assert row["confidence"] == "high"
+    assert row["ambiguity_n"] == 1
+
+
 # --- nearest-within-2000m, single candidate ------------------------------------
 
 
@@ -510,9 +607,21 @@ def test_build_crosswalk_called_twice_over_the_same_input_is_byte_identical() ->
 
 
 # --- crosswalk_counts -----------------------------------------------------------
+#
+# D12.3 triage, finding "crosswalk_counts row_total key breaks
+# reconcile_counts round-trip": `crosswalk_counts` used to add a `row_total`
+# key to the dict it returns, AFTER reconciling -- so the dict `reconcile_
+# counts` had already accepted once could never be handed back to `reconcile_
+# counts` again without a caller manually filtering `row_total` out first
+# (the old version of the test below did exactly that). `register_counts`
+# carries no such wart: `test_register_counts_reconciles_against_its_own_
+# total` asserts `reconcile_counts(counts) == counts` directly on its
+# return value, with no filtering. `crosswalk_counts` now holds the
+# identical invariant -- the STRUCTURE fix (separation), not a widened
+# checker: `row_total` moves to its own function, `crosswalk_row_total`.
 
 
-def test_crosswalk_counts_reconciles_distinct_sites_and_reports_row_total() -> None:
+def test_crosswalk_counts_reconciles_directly_with_no_caller_side_filtering() -> None:
     minedex_gdf, maus_gdf = _combined_fixture()
     df = build_crosswalk(minedex_gdf, maus_gdf)
 
@@ -524,10 +633,28 @@ def test_crosswalk_counts_reconciles_distinct_sites_and_reports_row_total() -> N
     assert counts["low"] == 1  # S3 (2 rows, 1 distinct site)
     assert counts["none"] == 1  # S5
     assert counts[register.TOTAL_KEY] == 4
-    assert counts["row_total"] == 5  # S3 contributes 2 rows
+    assert "row_total" not in counts
 
-    reconcilable = {key: value for key, value in counts.items() if key != "row_total"}
-    assert register.reconcile_counts(reconcilable) == reconcilable
+    # The round-trip invariant `register_counts` guarantees
+    # (`test_register_counts_reconciles_against_its_own_total`), now held by
+    # `crosswalk_counts` too: its OWN return value reconciles, unmodified.
+    assert register.reconcile_counts(counts) == counts
+
+
+def test_crosswalk_row_total_is_the_row_count_kept_separate_from_confidence_counts() -> None:
+    """`row_total` (total ROW count) is reported by its own function,
+    deliberately never a key `crosswalk_counts`' dict carries: a `low`-
+    confidence site contributes MULTIPLE rows (one per ambiguous candidate
+    polygon), so `row_total` can legitimately exceed the distinct-site
+    total -- summing it into `register.reconcile_counts`'s category total
+    would make a correct crosswalk fail its own reconciliation."""
+    minedex_gdf, maus_gdf = _combined_fixture()
+    df = build_crosswalk(minedex_gdf, maus_gdf)
+
+    row_total = crosswalk_module.crosswalk_row_total(df)
+
+    assert row_total == 5  # S3 contributes 2 rows
+    assert row_total != crosswalk_counts(df)[register.TOTAL_KEY]  # 5 rows, 4 distinct sites
 
 
 # --- tier1_population -------------------------------------------------------------
@@ -732,6 +859,52 @@ def test_build_crosswalk_cli_refuses_when_no_maus_extract_exists(
     )
     assert result.exit_code == 1
     assert "maus_v2" in result.output
+
+
+def test_build_crosswalk_cli_does_not_swallow_an_unrelated_valueerror_from_the_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D12.3 triage, finding "crosswalk ValueError refusal boundary too
+    broad/narrow": `build_crosswalk_cmd`'s refusal handler around
+    `crosswalk.build_crosswalk` used to catch bare `ValueError`, which is
+    also the type every unrelated pandas/shapely internal failure happens
+    to raise -- reporting a real defect as a clean structured input
+    refusal, indistinguishable from a genuine input-shape problem. The
+    handler now catches `crosswalk.CrosswalkInputError` specifically (a
+    `ValueError` subclass raised only by `crosswalk.py`'s own declared
+    input guards), so an unrelated `ValueError` propagates uncaught -- exit
+    1, EMPTY stdout, and `result.exception` the raw exception, the same
+    "escaped as a traceback" shape `test_register.py` records for an
+    unguarded `AttributeError` -- rather than a `refusal` JSON payload."""
+    data_root = tmp_path / "data"
+    cfg_file = _write_config(tmp_path, data_root)
+    _seed_register(data_root, "2026-08-14")
+    _seed_maus_extract(data_root, "2026-08-15")
+
+    def _unrelated_failure(
+        minedex_gdf: gpd.GeoDataFrame, maus_gdf: gpd.GeoDataFrame
+    ) -> pd.DataFrame:
+        # Stands in for any bug inside the real matching passes that
+        # happens to raise a bare `ValueError` -- e.g. a pandas/shapely
+        # internal, never one of `crosswalk.py`'s own declared guards.
+        raise ValueError("unrelated pandas/shapely failure, not an input-shape refusal")
+
+    monkeypatch.setattr(crosswalk_module, "build_crosswalk", _unrelated_failure)
+    monkeypatch.setattr(
+        cli_module,
+        "collect_git_state",
+        lambda repo_root: {"sha": "testsha", "dirty": False, "diff": ""},
+    )
+
+    result = runner.invoke(
+        app, ["build-crosswalk", "--config", str(cfg_file), "--date", "2026-08-16"]
+    )
+
+    assert result.exit_code == 1
+    assert result.output == ""
+    assert isinstance(result.exception, ValueError)
+    assert not isinstance(result.exception, crosswalk_module.CrosswalkInputError)
+    assert "unrelated pandas/shapely failure" in str(result.exception)
 
 
 # --- build-crosswalk CLI snapshot-integrity gate --------------------------------

@@ -639,6 +639,33 @@ def test_validate_minedex_bundles_discloses_orphan_owner_project_codes_without_r
     assert summary["n_orphan_owner_project_codes"] == 1
 
 
+def test_validate_minedex_bundles_discloses_current_and_ended_owner_rows(tmp_path: Path) -> None:
+    """D12.2: the 2026-08-14 extract's `ProjectsOwners.csv` happens to be
+    CURRENT-only (every row's `EndDate` blank), so D8's `owners_at_snapshot`
+    'current owner' filter has had no bite -- nothing pinned or disclosed
+    that property. A future extract carrying ENDED (non-empty `EndDate`)
+    rows must not pass through unremarked: `n_owner_rows_current` and
+    `n_owner_rows_ended` disclose the split and must reconcile to the total
+    `ProjectsOwners.csv` row count. Disclosure, not refusal -- an extract
+    carrying ended rows is a valid extract."""
+    shp_zip, csv_zip = _write_matched_pair(tmp_path)
+
+    owners_df = _build_owners_df(
+        project_codes=sorted(set(_DEFAULT_PROJECT_CODES)),
+        end_dates=["", "31/12/2020", ""],
+    )
+    sites_df = _build_sites_df(
+        site_codes=_DEFAULT_SITE_CODES, stages=_DEFAULT_STAGES, project_codes=_DEFAULT_PROJECT_CODES
+    )
+    _write_minedex_csv_zip(csv_zip, sites_df=sites_df, owners_df=owners_df)
+
+    summary = minedex.validate_minedex_bundles(shp_zip, csv_zip)
+
+    assert summary["n_owner_rows_current"] == 2
+    assert summary["n_owner_rows_ended"] == 1
+    assert summary["n_owner_rows_current"] + summary["n_owner_rows_ended"] == len(owners_df)
+
+
 def test_validate_minedex_bundles_raises_on_missing_file(tmp_path: Path) -> None:
     with pytest.raises(minedex.SnapshotValidationError):
         minedex.validate_minedex_bundles(
@@ -1067,6 +1094,13 @@ def test_fetch_minedex_cli_writes_a_verified_snapshot_with_unadjudicated_evidenc
         assert entry["redistribute_public"] is False
         assert "CONFLICT" in entry["licence"]
     assert manifest["resolved_args"]["validation_summary"]["extract_date"] == "2026-08-14"
+    # D12.2: the current/ended owner-row split flows into the manifest via
+    # the existing `validation_summary` plumbing -- no new sidecar. The
+    # fixture pair (`_write_matched_pair`) builds a current-only
+    # `ProjectsOwners.csv`, matching the real 2026-08-14 extract's own
+    # measured shape.
+    assert manifest["resolved_args"]["validation_summary"]["n_owner_rows_current"] == 3
+    assert manifest["resolved_args"]["validation_summary"]["n_owner_rows_ended"] == 0
 
 
 def test_fetch_minedex_cli_continues_fail_closed_on_a_datawa_fetch_failure(

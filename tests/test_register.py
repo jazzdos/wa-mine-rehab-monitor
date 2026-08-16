@@ -29,23 +29,28 @@ from typer.testing import CliRunner
 from tests.sources._fixtures import shapefile_members, write_zip
 from wa_mine_monitor import cli as cli_module
 from wa_mine_monitor import export_gate, snapshots
+from wa_mine_monitor import register as register_module
 from wa_mine_monitor.cli import app
 from wa_mine_monitor.register import (
     MINEDEX_SITES_SOURCE_CRS,
     OWNER_JOIN_DISCLOSURE_KEYS,
+    OWNER_ROW_COMPOSITION_KEYS,
     REGISTER_LONLAT_CRS,
     REGISTER_SCHEMA,
     STAGE_TO_INCLUSION,
+    TENEMENT_COUNT_DISCLOSURE_KEYS,
     NoSnapshotFoundError,
     build_reconciliation_report,
     build_register,
     count_rows_without_location,
     latest_snapshot,
     owner_join_disclosures,
+    owner_row_composition,
     owners_by_project,
     reconcile_counts,
     register_counts,
     site_id_duplication_counts,
+    tenement_count_disclosure,
 )
 from wa_mine_monitor.sources.minedex import MINEDEX_CSV_ZIP_FILENAME
 from wa_mine_monitor.sources.tenements import TENEMENTS_SHAPEFILE_BASENAME, TENEMENTS_ZIP_FILENAME
@@ -427,6 +432,54 @@ def test_owner_join_disclosures_all_zero_on_a_clean_join() -> None:
 
 
 # =============================================================================
+# owner_row_composition (D12.2)
+# =============================================================================
+
+
+def test_owner_row_composition_splits_current_and_ended_rows() -> None:
+    """D12.2: the 2026-08-14 extract's `ProjectsOwners.csv` happens to be
+    CURRENT-only, so D8's `owners_at_snapshot` 'current owner' filter has
+    had no bite against it -- nothing pinned or disclosed that property.
+    This mirrors `sources.minedex.validate_minedex_bundles`'s identical
+    disclosure, but computed directly off the `ProjectsOwners.csv` frame
+    `build-register` already has in hand, since the register manifest is
+    where a reader adjudicates owner semantics."""
+    owners_df = _owners_df(
+        [
+            _owners_row(project_code="P1", owner_code="O1", owner_name="Owner A", end_date=""),
+            _owners_row(
+                project_code="P1", owner_code="O2", owner_name="Owner B", end_date="31/12/2020"
+            ),
+            _owners_row(project_code="P2", owner_code="O3", owner_name="Owner C", end_date=""),
+        ]
+    )
+
+    composition = owner_row_composition(owners_df)
+
+    assert composition == {
+        "owner_rows_total": 3,
+        "n_owner_rows_current": 2,
+        "n_owner_rows_ended": 1,
+    }
+    assert set(composition) == set(OWNER_ROW_COMPOSITION_KEYS)
+
+
+def test_owner_row_composition_all_current_on_the_empty_extract_shape() -> None:
+    owners_df = _owners_df(
+        [_owners_row(project_code="P1", owner_code="O1", owner_name="Owner A", end_date="")]
+    )
+    composition = owner_row_composition(owners_df)
+    assert composition["owner_rows_total"] == 1
+    assert composition["n_owner_rows_current"] == 1
+    assert composition["n_owner_rows_ended"] == 0
+
+
+def test_owner_row_composition_requires_an_end_date_column() -> None:
+    with pytest.raises(ValueError, match="EndDate"):
+        owner_row_composition(pd.DataFrame({"ProjectCode": ["P1"]}))
+
+
+# =============================================================================
 # build_register: output shape, columns, row survival
 # =============================================================================
 
@@ -580,9 +633,11 @@ def test_build_register_null_coordinate_row_survives_with_lon_lat_na() -> None:
     assert pd.isna(row["lat"])
 
 
-def test_build_register_null_coordinate_row_has_zero_tenements_intersecting() -> None:
-    """A coordinate-less row takes no part in the spatial join -- 0 by
-    definition, not "not computed"."""
+def test_build_register_null_coordinate_row_has_not_computed_tenements_intersecting() -> None:
+    """A coordinate-less row takes no part in the spatial join -- D12.2:
+    `n_tenements_intersecting` is NOT COMPUTED (null) for it, never a
+    fabricated zero. A diagnostic that could not be computed is not a
+    diagnostic that fired."""
     df = build_register(
         _sites_df(
             [
@@ -597,7 +652,7 @@ def test_build_register_null_coordinate_row_has_zero_tenements_intersecting() ->
         "2026-08-15",
     )
     row = df.set_index("site_id").loc["M0002"]
-    assert row["n_tenements_intersecting"] == 0
+    assert pd.isna(row["n_tenements_intersecting"])
 
 
 def test_build_register_a_single_null_coordinate_field_also_counts() -> None:
@@ -664,6 +719,68 @@ def test_build_register_reprojects_a_differently_declared_tenements_crs() -> Non
         _sites_df([_sites_row(lon=116.0, lat=-32.0)]), _owners_df([]), tenements_gdf, "2026-08-15"
     )
     assert df.loc[0, "n_tenements_intersecting"] == 1
+
+
+# D12.3 triage, finding 5: "`_count_intersecting_tenements` `groupby(level=0)`
+# conflates a non-unique index -- unreachable via the CLI (`build_register`
+# always constructs `located_gdf` off a de-duplicated `RangeIndex` subset),
+# but a latent trap for any other caller. `groupby(level=0)` groups by INDEX
+# LABEL, not by row -- two rows sharing an index value are silently merged
+# into one group, so a duplicate-index frame reports each duplicated row's
+# count as the UNION of both rows' matches rather than each row's own.
+
+
+def test_count_intersecting_tenements_raises_on_a_non_unique_index() -> None:
+    tenements_gdf = _tenements_gdf([_tenement_polygon(116.0, -32.0)])
+    located_gdf = gpd.GeoDataFrame(
+        index=[0, 0, 1],
+        geometry=[
+            _tenement_polygon(116.0, -32.0).centroid,
+            _tenement_polygon(116.0, -32.0).centroid,
+            _tenement_polygon(120.0, -30.0).centroid,
+        ],
+        crs="EPSG:7844",
+    )
+
+    with pytest.raises(ValueError, match="non-unique index"):
+        register_module._count_intersecting_tenements(located_gdf, tenements_gdf)
+
+
+def test_count_intersecting_tenements_names_the_duplicated_index_values() -> None:
+    tenements_gdf = _tenements_gdf([_tenement_polygon(116.0, -32.0)])
+    located_gdf = gpd.GeoDataFrame(
+        index=[7, 7, 3, 3],
+        geometry=[
+            _tenement_polygon(116.0, -32.0).centroid,
+            _tenement_polygon(116.0, -32.0).centroid,
+            _tenement_polygon(120.0, -30.0).centroid,
+            _tenement_polygon(120.0, -30.0).centroid,
+        ],
+        crs="EPSG:7844",
+    )
+
+    with pytest.raises(ValueError, match=r"\[3, 7\]"):
+        register_module._count_intersecting_tenements(located_gdf, tenements_gdf)
+
+
+def test_count_intersecting_tenements_computes_each_row_independently_on_a_unique_index() -> None:
+    # The counterfactual the guard protects: a unique-index frame with two
+    # DISTINCT rows sharing the same point still gets each row's own count,
+    # never a merged one.
+    tenements_gdf = _tenements_gdf([_tenement_polygon(116.0, -32.0)])
+    located_gdf = gpd.GeoDataFrame(
+        index=[10, 11],
+        geometry=[
+            _tenement_polygon(116.0, -32.0).centroid,
+            _tenement_polygon(116.0, -32.0).centroid,
+        ],
+        crs="EPSG:7844",
+    )
+
+    counts = register_module._count_intersecting_tenements(located_gdf, tenements_gdf)
+
+    assert counts.loc[10] == 1
+    assert counts.loc[11] == 1
 
 
 # --- inclusion_status classification via STAGE_TO_INCLUSION --------------------
@@ -753,6 +870,86 @@ def test_build_register_counts_per_site_independently() -> None:
     assert by_id.loc["M0002", "n_tenements_intersecting"] == 0
 
 
+def test_build_register_distinguishes_not_computed_from_a_genuine_zero() -> None:
+    """D12.2: a coordinate-less site's `n_tenements_intersecting` is null
+    (never computed); a located site with no intersecting tenement is a
+    genuine 0. The two must never be conflated."""
+    df = build_register(
+        _sites_df(
+            [
+                _sites_row(site_code="M0001", lon=120.0, lat=-30.0),  # located, no intersection
+                _sites_row(site_code="M0002", lon=None, lat=None),  # coordinate-less
+            ]
+        ),
+        _owners_df([]),
+        _tenements_gdf([_tenement_polygon(116.0, -32.0)]),
+        "2026-08-15",
+    )
+    by_id = df.set_index("site_id")
+    assert by_id.loc["M0001", "n_tenements_intersecting"] == 0
+    assert not pd.isna(by_id.loc["M0001", "n_tenements_intersecting"])
+    assert pd.isna(by_id.loc["M0002", "n_tenements_intersecting"])
+
+
+def test_build_register_n_tenements_intersecting_dtype_is_nullable_integer() -> None:
+    df = build_register(
+        _sites_df(
+            [
+                _sites_row(site_code="M0001", lon=116.0, lat=-32.0),
+                _sites_row(site_code="M0002", lon=None, lat=None),
+            ]
+        ),
+        _owners_df([]),
+        _tenements_gdf([]),
+        "2026-08-15",
+    )
+    assert str(df["n_tenements_intersecting"].dtype) == "Int64"
+
+
+# =============================================================================
+# tenement_count_disclosure (D12.2)
+# =============================================================================
+
+
+def test_tenement_count_disclosure_reconciles_and_separates_zero_from_not_computed() -> None:
+    df = build_register(
+        _sites_df(
+            [
+                _sites_row(site_code="M0001", lon=116.0, lat=-32.0),  # located, intersects
+                _sites_row(site_code="M0002", lon=120.0, lat=-30.0),  # located, no intersection
+                _sites_row(site_code="M0003", lon=None, lat=None),  # coordinate-less
+            ]
+        ),
+        _owners_df([]),
+        _tenements_gdf([_tenement_polygon(116.0, -32.0)]),
+        "2026-08-15",
+    )
+    disclosure = tenement_count_disclosure(df)
+    assert disclosure == {
+        "sites_total": 3,
+        "n_sites_tenement_count_computed": 2,
+        "n_sites_tenement_count_zero": 1,
+        "n_sites_tenement_count_not_computed": 1,
+    }
+    assert set(disclosure.keys()) == set(TENEMENT_COUNT_DISCLOSURE_KEYS)
+    assert (
+        disclosure["n_sites_tenement_count_computed"]
+        + disclosure["n_sites_tenement_count_not_computed"]
+        == disclosure["sites_total"]
+    )
+
+
+def test_tenement_count_disclosure_on_a_fully_located_register() -> None:
+    df = build_register(_sites_df([_sites_row()]), _owners_df([]), _tenements_gdf([]), "2026-08-15")
+    disclosure = tenement_count_disclosure(df)
+    assert disclosure == {
+        "sites_total": 1,
+        "n_sites_tenement_count_computed": 1,
+        "n_sites_tenement_count_zero": 1,
+        "n_sites_tenement_count_not_computed": 0,
+    }
+
+
 # =============================================================================
 # declared schema + export-gate geometry check
 # =============================================================================
@@ -782,6 +979,43 @@ def test_register_schema_has_nullable_owners_and_lonlat_types() -> None:
     assert fields["lon"].nullable
     assert str(fields["lat"].type) == "double"
     assert fields["lat"].nullable
+
+
+def test_register_schema_declares_n_tenements_intersecting_as_nullable_int64() -> None:
+    """D12.2: `n_tenements_intersecting` must be able to carry NOT COMPUTED
+    (null) separately from a genuine computed zero."""
+    fields = {field.name: field for field in REGISTER_SCHEMA}
+    assert str(fields["n_tenements_intersecting"].type) == "int64"
+    assert fields["n_tenements_intersecting"].nullable
+
+
+def test_register_write_table_preserves_not_computed_vs_zero_through_the_real_write_path(
+    tmp_path: Path,
+) -> None:
+    """Through the REAL write/read-back path (`tables.write_table` /
+    `pd.read_parquet`), never against the in-memory frame alone -- a
+    nullable column is only proven nullable at the boundary that writes
+    it."""
+    df = build_register(
+        _sites_df(
+            [
+                _sites_row(site_code="M0001", lon=116.0, lat=-32.0),  # located, no intersection
+                _sites_row(site_code="M0002", lon=None, lat=None),  # coordinate-less
+            ]
+        ),
+        _owners_df([]),
+        _tenements_gdf([_tenement_polygon(200.0, 50.0)]),  # far away -- never intersects
+        "2026-08-15",
+    )
+    path = tmp_path / "register.parquet"
+
+    write_table(df, path, REGISTER_SCHEMA)
+    back = pd.read_parquet(path)
+
+    assert str(back["n_tenements_intersecting"].dtype) == "Int64"
+    by_id = back.set_index("site_id")
+    assert by_id.loc["M0001", "n_tenements_intersecting"] == 0
+    assert pd.isna(by_id.loc["M0002", "n_tenements_intersecting"])
 
 
 # =============================================================================
@@ -1117,6 +1351,13 @@ def test_build_register_cli_writes_parquet_counts_reconciliation_and_manifest(
     assert by_id.loc["M0001", "owners_at_snapshot"] == "Acme Bauxite (100%)"
     assert pd.isna(by_id.loc["M0002", "owners_at_snapshot"])
     assert by_id.loc["M0001", "n_tenements_intersecting"] == 1
+    # M0002 is LOCATED (lon=120.0, lat=-30.0) but the tenements fixture only
+    # carries a polygon at (116.0, -32.0) -- a genuine computed zero, D12.2.
+    assert by_id.loc["M0002", "n_tenements_intersecting"] == 0
+    assert not pd.isna(by_id.loc["M0002", "n_tenements_intersecting"])
+    # M0003 has no coordinates -- n_tenements_intersecting is NOT COMPUTED
+    # (null), never a fabricated zero, D12.2.
+    assert pd.isna(by_id.loc["M0003", "n_tenements_intersecting"])
     assert pd.isna(by_id.loc["M0003", "lon"])
     # `snapshot_date` names the MINEDEX snapshot the rows were actually read
     # from, never the `--date` build argument.
@@ -1151,11 +1392,90 @@ def test_build_register_cli_writes_parquet_counts_reconciliation_and_manifest(
         sites_df, owners_df
     )
     assert manifest["resolved_args"]["n_sites_null_coordinates"] == 1
+    # D12.2: M0001 and M0002 are located (computed: 1 intersecting, 0
+    # intersecting respectively); M0003 has no coordinates (not computed).
+    assert manifest["resolved_args"]["tenement_count_disclosure"] == {
+        "sites_total": 3,
+        "n_sites_tenement_count_computed": 2,
+        "n_sites_tenement_count_zero": 1,
+        "n_sites_tenement_count_not_computed": 1,
+    }
 
     payload = json.loads(result.output)
     assert payload["minedex_public_export_blocked"] is True
     assert payload["owner_join_disclosures"]["sites_total"] == 3
     assert payload["n_sites_null_coordinates"] == 1
+    assert payload["tenement_count_disclosure"]["n_sites_tenement_count_not_computed"] == 1
+    assert (
+        payload["tenement_count_disclosure"]["n_sites_tenement_count_computed"]
+        + payload["tenement_count_disclosure"]["n_sites_tenement_count_not_computed"]
+        == payload["tenement_count_disclosure"]["sites_total"]
+    )
+
+
+def test_build_register_cli_discloses_owner_row_composition_on_a_mixed_extract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D12.2: no earlier test exercises a `ProjectsOwners.csv` carrying BOTH
+    current and ended relationships. Pins two things at once -- the new
+    `owner_row_composition` disclosure in the register manifest/stdout, and
+    the EXISTING `owners_at_snapshot` behaviour (D8's current-owner join
+    still selects only the empty-EndDate row for a project that carries
+    both) now that a mixed extract is actually under test."""
+    data_root = tmp_path / "data"
+    cfg_file = _write_config(tmp_path, data_root)
+    sites_df = _sites_df(
+        [_sites_row(site_code="M0001", stage="Operating", project_code="P1", lon=116.0, lat=-32.0)]
+    )
+    owners_df = _owners_df(
+        [
+            # P1's current owner -- blank EndDate.
+            _owners_row(
+                project_code="P1", owner_code="O1", owner_name="Acme Bauxite", holding_pct=100.0
+            ),
+            # P1's ENDED former owner -- must NOT appear in owners_at_snapshot.
+            _owners_row(
+                project_code="P1",
+                owner_code="O0",
+                owner_name="Former Owner",
+                holding_pct=100.0,
+                end_date="31/12/2020",
+            ),
+        ]
+    )
+    _seed_minedex_snapshot(data_root, "2026-08-10", sites_df=sites_df, owners_df=owners_df)
+    _seed_tenements_snapshot(data_root, "2026-08-12", tmp_path, tenements_gdf=_tenements_gdf([]))
+    _patch_git_state(monkeypatch)
+
+    result = runner.invoke(
+        app, ["build-register", "--config", str(cfg_file), "--date", "2026-08-15"]
+    )
+    assert result.exit_code == 0, result.output
+
+    # The existing D8 current-owner join is unaffected by the ended row.
+    register_path = data_root / "curated" / "register" / "2026-08-15" / "register.parquet"
+    written = pd.read_parquet(register_path)
+    assert written.loc[written["site_id"] == "M0001", "owners_at_snapshot"].iloc[0] == (
+        "Acme Bauxite (100%)"
+    )
+    assert (
+        "Former Owner"
+        not in written.loc[written["site_id"] == "M0001", "owners_at_snapshot"].iloc[0]
+    )
+
+    expected_composition = owner_row_composition(owners_df)
+    assert expected_composition == {
+        "owner_rows_total": 2,
+        "n_owner_rows_current": 1,
+        "n_owner_rows_ended": 1,
+    }
+
+    manifest_path = Path(str(register_path) + ".run_manifest.json")
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["resolved_args"]["owner_row_composition"] == expected_composition
+
+    payload = json.loads(result.output)
+    assert payload["owner_row_composition"] == expected_composition
 
 
 def test_build_register_cli_survives_a_null_owner_name_as_structured_json(

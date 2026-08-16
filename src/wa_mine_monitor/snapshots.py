@@ -28,6 +28,7 @@ whoever ran the fetch, not to whoever re-imports this module later.
 
 from __future__ import annotations
 
+from datetime import date as dt_date
 from pathlib import Path
 
 from wa_mine_monitor.provenance import sha256_file
@@ -56,6 +57,60 @@ def create_snapshot_dir(root: Path, source_id: str, date: str) -> Path:
     snapshot_dir = Path(root) / "raw" / source_id / date
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     return snapshot_dir
+
+
+def latest_dated_subdir(parent: Path) -> Path | None:
+    """Return the most recently DATED immediate subdirectory of `parent`,
+    or `None` when `parent` does not exist or holds no date-named
+    subdirectory.
+
+    Directories are named `YYYY-MM-DD` (this module's own snapshot layout,
+    `create_snapshot_dir`), so "most recent" compares PARSED dates
+    (`date.fromisoformat`), never a lexicographic string sort -- a
+    lexicographic sort would be correct for `YYYY-MM-DD` names anyway, but
+    parsing is what lets a non-date-named entry (a file, or a directory like
+    `scratch`) be recognised and skipped rather than silently compared as a
+    string. Only immediate subdirectories are considered; nothing below them
+    is inspected.
+
+    This is the ONE dated-directory-scan this project runs: both
+    `register.latest_snapshot` (over `<root>/raw/<source_id>/`, a raw
+    snapshot parent) and `cli._latest_curated_dated_dir` (over
+    `<data_root>/curated/<artefact>/`, a curated-artefact parent) call this
+    function and differ only in which parent they pass and in how they
+    report "nothing found" -- `latest_snapshot` raises naming the
+    `source_id`, `_latest_curated_dated_dir` raises naming its `label`, and
+    neither difference belongs in this function, which has no opinion on
+    what a caller should do with `None`. Deliberately returns `None` rather
+    than raising: a raw snapshot parent with nothing dated and a curated
+    artefact parent with nothing dated are both "not found yet", but the two
+    callers raise different, differently-worded exceptions naming different
+    things, so the decision to raise -- and what to say -- stays with them.
+
+    This function has no opinion on `SHA256SUMS.txt` either, and never will:
+    a raw snapshot's integrity (has it been finalized? does it still match
+    its recorded digests?) is `cli._verify_snapshot_or_refuse`'s job, applied
+    only to raw snapshot directories after one is selected. A curated
+    directory carries a run manifest, not a `SHA256SUMS.txt`, and is never
+    passed through that gate at all -- selecting the latest dated directory
+    and verifying its integrity are two different concerns, and only the raw
+    side has the second one.
+    """
+    parent = Path(parent)
+    candidates: list[tuple[dt_date, Path]] = []
+    if parent.is_dir():
+        for entry in parent.iterdir():
+            if not entry.is_dir():
+                continue
+            try:
+                parsed = dt_date.fromisoformat(entry.name)
+            except ValueError:
+                continue
+            candidates.append((parsed, entry))
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda pair: pair[0])[1]
 
 
 def write_snapshot_metadata(
