@@ -1,0 +1,54 @@
+# D3 effective-pixel-support simulation protocol (D13 Batch D task D1).
+# FROZEN: freeze-d3-protocol writes this content's digest into
+# curated/d3-protocol/<date>/ BEFORE any spectral value is read, and
+# build-d3-inputs refuses to run against a config whose digest differs.
+# No accuracy result may change anything in this file.
+d3:
+  supports: [9, 16, 25, 36, 49, 64, 100, 144]
+  regions: [pilbara, goldfields_esperance, other_wa]
+  region_source_names:
+    pilbara: "Pilbara"
+    goldfields_esperance: "Goldfields-Esperance"
+  commodity_groups: [iron_ore, gold, bauxite_alumina, nickel, mineral_sands, other]
+  # Ordered, case-insensitive substring rules over the register's raw
+  # MINEDEX `commodity` text. First matching rule wins; a non-empty value
+  # matching nothing is `other`; null/empty is a refusal (unclassified).
+  commodity_token_rules:
+    - group: iron_ore
+      tokens: ["iron"]
+    - group: bauxite_alumina
+      tokens: ["bauxite", "alumina", "aluminium"]
+    - group: nickel
+      tokens: ["nickel"]
+    - group: mineral_sands
+      tokens: ["mineral sands", "heavy mineral", "ilmenite", "rutile", "zircon", "leucoxene", "monazite", "garnet"]
+    - group: gold
+      tokens: ["gold"]
+  shape_classes:
+    elongated_below: 0.20
+    compact_at_least: 0.50
+  adequacy:
+    min_footprints: 10
+    min_full_support_years: 10
+  selection:
+    use_all_below: 30
+    select_n: 30
+  replicates: 100
+  criteria:
+    nbr_p90_abs_error_max: 0.03
+    ndmi_p90_abs_error_max: 0.03
+    fc_p90_abs_error_pp_max: 5.0
+    spearman_median_min: 0.95
+    computable_site_year_fraction_min: 0.90
+  procedures:
+    boundary_tie: "Lexicographically smallest source region name wins in ambiguous point membership"
+    commodity_mode: "First matching rule in protocol-declared token list (case-insensitive substring match); non-matching non-empty values are 'other'; null/empty/whitespace is a refusal"
+    compactness: "Polsby-Popper 4πA/P² class: <0.20 elongated, [0.20, 0.50) intermediate, [0.50, 1+1e-9] compact; outside (0, 1+1e-9] or non-finite is a refusal"
+    stable_hash: "sha256(maus_id) hex digest, smallest-first 30 selections when stratum >29 footprints"
+    seed_template: "seed_material = '{protocol_digest}|{maus_id}|{source_id}|{year}'; no clock, process, or numpy RNG state ever enters sampling"
+    sampling_rank: "members ranked by sha256('{seed_material}|{replicate}|{tile_id},{row},{col}') hex; a sample of size n is the first n of that ranking (prefix property gives nesting across supports); without replacement, deterministic, input-order-free"
+    metric_formulas: "Geomedian NBR=(nir-swir2)/(nir+swir2), NDMI=(nir-swir1)/(nir+swir1), per-pixel then averaged; FC metrics bare_soil/pv/npv are spatial means of decoded _pc_50 assets; nulls reduce valid_support_px"
+    decode_rules: "Geomedian: -999→NaN, values/10000; FC: 255→NaN, >100 retained (counted, not clipped)"
+    full_support_year: "Every contributing band pixel non-null post-decode AND every geomedian metric denominator non-zero; valid_support_px==effective_pixel_support_px"
+    item_selection: "For each (collection, tile, year) exactly one catalogue item must exist: zero means the tile-year is not epoch-covered, more than one is a duplicate refusal; band hrefs matched by frozen asset keys (geomedian: nbart_nir/nbart_swir_1/nbart_swir_2; FC: bs_pc_50/pv_pc_50/npv_pc_50); all bands of an item must report identical grid identity; no mosaicking - members read per tile from that tile's own item"
+    quantile_method: "numpy.percentile(..., method='linear') for P90 absolute error over POOLED per-replicate errors across stratum footprint-years; numpy.median for median Spearman over stratum rows"

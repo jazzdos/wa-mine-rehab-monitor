@@ -401,3 +401,11 @@ def test_dea_source_urls_point_at_their_own_collection():
     for source_id, collection_id in dea_collection_ids.items():
         source = SOURCES[source_id]
         assert source.source_url.endswith(f"/collections/{collection_id}")
+
+
+def test_wa_rdc_regions_licence_is_pinned_cc_by():
+    record = SOURCES["wa_rdc_regions"]
+    assert record.licence_id == "CC-BY-4.0"
+    assert record.redistribute_public is True
+    assert "DPIRD-020" in record.title
+    assert "catalogue.data.wa.gov.au" in record.source_url
