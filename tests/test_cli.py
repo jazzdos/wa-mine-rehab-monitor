@@ -6,6 +6,7 @@ import geopandas as gpd
 import pandas as pd
 import pytest
 import typer
+import yaml
 from shapely.geometry import Polygon
 from typer.testing import CliRunner
 
@@ -990,3 +991,227 @@ def test_derive_dea_volume_refuses_mismatched_maus_digests(tmp_path, monkeypatch
     )
     assert result.exit_code == 1
     assert "maus" in result.output.lower()
+
+
+# --- fetch-region-boundaries CLI command ------------------------------------
+
+
+def _rdc_fixture_gpkg_bytes() -> bytes:
+    """Nine-region synthetic DPIRD-020 stand-in as GeoPackage bytes."""
+    import io
+    from pathlib import Path
+
+    names = [
+        "Pilbara",
+        "Goldfields-Esperance",
+        "Kimberley",
+        "Gascoyne",
+        "Mid West",
+        "Wheatbelt",
+        "Peel",
+        "South West",
+        "Great Southern",
+    ]
+    gdf = gpd.GeoDataFrame(
+        {"dpird_region_name": names},
+        geometry=[Polygon([(i, 0), (i + 1, 0), (i + 1, 1), (i, 1)]) for i in range(len(names))],
+        crs="EPSG:4283",
+    )
+    # Try BytesIO first, fall back to temp file if unsupported
+    try:
+        buffer = io.BytesIO()
+        gdf.to_file(buffer, driver="GPKG")
+        return buffer.getvalue()
+    except Exception:  # noqa: BLE001
+        # Fall back to temp file
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as f:
+            gdf.to_file(f.name, driver="GPKG")
+            tmp_path = Path(f.name)
+        result = tmp_path.read_bytes()
+        tmp_path.unlink()
+        return result
+
+
+def test_fetch_region_boundaries_writes_finalized_snapshot(tmp_path, monkeypatch):
+    _init_git_repo(tmp_path)
+    monkeypatch.setattr("wa_mine_monitor.cli._REPO_ROOT", tmp_path)
+    cfg_file = _write_monitor_config(tmp_path)
+    payload = _rdc_fixture_gpkg_bytes()
+    monkeypatch.setattr("wa_mine_monitor.cli._fetch_region_boundaries_bytes", lambda: payload)
+    result = runner.invoke(
+        app,
+        ["fetch-region-boundaries", "--config", str(cfg_file), "--date", "2026-08-16"],
+    )
+    assert result.exit_code == 0, result.output
+    snapshot_dir = tmp_path / "data" / "raw" / "wa_rdc_regions" / "2026-08-16"
+    assert (snapshot_dir / "regions.gpkg").exists()
+    assert (snapshot_dir / "SHA256SUMS.txt").exists()
+    manifest = json.loads((snapshot_dir / "SHA256SUMS.txt.run_manifest.json").read_text())
+    assert manifest["resolved_args"]["source_url"]
+    payload_out = json.loads(result.output)
+    assert payload_out["region_count"] == 9
+
+
+def test_fetch_region_boundaries_refuses_extract_missing_required_region(tmp_path, monkeypatch):
+    _init_git_repo(tmp_path)
+    monkeypatch.setattr("wa_mine_monitor.cli._REPO_ROOT", tmp_path)
+    cfg_file = _write_monitor_config(tmp_path)
+    import io
+
+    gdf = gpd.GeoDataFrame(
+        {"dpird_region_name": ["Pilbara", "Kimberley"]},
+        geometry=[
+            Polygon([(0, 0), (1, 0), (1, 1), (0, 1)]),
+            Polygon([(1, 0), (2, 0), (2, 1), (1, 1)]),
+        ],
+        crs="EPSG:4283",
+    )
+    try:
+        buffer = io.BytesIO()
+        gdf.to_file(buffer, driver="GPKG")
+        payload = buffer.getvalue()
+    except Exception:  # noqa: BLE001
+        # Fall back to temp file
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as f:
+            gdf.to_file(f.name, driver="GPKG")
+            tmp_gpkg = Path(f.name)
+        payload = tmp_gpkg.read_bytes()
+        tmp_gpkg.unlink()
+
+    monkeypatch.setattr(
+        "wa_mine_monitor.cli._fetch_region_boundaries_bytes",
+        lambda: payload,
+    )
+    result = runner.invoke(
+        app,
+        ["fetch-region-boundaries", "--config", str(cfg_file), "--date", "2026-08-16"],
+    )
+    assert result.exit_code == 1
+    assert "refusal" in result.output
+    assert not (
+        tmp_path / "data" / "raw" / "wa_rdc_regions" / "2026-08-16" / "SHA256SUMS.txt"
+    ).exists()
+
+
+# --- freeze-d3-protocol CLI command -----------------------------------------
+
+
+def _write_d3_config(tmp_path) -> Path:
+    import shutil
+
+    src = Path(__file__).resolve().parents[1] / "config" / "d3.yaml"
+    dst = tmp_path / "d3.yaml"
+    shutil.copy(src, dst)
+    return dst
+
+
+def test_freeze_d3_protocol_writes_digest_artifact(tmp_path, monkeypatch):
+    _init_git_repo(tmp_path)
+    monkeypatch.setattr("wa_mine_monitor.cli._REPO_ROOT", tmp_path)
+    cfg_file = _write_monitor_config(tmp_path)
+    d3_file = _write_d3_config(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "freeze-d3-protocol",
+            "--config",
+            str(cfg_file),
+            "--protocol-config",
+            str(d3_file),
+            "--date",
+            "2026-08-16",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    out_dir = tmp_path / "data" / "curated" / "d3-protocol" / "2026-08-16"
+    frozen = json.loads((out_dir / "protocol.json").read_text())
+    from wa_mine_monitor import d3_protocol
+
+    expected = d3_protocol.protocol_digest(d3_protocol.load_protocol(d3_file))
+    assert frozen["protocol_digest"] == expected
+    manifest = json.loads((out_dir / "protocol.json.run_manifest.json").read_text())
+    assert manifest["resolved_args"]["protocol_digest"] == expected
+
+
+def test_freeze_d3_protocol_refuses_existing_output(tmp_path, monkeypatch):
+    _init_git_repo(tmp_path)
+    monkeypatch.setattr("wa_mine_monitor.cli._REPO_ROOT", tmp_path)
+    cfg_file = _write_monitor_config(tmp_path)
+    d3_file = _write_d3_config(tmp_path)
+    argv = [
+        "freeze-d3-protocol",
+        "--config",
+        str(cfg_file),
+        "--protocol-config",
+        str(d3_file),
+        "--date",
+        "2026-08-16",
+    ]
+    assert runner.invoke(app, argv).exit_code == 0
+    result = runner.invoke(app, argv)
+    assert result.exit_code == 1
+    assert "refusal" in result.output
+
+
+def test_freeze_d3_protocol_refuses_drifted_config(tmp_path, monkeypatch):
+    _init_git_repo(tmp_path)
+    monkeypatch.setattr("wa_mine_monitor.cli._REPO_ROOT", tmp_path)
+    cfg_file = _write_monitor_config(tmp_path)
+    d3_file = _write_d3_config(tmp_path)
+    raw = yaml.safe_load(d3_file.read_text())
+    raw["d3"]["replicates"] = 5
+    d3_file.write_text(yaml.safe_dump(raw))
+    result = runner.invoke(
+        app,
+        [
+            "freeze-d3-protocol",
+            "--config",
+            str(cfg_file),
+            "--protocol-config",
+            str(d3_file),
+            "--date",
+            "2026-08-16",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "refusal" in result.output
+
+
+def test_freeze_d3_protocol_refuses_any_dated_dir(tmp_path, monkeypatch):
+    """Single lineage: refuse if ANY dated directory exists, not just same date."""
+    _init_git_repo(tmp_path)
+    monkeypatch.setattr("wa_mine_monitor.cli._REPO_ROOT", tmp_path)
+    cfg_file = _write_monitor_config(tmp_path)
+    d3_file = _write_d3_config(tmp_path)
+
+    # First freeze with date 2026-08-18
+    argv1 = [
+        "freeze-d3-protocol",
+        "--config",
+        str(cfg_file),
+        "--protocol-config",
+        str(d3_file),
+        "--date",
+        "2026-08-18",
+    ]
+    assert runner.invoke(app, argv1).exit_code == 0
+
+    # Try to freeze with different date 2026-08-19 - should refuse
+    argv2 = [
+        "freeze-d3-protocol",
+        "--config",
+        str(cfg_file),
+        "--protocol-config",
+        str(d3_file),
+        "--date",
+        "2026-08-19",
+    ]
+    result = runner.invoke(app, argv2)
+    assert result.exit_code == 1
+    assert "refusal" in result.output
+    assert "Single lineage" in result.output or "already has dated directory" in result.output

@@ -11,6 +11,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import subprocess
 import zipfile
 from collections.abc import Mapping
@@ -28,6 +29,7 @@ from pydantic import ValidationError
 
 from wa_mine_monitor import (
     crosswalk,
+    d3_protocol,
     dea_coverage,
     dea_volume,
     licence,
@@ -37,10 +39,16 @@ from wa_mine_monitor import (
     snapshots,
 )
 from wa_mine_monitor.config import ProjectConfig, load_config
-from wa_mine_monitor.http import map_concurrent
+from wa_mine_monitor.http import (
+    HttpClient,
+    HttpRequestRefused,
+    HttpRetryExhausted,
+    map_concurrent,
+)
 from wa_mine_monitor.provenance import SourceAsset, collect_git_state, sha256_file
 from wa_mine_monitor.secrets import redact_secrets, scrub_string_leaves
 from wa_mine_monitor.source_catalogue import DEA_COLLECTIONS, SourceSpec
+from wa_mine_monitor.sources import wa_regions
 from wa_mine_monitor.sources.dea import (
     DEA_RETRY_POLICY,
     CatalogueValidationError,
@@ -281,6 +289,23 @@ SourceGpkgOption = typer.Option(
     dir_okay=False,
     readable=True,
 )
+
+
+#: DPIRD-020 GeoPackage download, pinned 2026-08-16 (Data WA catalogue
+#: record `regional-development-commission-boundaries`, licence CC-BY-4.0).
+_RDC_REGIONS_DOWNLOAD_URL = "https://data-downloads.slip.wa.gov.au/DPIRD-020/Geopackage"
+
+ProtocolConfigOption = typer.Option(
+    Path("config/d3.yaml"),
+    "--protocol-config",
+    help="Path to the D3 protocol YAML to freeze.",
+)
+
+
+def _fetch_region_boundaries_bytes() -> bytes:
+    """Download the pinned DPIRD-020 GeoPackage (network seam, monkeypatchable)."""
+    client = HttpClient()
+    return client.get_bytes(_RDC_REGIONS_DOWNLOAD_URL)
 
 
 def _refuse_if_snapshot_already_finalized(
@@ -3069,6 +3094,229 @@ def derive_dea_volume_cmd(config: Path = ConfigOption, date: str = DateOption) -
             indent=2,
             sort_keys=True,
             default=str,
+        )
+    )
+
+
+@app.command("fetch-region-boundaries")
+def cmd_fetch_region_boundaries(
+    config: Path = ConfigOption,
+    date: str = DateOption,
+) -> None:
+    """Capture the pinned DPIRD-020 RDC boundaries into a dated snapshot.
+
+    Downloads the GeoPackage, validates it with
+    `wa_regions.load_regions` (both protocol regions present, non-null
+    unique names) BEFORE finalization, and writes an immutable snapshot at
+    `<data_root>/raw/wa_rdc_regions/<date>/` with one run manifest. A
+    failed validation refuses the WHOLE snapshot -- a boundary set that
+    cannot classify every site would poison every stratum downstream.
+    """
+    resolved = _load_config_or_exit(config)
+    resolved_config = resolved.model_dump(mode="json")
+    git_state = _collect_git_state_disclosing_gaps(_REPO_ROOT)
+
+    snapshot_dir = resolved.run.data_root / "raw" / "wa_rdc_regions" / date
+    sums_path = snapshot_dir / snapshots.SHA256SUMS_FILENAME
+    if sums_path.exists():
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"{sums_path} already exists -- this snapshot was "
+                        "already captured and is immutable. Choose a "
+                        "different --date to capture again."
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+
+    try:
+        payload = _fetch_region_boundaries_bytes()
+    except (HttpRequestRefused, HttpRetryExhausted) as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    gpkg_path = snapshot_dir / "regions.gpkg"
+    gpkg_path.write_bytes(payload)
+
+    try:
+        regions = wa_regions.load_regions(gpkg_path)
+    except Exception as exc:  # noqa: BLE001
+        gpkg_path.unlink(missing_ok=True)
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    # Finalize + manifest: mirror fetch-maus-extract
+    sums_path = snapshots.finalize_snapshot(snapshot_dir)
+    _n_ok, _n_bad, _n_missing = snapshots.verify_snapshot(snapshot_dir)
+
+    input_asset = SourceAsset(
+        uri=_RDC_REGIONS_DOWNLOAD_URL,
+        sha256=sha256_file(gpkg_path),
+        collection=None,
+        snapshot_date=dt_date.fromisoformat(date),
+        licence="CC-BY-4.0",
+        redistribute_public=True,
+    )
+
+    manifest_path = manifests.write_run_manifest(
+        output=sums_path,
+        inputs=[input_asset],
+        config=resolved_config,
+        git_state=git_state,
+        resolved_args={
+            "date": date,
+            "source_url": _RDC_REGIONS_DOWNLOAD_URL,
+            "region_count": len(regions),
+        },
+    )
+
+    typer.echo(
+        json.dumps(
+            {
+                "snapshot_dir": str(snapshot_dir),
+                "region_count": len(regions),
+                "regions": sorted(regions["region_name"].tolist()),
+                "manifest_path": str(manifest_path),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("freeze-d3-protocol")
+def cmd_freeze_d3_protocol(
+    config: Path = ConfigOption,
+    protocol_config: Path = ProtocolConfigOption,
+    date: str = DateOption,
+) -> None:
+    """Freeze the D3 simulation protocol BEFORE any spectral value is read.
+
+    Writes `curated/d3-protocol/<date>/protocol.json` -- the canonical
+    protocol content and its sha256 digest -- so `build-d3-inputs` can
+    refuse a config that drifted after freezing (D13: "The configuration
+    digest is written before metric extraction"; "No accuracy result can
+    change sample definitions or criteria").
+    """
+    resolved = _load_config_or_exit(config)
+    resolved_config = resolved.model_dump(mode="json")
+    git_state = _collect_git_state_disclosing_gaps(_REPO_ROOT)
+
+    try:
+        protocol = d3_protocol.load_protocol(protocol_config)
+    except (d3_protocol.D3ProtocolError, OSError, yaml.YAMLError) as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    digest = d3_protocol.protocol_digest(protocol)
+
+    # Single lineage check: refuse if ANY dated directory exists
+    base_dir = resolved.run.data_root / "curated" / "d3-protocol"
+    if base_dir.exists():
+        dated_dirs = list(base_dir.glob("????-??-??"))
+        if dated_dirs:
+            typer.echo(
+                json.dumps(
+                    {
+                        "refusal": (
+                            f"d3-protocol already has dated directory {dated_dirs[0].name}. "
+                            "Single lineage: superseding a frozen protocol requires human "
+                            "decision recorded in a decision doc. Move the existing snapshot "
+                            "aside or delete it and re-run."
+                        )
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            raise typer.Exit(1)
+
+    output_dir = resolved.run.data_root / "curated" / "d3-protocol" / date
+    output_path = output_dir / "protocol.json"
+    _refuse_if_curated_output_already_exists(
+        output_path, config=resolved_config, git_state=git_state
+    )
+
+    protocol_source_sha = sha256_file(protocol_config)
+    source_path, source_root = manifests.root_relative_path(protocol_config, config=resolved_config)
+    input_assets = [
+        SourceAsset(
+            uri=str(protocol_config),
+            sha256=protocol_source_sha,
+            collection=None,
+            snapshot_date=None,
+            licence=None,
+            redistribute_public=False,
+        )
+    ]
+
+    # Atomic finalize via .tmp directory
+    tmp_dir = output_dir.parent / f"{output_dir.name}.tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_output_path = tmp_dir / "protocol.json"
+
+    tmp_output_path.write_text(
+        json.dumps(
+            {
+                "protocol": d3_protocol.canonical_protocol(protocol),
+                "protocol_digest": digest,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+    try:
+        manifests.write_run_manifest(
+            output=tmp_output_path,
+            inputs=input_assets,
+            config=resolved_config,
+            git_state=git_state,
+            resolved_args={
+                "date": date,
+                "protocol_config": source_path,
+                "protocol_config_root": source_root,
+                "protocol_digest": digest,
+            },
+        )
+    except FileExistsError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    # Re-check existing output before rename
+    if output_path.exists():
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"{output_path} already exists -- this curated artefact was already "
+                        "built by an earlier run. Refusing before rename."
+                    ),
+                    "output_path": str(output_path),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+
+    # Rename tmp directory into place (atomic)
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(tmp_dir, output_dir)
+
+    typer.echo(
+        json.dumps(
+            {
+                "output_path": str(output_path),
+                "protocol_digest": digest,
+            },
+            indent=2,
+            sort_keys=True,
         )
     )
 
