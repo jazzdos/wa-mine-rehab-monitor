@@ -71,30 +71,111 @@ Batch C checkpoint host decision.
    the sampled set is non-null; nulls reduce `valid_support_px` and a
    full-support year requires `valid_support_px == effective_pixel_support_px
    ≥ 144`.
-6. **Replicate persistence is aggregated, pre-registered, and bounded.** Raw
-   site-year-support-replicate rows (~10⁹ at real scale) are not persisted.
-   `build-d3-inputs` writes two tables:
-   `support_inputs.parquet` — one row per site × year × collection × metric ×
-   support: `full_value`, `replicate_median_abs_error`,
-   `replicate_p90_abs_error`, `n_replicates`, plus identity/stratum/digest
-   columns; and `support_spearman.parquet` — one row per site × collection ×
-   metric × support × replicate carrying the full-vs-reduced Spearman over
-   that site's full-support years. D4's criteria are pre-registered against
-   these aggregates: P90 absolute error is the P90 over site-years of the
-   per-site-year replicate MEDIAN absolute error; median Spearman is the
-   median over the spearman table's rows.
-7. **Eligibility support uses the canonical DEA Albers grid, not a per-tile
-   read.** `apply-d3-threshold` computes `effective_pixel_support_px` for
-   every high-confidence site from Maus geometry against the canonical
-   EPSG:3577 30 m grid (origin aligned to the DEA collection-3 96 000 m tile
-   lattice), via `pixel_support.build_pixel_support`. Grid identity for
-   ACTUAL raster reads in `build-d3-inputs` additionally binds the product
-   tile identity per D2.
+6. **Replicate persistence is bounded but exact, and the stratum statistic
+   is frozen.** Raw replicate rows are not persisted as ~10⁹ scalars;
+   instead `support_inputs.parquet` carries one row per **footprint**
+   (`maus_id`) × year × collection × metric × support with `full_value`,
+   `replicate_abs_errors` (a `list<float64>` of the 100 per-replicate
+   absolute errors, sorted ascending), `n_replicates`, plus
+   identity/stratum/digest columns (~10⁵–10⁶ rows, each ~800 bytes of
+   list payload — bounded). `support_spearman.parquet` is one row per
+   footprint × collection × metric × support × replicate. Frozen stratum
+   statistics (resolving the D13 §4 "P90 absolute error" ambiguity, chosen
+   BEFORE any spectral read): **P90 absolute error = `numpy.percentile`
+   (`method="linear"`) over the POOLED per-replicate absolute errors across
+   all of the stratum's footprint-years** (exactly recoverable from the
+   persisted lists); **median Spearman = `numpy.median` over the stratum's
+   spearman rows**. All statistics run on finite values only, with the
+   finite/total counts recorded; an EMPTY value set fails the criterion, it
+   never passes vacuously.
+7. **One authoritative support measurement.** `effective_pixel_support_px`
+   is computed once, in `build-d3-inputs`, from Maus geometry against the
+   ACTUAL product tile grids (per-tile assignments unioned, D2 tile
+   identity bound; multi-tile footprints sum distinct members across
+   tiles). It is persisted per footprint in `footprint_support.parquet`
+   and `apply-d3-threshold` consumes that table — it never recomputes
+   support on a synthetic grid. A site's support is its linked
+   high-confidence footprint's support.
 8. **Live spectral capture is deferred** (Task 16 Step 6): fixture rasters
    prove the chain; the real windowed reads run on luminosity
    (`/mnt/data` scratch, per `docs/checkpoints/batch-c-result.md`) with an
    explicit `--date`, budgeted per 800×800 block, and fill the Batch D
    checkpoint.
+9. **The statistical unit is the footprint, not the register site.** Batch
+   C measured 11,001 eligible sites linked to only 1,252 footprints; using
+   `site_id` as the unit would replicate identical footprint-year
+   measurements and destroy the D13 "independent footprints" adequacy
+   unit. All simulation, adequacy, selection, and threshold statistics key
+   on `maus_id` with each footprint appearing exactly once. Sites re-enter
+   only at `apply-d3-threshold`, where each site inherits its linked
+   footprint's support.
+10. **Footprint stratum identity is single-valued and pre-registered.** A
+   footprint linked to several sites could otherwise claim several strata.
+   Rules: region = `assign_regions` on the footprint geometry's
+   `representative_point()` (geometry-based, not site-based); commodity
+   group = the modal group over the footprint's linked high-confidence
+   sites' classified groups, ties broken by lexicographically smallest
+   group name, with tie counts disclosed in the manifest; shape class from
+   the footprint's own geometry. Exactly one stratum per footprint.
+11. **Two-phase extraction; no accuracy result precedes selection.**
+   Phase A (validity pass) reads candidate footprints' member pixels ONLY
+   to establish per-footprint-year-collection computability booleans — a
+   year is full-support computable for a collection iff every member pixel
+   is non-null after decode in every required band and, for geomedian
+   metrics, no member has a zero metric denominator. No metric aggregate
+   is computed, logged, or persisted in Phase A. Adequacy counts a
+   footprint-year toward the ≥10 requirement iff FC is computable AND at
+   least one geomedian collection is computable that year (sensor variants
+   still evaluated separately downstream). Adequacy + stable-hash
+   selection then run on those counts alone; Phase B reads values only for
+   SELECTED footprints. This resolves the D13 "read only the selected
+   footprints" circularity: selection depends on computability, which
+   Phase A establishes without observing accuracy.
+12. **Computable footprint-year fraction is a data-completeness gate.**
+   Per stratum × collection: full-support-computable footprint-years ÷
+   epoch-covered footprint-years among selected footprints. It is
+   identical across supports by construction (every reduced sample is a
+   subset of a fully valid set) and is reported at every support for the
+   record; it gates the threshold's evidentiary base, not a per-support
+   property.
+13. **Protocol lineage is single and procedures are digest-bound.**
+   `freeze-d3-protocol` refuses if ANY dated protocol snapshot already
+   exists; every downstream command refuses if more than one exists.
+   Superseding a frozen protocol requires human deletion recorded in a
+   decision doc. `protocol.json` embeds a `procedures` block — literal
+   frozen texts of the boundary tie rule, commodity mode rule, compactness
+   formula, stable-hash rule, replicate seed template, sampling rank rule,
+   metric formulas, decode rules, full-support-year rule, item-selection
+   rule, and quantile method — all inside the digest; each consuming
+   module cross-checks its own constants against the loaded protocol and
+   refuses on drift.
+14. **Threshold artefact path and acceptance semantics.** The threshold
+   lands at `curated/d3-threshold/<date>/threshold.json` (D13 D4; NOT
+   `reports/`). `apply-d3-threshold` refuses when the artefact is missing,
+   digest-altered, or protocol-mismatched. A `criteria_passed=false`
+   artefact IS accepted: the forced 144 threshold is applied, every
+   otherwise-eligible site gets `trajectory_status="threshold_not_computed"`
+   and `d3_eligible=false`, and the failed-criteria disclosure is carried
+   into the register manifest (D13: "a forced 144 result retains the
+   failed-criteria disclosure").
+15. **Multi-file outputs land atomically.** Every dated curated output
+   with more than one file is assembled in a sibling `.tmp` directory and
+   renamed into place only after ALL tables and manifests are written
+   (the snapshot-finalize pattern); a mid-write failure leaves no partial
+   dated directory. The existing-output check runs BEFORE any raster
+   access in `build-d3-inputs` (preflight) and again immediately before
+   the rename.
+16. **Spectral response identity is recorded.** Every asset href read in
+   Phase A/B records its HTTP `ETag` and `Last-Modified` (when served)
+   into `extraction_assets.parquet` beside the output tables; Phase B
+   refuses if an asset's ETag differs from Phase A's. A digest-verified
+   STAC snapshot proves which URL was listed, not which bytes were served
+   — this table is the served-content record.
+17. **Live-run disk formula.** Streaming reads with a bounded block cache
+   (default 50 GB, config-overridable) — the disk requirement is the
+   cache bound, NOT the transfer volume. The transfer budget is disclosed
+   as 597 GB–3.30 TB block-granular (Batch C measured 800×800 deflate
+   blocks).
 
 ## Conventions binding every task
 
@@ -335,6 +416,20 @@ def load_regions(path: Path) -> gpd.GeoDataFrame:
 Run: `uv run pytest tests/test_wa_regions.py -q`
 Expected: PASS (4 tests)
 
+**Amendments (codex review 2026-08-16, binding):**
+
+- `load_regions` must additionally REFUSE (RegionExtractError): null, empty,
+  or shapely-invalid geometries; non-(Multi)Polygon geometry types; a layer
+  with no CRS; and MORE THAN ONE of the `_NAME_COLUMNS` candidates present
+  (ambiguity is a refusal, not first-wins). Add one test per refusal (5 new
+  tests) plus a passing-fixture assertion that exactly one name column
+  exists.
+- `load_regions` must validate that region polygon INTERIORS do not overlap
+  (pairwise `overlaps` / interior intersection area > 0 → refusal naming
+  both regions); boundary touching is allowed. Add a two-overlapping-squares
+  refusal test. This makes Task 5's ambiguous-boundary rule sound: with
+  non-overlapping interiors, a multi-match can only be a shared boundary.
+
 ---
 
 ### Task 3: `fetch-region-boundaries` CLI
@@ -558,6 +653,16 @@ finalize-once/refuse-partial discipline these snapshots require.
 
 Run: `uv run pytest tests/test_cli.py -k fetch_region_boundaries -q`
 Expected: PASS (2 tests)
+
+**Amendments (codex review 2026-08-16, binding):**
+
+- The CLI body's parse step must catch not only `RegionExtractError` and
+  `OSError` but ANY exception raised by the GeoPackage read (driver/data-
+  source errors vary by GDAL build): wrap the load in
+  `except Exception as exc:` → structured JSON refusal naming the snapshot
+  path. Fetch, write, finalize, and manifest failures likewise emit the
+  structured refusal shape, never a bare traceback. Extend the corrupt-
+  bytes test to assert JSON refusal output.
 
 ---
 
@@ -857,6 +962,26 @@ def protocol_digest(protocol: D3Protocol) -> str:
 Run: `uv run pytest tests/test_d3_protocol.py -q`
 Expected: PASS (5 tests)
 
+**Amendments (codex review 2026-08-16, binding):**
+
+- `load_protocol` must refuse DRIFT OF EVERY FROZEN FIELD, not just the
+  support set: shape-class thresholds (0.20/0.50), adequacy minimums
+  (10 footprints / 10 years), selection sizes (10–29 all / 30 by hash),
+  replicates (100), regions, commodity groups, criteria values, and
+  MIN_FULL_SUPPORT_PX. Add one mutation-refusal test per field group
+  (parametrize: mutate one YAML field → `load_protocol` raises).
+- `config/d3.yaml` and the frozen protocol gain a `procedures` block per
+  design decision 13 — literal strings naming each frozen rule. It is part
+  of the canonical digest. `load_protocol` requires all procedure keys
+  present.
+- The digest key-order test as sketched (`safe_load` → `safe_dump(...,
+  sort_keys=False)`) does not reorder keys. Build the reordered mapping
+  explicitly (recursively reverse each dict's insertion order) before
+  serialization, then assert digest equality.
+- Rename `test_digest_is_stable_and_key-order-independent` →
+  `test_digest_is_stable_and_key_order_independent` (hyphen is not a valid
+  identifier).
+
 ---
 
 ### Task 5: `d3_protocol.py` classification (commodity, shape, region)
@@ -1056,6 +1181,20 @@ this module now genuinely depends on them.
 Run: `uv run pytest tests/test_d3_protocol.py -q`
 Expected: PASS (11 tests)
 
+**Amendments (codex review 2026-08-16, binding):**
+
+- `shape_class` must refuse (raise) compactness outside `(0, 1 + 1e-9]` or
+  non-finite — a Polsby–Popper value above 1 indicates invalid geometry or
+  computation, never a legitimate class. Add tests for 1.5, `inf`, `nan`,
+  0, and negative inputs.
+- `assign_regions` is also used on footprint `representative_point()`
+  geometries (design decision 10), not only register site points — the
+  docstring and one test must cover a polygon-derived point input.
+- With Task 2's non-overlap validation in force, the multi-match rule's
+  docstring must state its precondition: interiors are disjoint, so a
+  multi-match IS a shared boundary; the lexicographic tie-break plus
+  disclosure count stands.
+
 ---
 
 ### Task 6: `d3_protocol.py` selection (adequacy + stable hash)
@@ -1212,6 +1351,16 @@ def select_stratum_footprints(
 
 Run: `uv run pytest tests/test_d3_protocol.py -q`
 Expected: PASS (16 tests)
+
+**Amendments (codex review 2026-08-16, binding):**
+
+- `stratum_adequacy` must return the FULL frozen 3×6×3 stratum space
+  (54 rows), zero-count strata included with `adequate=False` — sparse
+  strata are reported, never silently omitted (D13 D1 acceptance). Add a
+  test asserting 54 rows and that an empty input frame still yields 54
+  inadequate strata.
+- Adequacy consumes FOOTPRINT rows (`maus_id` unit, design decision 9):
+  rename any `site_id` in this task's signatures/tests to `maus_id`.
 
 ---
 
@@ -1418,6 +1567,21 @@ config (`"MIT"` is wrong — prefer omitting optional fields per the model).
 
 Run: `uv run pytest tests/test_cli.py -k freeze_d3_protocol -q`
 Expected: PASS (3 tests)
+
+**Amendments (codex review 2026-08-16, binding):**
+
+- **Single lineage (design decision 13):** the command REFUSES if any dated
+  directory already exists under `curated/d3-protocol/` — not just the
+  same date. Refusal names the existing snapshot and states supersession
+  requires a recorded human decision. Add a test freezing 2026-08-18 then
+  refusing 2026-08-19.
+- The frozen `protocol.json` includes the `procedures` block; the digest
+  covers it.
+- **Atomic finalize (design decision 15):** write `protocol.json` + its
+  manifest into `<dir>.tmp` and `os.replace` the directory into place
+  after both files exist. The existing-output check runs before the write
+  AND the rename re-checks. Apply the same pattern anywhere this plan
+  writes a multi-file dated output.
 
 ---
 
@@ -1675,6 +1839,22 @@ the count, hand-check the centre coordinates (15, 45, 75 in both axes for a
 90 m square at origin) before touching the implementation — the TEST
 encodes the definition.
 
+**Amendments (codex review 2026-08-16, binding):**
+
+- `_validate_grid` must additionally refuse: `crs != crosswalk.TARGET_CRS`
+  (exactly "EPSG:3577" — a 30-unit EPSG:4326 grid must not pass); and,
+  when `tile_id` matches `^x(-?\d+)y(-?\d+)$`, an origin inconsistent
+  with the DEA collection-3 tiling (origin_x == x_index * 96_000,
+  origin_y == (y_index + 1) * 96_000 on the 3 200 × 30 m layout —
+  VERIFY the exact index convention against one captured item's actual
+  transform before hard-coding signs, and freeze what the data shows).
+  Non-matching tile_id formats skip the lattice check (fixture grids) but
+  still require EPSG:3577 and the 30 m lattice.
+- D13 D2 requires an exact **144-centre** test; add
+  `test_exact_144_centre_square` (12×12 polygon → support 144). With the
+  refusal additions the test count rises — state the true count in Step 4
+  after writing them, and make Step 4's expected count match the file.
+
 ---
 
 ### Task 9: rasterio pin + `dea_raster.py` decode rules
@@ -1791,6 +1971,9 @@ Expected: PASS (3 tests)
 - Create: `src/wa_mine_monitor/d3_inputs.py`
 - Create: `tests/test_d3_inputs.py`
 
+The statistical unit is the FOOTPRINT (`maus_id`, design decision 9); no
+`site_id` appears in this module or its tables.
+
 **Step 1: Write the failing tests**
 
 ```python
@@ -1835,18 +2018,28 @@ def test_sample_support_refuses_more_than_available():
 
 def test_geomedian_metrics_full_vs_reduced():
     n = 144
-    rng_free = np.linspace(0.1, 0.9, n)
+    nir = np.linspace(0.1, 0.9, n)
     bands = {
-        "nbart_nir": rng_free,
+        "nbart_nir": nir,
         "nbart_swir_1": np.full(n, 0.2),
         "nbart_swir_2": np.full(n, 0.1),
     }
     full = d3_inputs.geomedian_metrics(bands)
-    nir = rng_free
     assert full["nbr"] == pytest.approx(np.mean((nir - 0.1) / (nir + 0.1)))
     assert full["ndmi"] == pytest.approx(np.mean((nir - 0.2) / (nir + 0.2)))
     reduced = d3_inputs.geomedian_metrics({k: v[:9] for k, v in bands.items()})
     assert reduced["nbr"] != full["nbr"]
+
+
+def test_geomedian_validity_rejects_zero_denominator():
+    # nir = -swir2 at one pixel -> nbr denominator zero -> pixel invalid.
+    bands = {
+        "nbart_nir": np.array([0.5, -0.1]),
+        "nbart_swir_1": np.array([0.2, 0.2]),
+        "nbart_swir_2": np.array([0.1, 0.1]),
+    }
+    valid = d3_inputs.geomedian_valid_mask(bands)
+    assert valid.tolist() == [True, False]
 
 
 def test_fc_metrics_are_means_of_the_median_percentile_assets():
@@ -1863,22 +2056,18 @@ def test_fc_metrics_are_means_of_the_median_percentile_assets():
     }
 
 
-def test_replicate_aggregation_median_and_p90():
-    errors = np.array([abs(x) for x in range(-50, 50)], dtype=float)
-    agg = d3_inputs.aggregate_replicate_errors(errors)
-    assert agg["replicate_median_abs_error"] == pytest.approx(np.median(errors))
-    assert agg["replicate_p90_abs_error"] == pytest.approx(
-        np.percentile(errors, 90)
-    )
-    assert agg["n_replicates"] == 100
-
-
 def test_spearman_matches_rank_pearson():
     full = pd.Series([0.1, 0.4, 0.2, 0.9, 0.7])
     reduced = pd.Series([0.15, 0.35, 0.25, 0.85, 0.75])
     rho = d3_inputs.spearman(full, reduced)
     expected = full.rank().corr(reduced.rank())
     assert rho == pytest.approx(expected)
+
+
+def test_spearman_returns_none_for_constant_series():
+    # A constant series has undefined rank correlation: not-computable,
+    # disclosed by the caller -- never silently 0 or NaN in a table.
+    assert d3_inputs.spearman(pd.Series([1.0, 1.0, 1.0]), pd.Series([1.0, 2.0, 3.0])) is None
 
 
 def test_spearman_refuses_fewer_than_min_years():
@@ -1901,8 +2090,11 @@ Sampling is WITHOUT replacement, deterministic, nested and input-order
 free: members are ranked by sha256("{seed_material}|{replicate}|{member}")
 and a sample of size n is the first n of that ranking, so the n=9 sample
 is always a prefix-subset of the n=100 sample for the same replicate. The
-seed material is pre-registered by the caller (protocol digest + site +
+seed material is pre-registered by the caller (protocol digest + maus_id +
 collection + year) and never derived from a clock or process state.
+
+The statistical unit throughout is the footprint (maus_id); register
+sites never enter this module.
 """
 
 from __future__ import annotations
@@ -1915,7 +2107,7 @@ import pandas as pd
 
 Member = tuple[str, int, int]  # (tile_id, row, col)
 
-#: Geomedian band -> metric formulas (pre-registered; decision 5).
+#: Geomedian metric -> (numerator-plus band, numerator-minus band).
 GEOMEDIAN_METRIC_BANDS: dict[str, tuple[str, str]] = {
     "nbr": ("nbart_nir", "nbart_swir_2"),
     "ndmi": ("nbart_nir", "nbart_swir_1"),
@@ -1949,8 +2141,24 @@ def sample_support(
     return tuple(ranked[:n])
 
 
+def geomedian_valid_mask(bands: Mapping[str, np.ndarray]) -> np.ndarray:
+    """Pixel validity for geomedian metrics: every band finite AND every
+    metric denominator nonzero (design decision 11)."""
+    stacked = np.vstack([bands[b] for b in sorted(bands)])
+    valid = np.isfinite(stacked).all(axis=0)
+    for plus, minus in GEOMEDIAN_METRIC_BANDS.values():
+        valid &= (bands[plus] + bands[minus]) != 0
+    return valid
+
+
+def fc_valid_mask(values: Mapping[str, np.ndarray]) -> np.ndarray:
+    stacked = np.vstack([values[a] for a in sorted(values)])
+    return np.isfinite(stacked).all(axis=0)
+
+
 def geomedian_metrics(bands: Mapping[str, np.ndarray]) -> dict[str, float]:
-    """Spatial mean of the per-pixel index over the given pixel arrays."""
+    """Spatial mean of the per-pixel index over the given pixel arrays.
+    Caller guarantees validity (geomedian_valid_mask all-True)."""
     out: dict[str, float] = {}
     for metric, (plus, minus) in GEOMEDIAN_METRIC_BANDS.items():
         numerator = bands[plus] - bands[minus]
@@ -1966,42 +2174,33 @@ def fc_metrics(values: Mapping[str, np.ndarray]) -> dict[str, float]:
     }
 
 
-def aggregate_replicate_errors(abs_errors: np.ndarray) -> dict[str, float | int]:
-    return {
-        "replicate_median_abs_error": float(np.median(abs_errors)),
-        "replicate_p90_abs_error": float(np.percentile(abs_errors, 90)),
-        "n_replicates": int(abs_errors.size),
-    }
-
-
-def spearman(full: pd.Series, reduced: pd.Series) -> float:
+def spearman(full: pd.Series, reduced: pd.Series) -> float | None:
     if len(full) < MIN_SPEARMAN_YEARS or len(full) != len(reduced):
         raise D3InputsError(
             f"spearman needs >= {MIN_SPEARMAN_YEARS} paired years, got "
             f"{len(full)} vs {len(reduced)}"
         )
+    if full.nunique() < 2 or reduced.nunique() < 2:
+        return None  # undefined for a constant series -- caller discloses
     return float(full.rank().corr(reduced.rank()))
 ```
-
-Note `test_replicate_aggregation_median_and_p90` passes 100 values, so
-`n_replicates` reports the array size — the CLI asserts it equals the
-protocol's 100 before persisting.
 
 **Step 4: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/test_d3_inputs.py -q`
-Expected: PASS (9 tests)
+Expected: PASS (10 tests)
 
 ---
 
-### Task 11: `d3_inputs.py` — windowed extraction + simulation orchestration
+### Task 11: `d3_inputs.py` — tile-aware reads + two-phase simulation
 
 **Files:**
 - Modify: `src/wa_mine_monitor/d3_inputs.py`
 - Modify: `tests/test_d3_inputs.py`
 
-Adds the raster seam and the per-site simulation driver. Fixture tests
-write tiny LOCAL GeoTIFFs with rasterio into `tmp_path` — no network.
+Implements the raster seam and the per-footprint driver under design
+decision 11 (Phase A computability, Phase B values). Fixture tests write
+tiny LOCAL GeoTIFFs with rasterio into `tmp_path` — no network.
 
 **Step 1: Write the failing tests**
 
@@ -2032,96 +2231,129 @@ def test_grid_spec_from_dataset_reads_identity(tmp_path):
     path = tmp_path / "band.tif"
     _write_geotiff(path, np.zeros((10, 10), dtype=np.int16))
     with rasterio.open(path) as dataset:
-        grid = d3_inputs.grid_spec_from_dataset(dataset, tile_id="x0y0")
+        grid = d3_inputs.grid_spec_from_dataset(dataset, tile_id="fixture-a")
     assert grid.crs == "EPSG:3577"
     assert grid.width == 10 and grid.height == 10
     assert grid.transform[0] == 30.0 and grid.transform[4] == -30.0
 
 
-def test_read_member_values_windows_only_the_member_bounds(tmp_path):
+def test_read_member_values_multi_tile_in_canonical_order(tmp_path):
     import rasterio
 
-    path = tmp_path / "band.tif"
-    array = np.arange(100, dtype=np.int16).reshape(10, 10)
-    _write_geotiff(path, array)
-    members = (("x0y0", 2, 3), ("x0y0", 4, 7))
-    with rasterio.open(path) as dataset:
-        values = d3_inputs.read_member_values(dataset, members)
-    assert values.tolist() == [23, 47]
+    a = tmp_path / "a.tif"
+    b = tmp_path / "b.tif"
+    _write_geotiff(a, np.arange(100, dtype=np.int16).reshape(10, 10))
+    _write_geotiff(b, (np.arange(100, dtype=np.int16) + 1000).reshape(10, 10))
+    members = (("tile-a", 2, 3), ("tile-b", 0, 1), ("tile-a", 4, 7))
+    with rasterio.open(a) as da, rasterio.open(b) as db:
+        values = d3_inputs.read_member_values(
+            {"tile-a": da, "tile-b": db}, members
+        )
+    # canonical member order is sorted(set(members)):
+    # (tile-a,2,3)=23, (tile-a,4,7)=47, (tile-b,0,1)=1001
+    assert values.tolist() == [23, 47, 1001]
 
 
-def test_simulate_site_year_produces_full_and_reduced_rows():
-    protocol_digest = "d" * 64
-    n = 144
-    bands = {
+def test_read_member_values_refuses_unknown_tile(tmp_path):
+    import rasterio
+
+    a = tmp_path / "a.tif"
+    _write_geotiff(a, np.zeros((10, 10), dtype=np.int16))
+    with rasterio.open(a) as da:
+        with pytest.raises(d3_inputs.D3InputsError, match="tile"):
+            d3_inputs.read_member_values({"tile-a": da}, (("tile-b", 0, 0),))
+
+
+def _bands(n):
+    return {
         "nbart_nir": np.linspace(0.2, 0.8, n),
         "nbart_swir_1": np.full(n, 0.2),
         "nbart_swir_2": np.full(n, 0.1),
     }
-    members = tuple(("x0y0", r, c) for r in range(12) for c in range(12))
-    rows, spearman_series = d3_inputs.simulate_site_year(
-        site_id="S1",
+
+
+def test_simulate_footprint_year_produces_rows_and_series():
+    members = tuple(sorted(("x0y0", r, c) for r in range(12) for c in range(12)))
+    result = d3_inputs.simulate_footprint_year(
+        maus_id="M1",
         year=2005,
         source_id="dea_gm_ls5t",
         members=members,
-        band_values=bands,
+        band_values=_bands(144),
         kind="geomedian",
         supports=(9, 16),
         replicates=25,
-        protocol_digest=protocol_digest,
+        protocol_digest="d" * 64,
     )
+    assert result is not None
+    rows, reduced_series = result
     frame = pd.DataFrame(rows)
     assert set(frame["metric_id"]) == {"nbr", "ndmi"}
     assert set(frame["support_px"]) == {9, 16}
     assert (frame["n_replicates"] == 25).all()
-    full_nbr = frame[frame["metric_id"] == "nbr"]["full_value"].unique()
-    assert len(full_nbr) == 1
-    # reduced-value series returned for the spearman stage: one per
-    # metric x support x replicate.
-    assert set(spearman_series.keys()) == {
+    # errors persisted as the full sorted replicate list (decision 6)
+    lengths = frame["replicate_abs_errors"].map(len)
+    assert (lengths == 25).all()
+    assert frame["replicate_abs_errors"].map(
+        lambda v: v == sorted(v)
+    ).all()
+    assert set(reduced_series.keys()) == {
         ("nbr", 9), ("nbr", 16), ("ndmi", 9), ("ndmi", 16),
     }
-    assert all(len(v) == 25 for v in spearman_series.values())
+    assert all(len(v) == 25 for v in reduced_series.values())
 
 
-def test_simulate_site_year_refuses_below_144_support():
-    members = tuple(("x0y0", 0, c) for c in range(100))
-    with pytest.raises(d3_inputs.D3InputsError, match="144"):
-        d3_inputs.simulate_site_year(
-            site_id="S1", year=2005, source_id="dea_gm_ls5t",
-            members=members,
-            band_values={"nbart_nir": np.zeros(100)},
-            kind="geomedian", supports=(9,), replicates=5,
-            protocol_digest="d" * 64,
+def test_simulate_footprint_year_requires_canonical_member_order():
+    members = tuple(("x0y0", r, c) for r in range(12) for c in range(12))
+    shuffled = members[1:] + members[:1]
+    with pytest.raises(d3_inputs.D3InputsError, match="sorted"):
+        d3_inputs.simulate_footprint_year(
+            maus_id="M1", year=2005, source_id="dea_gm_ls5t",
+            members=shuffled, band_values=_bands(144), kind="geomedian",
+            supports=(9,), replicates=5, protocol_digest="d" * 64,
         )
 
 
-def test_simulate_site_year_refuses_null_pixels_in_full_support():
-    n = 144
-    bands = {
-        "nbart_nir": np.linspace(0.2, 0.8, n),
-        "nbart_swir_1": np.full(n, 0.2),
-        "nbart_swir_2": np.full(n, 0.1),
-    }
+def test_simulate_footprint_year_refuses_below_144_support():
+    members = tuple(sorted(("x0y0", 0, c) for c in range(100)))
+    with pytest.raises(d3_inputs.D3InputsError, match="144"):
+        d3_inputs.simulate_footprint_year(
+            maus_id="M1", year=2005, source_id="dea_gm_ls5t",
+            members=members, band_values=_bands(100), kind="geomedian",
+            supports=(9,), replicates=5, protocol_digest="d" * 64,
+        )
+
+
+def test_simulate_footprint_year_invalid_pixel_returns_none():
+    members = tuple(sorted(("x0y0", r, c) for r in range(12) for c in range(12)))
+    bands = _bands(144)
     bands["nbart_nir"][3] = np.nan
-    members = tuple(("x0y0", r, c) for r in range(12) for c in range(12))
-    result = d3_inputs.simulate_site_year(
-        site_id="S1", year=2005, source_id="dea_gm_ls5t",
+    result = d3_inputs.simulate_footprint_year(
+        maus_id="M1", year=2005, source_id="dea_gm_ls5t",
         members=members, band_values=bands, kind="geomedian",
         supports=(9,), replicates=5, protocol_digest="d" * 64,
     )
-    assert result is None  # not a full-support computable year
+    assert result is None  # not full-support computable
+
+
+def test_year_computable_matches_simulate_none_result():
+    bands = _bands(144)
+    assert d3_inputs.year_computable(bands, kind="geomedian") is True
+    bands["nbart_nir"][3] = np.nan
+    assert d3_inputs.year_computable(bands, kind="geomedian") is False
 ```
 
 **Step 2: Run them to verify they fail**
 
 Run: `uv run pytest tests/test_d3_inputs.py -q`
-Expected: new tests FAIL with `AttributeError` on `grid_spec_from_dataset`
+Expected: new tests FAIL with `AttributeError`
 
 **Step 3: Implement**
 
 ```python
-def grid_spec_from_dataset(dataset: "rasterio.DatasetReader", *, tile_id: str) -> pixel_support.GridSpec:
+def grid_spec_from_dataset(
+    dataset: "rasterio.DatasetReader", *, tile_id: str
+) -> pixel_support.GridSpec:
     """Grid identity read from the ACTUAL raster -- D2's tile binding."""
     t = dataset.transform
     return pixel_support.GridSpec(
@@ -2134,27 +2366,60 @@ def grid_spec_from_dataset(dataset: "rasterio.DatasetReader", *, tile_id: str) -
 
 
 def read_member_values(
-    dataset: "rasterio.DatasetReader", members: Sequence[Member]
+    datasets: Mapping[str, "rasterio.DatasetReader"],
+    members: Sequence[Member],
 ) -> np.ndarray:
-    """One windowed read covering the member bounding box, then index out
-    exactly the member pixels, in member order."""
+    """Member pixel values in CANONICAL order (sorted(set(members))),
+    grouped per tile: one windowed read per tile covering that tile's
+    member bounding box. Refuses a member whose tile has no dataset."""
     from rasterio.windows import Window
 
-    rows = [m[1] for m in members]
-    cols = [m[2] for m in members]
-    row_lo, row_hi = min(rows), max(rows)
-    col_lo, col_hi = min(cols), max(cols)
-    window = Window(
-        col_off=col_lo, row_off=row_lo,
-        width=col_hi - col_lo + 1, height=row_hi - row_lo + 1,
+    canonical = sorted(set(members))
+    missing = {m[0] for m in canonical} - set(datasets)
+    if missing:
+        raise D3InputsError(f"no dataset for tile(s): {sorted(missing)}")
+    out = np.empty(len(canonical), dtype=np.float64)
+    by_tile: dict[str, list[int]] = {}
+    for i, m in enumerate(canonical):
+        by_tile.setdefault(m[0], []).append(i)
+    for tile_id, positions in by_tile.items():
+        rows = [canonical[i][1] for i in positions]
+        cols = [canonical[i][2] for i in positions]
+        row_lo, col_lo = min(rows), min(cols)
+        window = Window(
+            col_off=col_lo, row_off=row_lo,
+            width=max(cols) - col_lo + 1, height=max(rows) - row_lo + 1,
+        )
+        block = datasets[tile_id].read(1, window=window)
+        for i in positions:
+            _, r, c = canonical[i]
+            out[i] = block[r - row_lo, c - col_lo]
+    return out
+
+
+def _require_canonical(members: Sequence[Member]) -> tuple[Member, ...]:
+    canonical = tuple(members)
+    if list(canonical) != sorted(set(canonical)):
+        raise D3InputsError(
+            "members must be sorted and duplicate-free (canonical order); "
+            "band_values arrays are positionally aligned to that order"
+        )
+    return canonical
+
+
+def year_computable(band_values: Mapping[str, np.ndarray], *, kind: str) -> bool:
+    """Phase A computability: every member pixel valid (design decision 11)."""
+    mask = (
+        geomedian_valid_mask(band_values)
+        if kind == "geomedian"
+        else fc_valid_mask(band_values)
     )
-    block = dataset.read(1, window=window)
-    return np.array([block[r - row_lo, c - col_lo] for _, r, c in members])
+    return bool(mask.all())
 
 
-def simulate_site_year(
+def simulate_footprint_year(
     *,
-    site_id: str,
+    maus_id: str,
     year: int,
     source_id: str,
     members: Sequence[Member],
@@ -2164,38 +2429,43 @@ def simulate_site_year(
     replicates: int,
     protocol_digest: str,
 ) -> tuple[list[dict[str, object]], dict[tuple[str, int], list[float]]] | None:
-    """Full + reduced metrics for one site-year-collection.
+    """Full + reduced metrics for one footprint-year-collection (Phase B).
 
-    Returns None when the year is not full-support computable (support
-    below 144 is a refusal -- a protocol violation by the caller -- but a
-    NULL PIXEL inside the full set is a data property: the year is simply
-    not computable at full support, so it contributes nothing).
+    `members` MUST be canonical (sorted, unique) and `band_values` arrays
+    MUST be positionally aligned to it -- refused otherwise, because a
+    silent misalignment assigns raster values to the wrong pixels.
+    Support below 144 is a caller error (refused); an invalid pixel is a
+    data property (year not computable -> None).
     """
-    distinct = sorted(set(members))
-    if len(distinct) < d3_protocol.MIN_FULL_SUPPORT_PX:
+    canonical = _require_canonical(members)
+    if len(canonical) < d3_protocol.MIN_FULL_SUPPORT_PX:
         raise D3InputsError(
-            f"full support {len(distinct)} is below the frozen minimum "
-            f"{d3_protocol.MIN_FULL_SUPPORT_PX} -- caller must not submit "
-            "this site"
+            f"full support {len(canonical)} is below the frozen minimum "
+            f"{d3_protocol.MIN_FULL_SUPPORT_PX} -- caller must not submit"
         )
-    stacked = np.vstack([band_values[b] for b in sorted(band_values)])
-    valid_mask = ~np.isnan(stacked).any(axis=0)
-    if not valid_mask.all():
+    for band, values in band_values.items():
+        if len(values) != len(canonical):
+            raise D3InputsError(
+                f"band {band} has {len(values)} values for "
+                f"{len(canonical)} members -- misaligned input"
+            )
+    if not year_computable(band_values, kind=kind):
         return None
 
     metric_fn = geomedian_metrics if kind == "geomedian" else fc_metrics
     full = metric_fn(band_values)
-    member_index = {m: i for i, m in enumerate(distinct)}
-    seed_material = f"{protocol_digest}|{site_id}|{source_id}|{year}"
+    member_index = {m: i for i, m in enumerate(canonical)}
+    seed_material = f"{protocol_digest}|{maus_id}|{source_id}|{year}"
 
     rows: list[dict[str, object]] = []
-    spearman_series: dict[tuple[str, int], list[float]] = {}
+    reduced_series: dict[tuple[str, int], list[float]] = {}
     for support in supports:
         per_metric_errors: dict[str, list[float]] = {m: [] for m in full}
         per_metric_reduced: dict[str, list[float]] = {m: [] for m in full}
         for replicate in range(replicates):
             sample = sample_support(
-                distinct, support, replicate=replicate, seed_material=seed_material
+                canonical, support, replicate=replicate,
+                seed_material=seed_material,
             )
             indices = [member_index[m] for m in sample]
             reduced = metric_fn(
@@ -2205,33 +2475,32 @@ def simulate_site_year(
                 per_metric_errors[metric].append(abs(value - full[metric]))
                 per_metric_reduced[metric].append(value)
         for metric, errors in per_metric_errors.items():
-            aggregate = aggregate_replicate_errors(np.array(errors))
             rows.append(
                 {
-                    "site_id": site_id,
+                    "maus_id": maus_id,
                     "year": year,
                     "source_id": source_id,
                     "metric_id": metric,
                     "support_px": support,
-                    "full_support_px": len(distinct),
-                    "valid_support_px": int(valid_mask.sum()),
+                    "full_support_px": len(canonical),
+                    "valid_support_px": len(canonical),
                     "full_value": full[metric],
-                    **aggregate,
+                    "replicate_abs_errors": sorted(errors),
+                    "n_replicates": replicates,
                     "protocol_digest": protocol_digest,
                 }
             )
-            spearman_series[(metric, support)] = per_metric_reduced[metric]
-    return rows, spearman_series
+            reduced_series[(metric, support)] = per_metric_reduced[metric]
+    return rows, reduced_series
 ```
 
 Imports: `from wa_mine_monitor import d3_protocol, pixel_support`; rasterio
-is imported lazily inside the two dataset functions (keeps module import
-cheap for the pure-simulation tests).
+is imported lazily inside the dataset functions.
 
 **Step 4: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/test_d3_inputs.py -q`
-Expected: PASS (14 tests)
+Expected: PASS (19 tests)
 
 ---
 
@@ -2239,203 +2508,272 @@ Expected: PASS (14 tests)
 
 **Files:**
 - Modify: `src/wa_mine_monitor/cli.py`
+- Modify: `src/wa_mine_monitor/d3_inputs.py` (schemas + orchestration helpers)
 - Modify: `tests/test_cli.py`
 
-The largest command in the batch. Verification chain (each gate individually
-refused with the standard JSON shape, in this order):
+The largest command in the batch. **Gate order** (each individually refused
+with the standard JSON shape):
 
-1. Frozen protocol: `_latest_curated_dated_dir(data_root/"curated"/
-   "d3-protocol", label="curated/d3-protocol")`, load `protocol.json`,
-   recompute `d3_protocol.protocol_digest(load_protocol(--protocol-config))`
-   — refuse on mismatch ("protocol drifted after freezing").
+0. **Preflight existing-output check** (design decision 17/15): refuse if
+   `curated/d3-inputs/<date>/` exists, BEFORE any snapshot or raster access.
+1. Frozen protocol: exactly ONE dated dir under `curated/d3-protocol/`
+   (more than one → refusal per design decision 13), digest-verified;
+   recompute `protocol_digest(load_protocol(--protocol-config))` — refuse
+   mismatch ("protocol drifted after freezing"). Cross-check every module
+   constant this command relies on (`d3_inputs.GEOMEDIAN_METRIC_BANDS`,
+   `FC_METRIC_ASSETS`, decode constants, hash/seed rule strings) against
+   the protocol's `procedures` block — refuse drift.
 2. Enriched register: latest `curated/register/<date>/`, digest-verified;
-   must carry `register.DEA_COVERAGE_COLUMNS` (a bare Batch B register
-   refuses, naming `build-dea-coverage`) — same gate `derive-dea-volume`
-   uses; read that command's step 1-2 block and mirror it.
-3. Crosswalk: latest `curated/crosswalk/<date>/`, digest-verified;
-   `tier1_population`.
-4. Footprint areas: latest `curated/maus_footprint_areas/<date>/`,
-   digest-verified; **Maus sha256 equality gate** between crosswalk
-   manifest and footprint-areas manifest — mirror `derive-dea-volume`'s
-   refusal wording and rationale.
-5. Regions snapshot: `_verify_snapshot_or_refuse(data_root/"raw"/
-   "wa_rdc_regions"/<latest>, source_id="wa_rdc_regions",
-   required_files=("regions.gpkg",))`; `wa_regions.load_regions`.
-6. Maus geometry: `register.latest_snapshot(data_root, "maus_v2")` +
-   `_verify_snapshot_or_refuse(..., required_files=("wa_extract.gpkg",))`;
-   its sha256 must ALSO equal the crosswalk manifest's Maus digest (the
-   compactness scalars must come from the same snapshot the ids came
-   from — same drift argument as the footprint gate).
-7. Catalogue: the DEA STAC snapshot named by the enriched register's own
-   manifest `resolved_args["catalogue_date"]`, `_verify_snapshot_or_refuse`
-   + `_load_dea_items` — mirror `derive-dea-volume`.
+   must carry `register.DEA_COVERAGE_COLUMNS` (bare Batch B register
+   refuses, naming `build-dea-coverage`) — mirror `derive-dea-volume`.
+3. Crosswalk: latest, digest-verified; `tier1_population`.
+4. Footprint areas: latest, digest-verified; Maus sha256 equality gate
+   between crosswalk and footprint-areas manifests — mirror
+   `derive-dea-volume`'s wording.
+5. Regions snapshot: `_verify_snapshot_or_refuse(..., source_id=
+   "wa_rdc_regions", required_files=("regions.gpkg",))`; `load_regions`.
+6. Maus geometry snapshot: sha256 must ALSO equal the crosswalk manifest's
+   Maus digest (compactness must come from the snapshot the ids came from).
+7. Catalogue: the DEA STAC snapshot named by the enriched register's
+   manifest `resolved_args["catalogue_date"]`, verified + `_load_dea_items`.
 
-Then, in order (pre-registered; decision 8 defers the live run):
+**Computation order** (pre-registered; live run deferred by decision 8):
 
-- Compactness per `maus_id`: read `wa_extract.gpkg`, reproject to
-  `crosswalk.TARGET_CRS`, `compactness = 4 * math.pi * area / perimeter**2`
-  per polygon (MultiPolygon: area/perimeter of the union as-is);
-  `shape_class` via protocol.
-- Candidate footprints: tier1 sites joined to footprint stats
-  (`join_site_footprints`); region via `assign_regions` on register
-  lon/lat points reprojected to TARGET_CRS; commodity via
-  `classify_commodity` on the register's raw commodity text.
-- Candidate filter (NO raster read yet): effective support ≥ 144 measured
-  by `pixel_support.build_pixel_support` against each footprint's
-  ACTUAL tile grids (grids read from the catalogue's asset hrefs via
-  `d3_inputs.grid_spec_from_dataset`); sites whose geometry returns
-  not-computed are disclosed, not silently dropped.
-- Extraction over candidates: for each candidate site x full-support year
-  (a year with an epoch item in every required asset), read member pixel
-  values per band (`read_member_values`), decode via `dea_raster`, and run
-  `simulate_site_year`. Count full-support computable years per footprint.
-- Adequacy + selection: `stratum_adequacy` + `select_stratum_footprints`
-  over the measured `n_full_support_years`. ONLY selected footprints'
-  rows are persisted; candidate counts and per-stratum adequacy go in the
-  manifest disclosures. (Selection depends on computability alone — no
-  metric VALUE feeds selection; that is the D13 acceptance "No accuracy
-  result can change sample definitions".)
-- Spearman table: for each selected site x collection x metric x support x
-  replicate, the Spearman over that site's full-support years between the
-  full-value series and the replicate's reduced-value series.
+- **Footprint strata** (decisions 9–10): per `maus_id` in
+  `tier1_population`: compactness + `shape_class` from Maus geometry in
+  `crosswalk.TARGET_CRS`; region from `assign_regions` on
+  `representative_point()`; commodity group = modal group over linked
+  high-confidence sites (`classify_commodity` on register text), ties →
+  lexicographically smallest, tie count disclosed.
+- **Support** (decision 7): per footprint, `build_pixel_support` against
+  each intersecting tile's ACTUAL grid (grids via
+  `grid_spec_from_dataset` from the catalogue item assets; item selection
+  rule below), members unioned across tiles;
+  `effective_pixel_support_px` = distinct member count. Geometry
+  missing/invalid → support not-computed with a reason, disclosed.
+- **Item selection rule (frozen in `procedures`):** for each (collection,
+  tile, year) exactly one item must exist in the item index — zero means
+  the year is not epoch-covered for that tile; more than one is a refusal
+  (duplicate item). Band hrefs are matched by the frozen asset keys per
+  collection (geomedian: `nbart_nir`, `nbart_swir_1`, `nbart_swir_2`;
+  FC: `bs_pc_50`, `pv_pc_50`, `npv_pc_50`). All bands of an item must
+  report identical grid identity (refuse otherwise). No mosaicking:
+  members are read per tile from that tile's own item (Task 11 reader).
+- **Phase A (validity):** for candidate footprints (support ≥ 144 and
+  epoch coverage > 0), read member values per year and evaluate ONLY
+  `year_computable` per collection; record per-asset `ETag`/
+  `Last-Modified` response headers (decision 16). A footprint-year counts
+  toward adequacy iff FC computable AND ≥1 geomedian collection
+  computable (decision 11).
+- **Adequacy + selection:** `stratum_adequacy` (full 54-stratum space) +
+  `select_stratum_footprints` over Phase A counts. No metric value exists
+  yet — selection cannot depend on accuracy.
+- **Phase B (values):** for SELECTED footprints only, re-read member
+  values (refusing if any asset ETag changed since Phase A), decode via
+  `dea_raster`, run `simulate_footprint_year` per computable year ×
+  collection.
+- **Spearman:** per selected footprint × collection × metric × support ×
+  replicate over that footprint's computable years; `spearman()` returning
+  `None` (constant series) drops the row and increments a disclosed
+  counter.
 
-Output: `curated/d3-inputs/<date>/support_inputs.parquet` +
-`support_spearman.parquet` + ONE run manifest per table (the second table's
-manifest lists the first as an input — mirror how multi-file outputs are
-handled elsewhere; if no precedent exists, manifest each independently with
-identical inputs). Schemas:
+**Outputs** — assembled in `<dir>.tmp`, atomically renamed (decision 15),
+four tables each with a run manifest sharing identical inputs:
 
-```python
-D3_SUPPORT_INPUTS_SCHEMA = pa.schema(
-    [
-        pa.field("site_id", pa.string(), nullable=False),
-        pa.field("maus_id", pa.string(), nullable=False),
-        pa.field("region", pa.string(), nullable=False),
-        pa.field("commodity_group", pa.string(), nullable=False),
-        pa.field("shape_class", pa.string(), nullable=False),
-        pa.field("year", pa.int64(), nullable=False),
-        pa.field("source_id", pa.string(), nullable=False),
-        pa.field("metric_id", pa.string(), nullable=False),
-        pa.field("support_px", pa.int64(), nullable=False),
-        pa.field("full_support_px", pa.int64(), nullable=False),
-        pa.field("valid_support_px", pa.int64(), nullable=False),
-        pa.field("full_value", pa.float64(), nullable=False),
-        pa.field("replicate_median_abs_error", pa.float64(), nullable=False),
-        pa.field("replicate_p90_abs_error", pa.float64(), nullable=False),
-        pa.field("n_replicates", pa.int64(), nullable=False),
-        pa.field("protocol_digest", pa.string(), nullable=False),
-    ]
-)
+- `support_inputs.parquet` (`D3_SUPPORT_INPUTS_SCHEMA`)
+- `support_spearman.parquet` (`D3_SPEARMAN_SCHEMA`)
+- `footprint_support.parquet` (`D3_FOOTPRINT_SUPPORT_SCHEMA`)
+- `stratum_summary.parquet` (`D3_STRATUM_SUMMARY_SCHEMA`)
+- `extraction_assets.parquet` (`D3_EXTRACTION_ASSETS_SCHEMA`)
 
-D3_SPEARMAN_SCHEMA = pa.schema(
-    [
-        pa.field("site_id", pa.string(), nullable=False),
-        pa.field("source_id", pa.string(), nullable=False),
-        pa.field("metric_id", pa.string(), nullable=False),
-        pa.field("support_px", pa.int64(), nullable=False),
-        pa.field("replicate", pa.int64(), nullable=False),
-        pa.field("spearman", pa.float64(), nullable=False),
-        pa.field("n_years", pa.int64(), nullable=False),
-        pa.field("protocol_digest", pa.string(), nullable=False),
-    ]
-)
-```
-
-(Declare both in `d3_inputs.py`, not cli.py, next to the row builders.)
-
-**Step 1: Write the failing CLI tests** — fixture chain:
+Schemas (declare in `d3_inputs.py`):
 
 ```python
-# --- build-d3-inputs CLI command --------------------------------------------
+_INPUT_DIGEST_FIELD = pa.field("input_manifest_digests", pa.string(), nullable=False)
+# canonical JSON: {"catalogue": sha, "register": sha, "crosswalk": sha,
+#  "footprint_areas": sha, "maus": sha, "regions": sha, "protocol": sha}
+# identical on every row of every table (D13 D3: input-manifest digests).
+
+D3_SUPPORT_INPUTS_SCHEMA = pa.schema([
+    pa.field("maus_id", pa.string(), nullable=False),
+    pa.field("region", pa.string(), nullable=False),
+    pa.field("commodity_group", pa.string(), nullable=False),
+    pa.field("shape_class", pa.string(), nullable=False),
+    pa.field("year", pa.int64(), nullable=False),
+    pa.field("source_id", pa.string(), nullable=False),
+    pa.field("metric_id", pa.string(), nullable=False),
+    pa.field("support_px", pa.int64(), nullable=False),
+    pa.field("full_support_px", pa.int64(), nullable=False),
+    pa.field("valid_support_px", pa.int64(), nullable=False),
+    pa.field("full_value", pa.float64(), nullable=False),
+    pa.field("replicate_abs_errors", pa.list_(pa.float64()), nullable=False),
+    pa.field("n_replicates", pa.int64(), nullable=False),
+    pa.field("protocol_digest", pa.string(), nullable=False),
+    _INPUT_DIGEST_FIELD,
+])
+
+D3_SPEARMAN_SCHEMA = pa.schema([
+    pa.field("maus_id", pa.string(), nullable=False),
+    pa.field("source_id", pa.string(), nullable=False),
+    pa.field("metric_id", pa.string(), nullable=False),
+    pa.field("support_px", pa.int64(), nullable=False),
+    pa.field("replicate", pa.int64(), nullable=False),
+    pa.field("spearman", pa.float64(), nullable=False),
+    pa.field("n_years", pa.int64(), nullable=False),
+    pa.field("protocol_digest", pa.string(), nullable=False),
+    _INPUT_DIGEST_FIELD,
+])
+
+D3_FOOTPRINT_SUPPORT_SCHEMA = pa.schema([
+    pa.field("maus_id", pa.string(), nullable=False),
+    pa.field("region", pa.string(), nullable=True),
+    pa.field("commodity_group", pa.string(), nullable=True),
+    pa.field("shape_class", pa.string(), nullable=True),
+    pa.field("effective_pixel_support_px", pa.int64(), nullable=True),
+    pa.field("support_not_computed_reason", pa.string(), nullable=True),
+    pa.field("n_epoch_covered_years", pa.int64(), nullable=False),
+    pa.field("n_full_support_years", pa.int64(), nullable=False),
+    pa.field("candidate", pa.bool_(), nullable=False),
+    pa.field("selected", pa.bool_(), nullable=False),
+    pa.field("protocol_digest", pa.string(), nullable=False),
+    _INPUT_DIGEST_FIELD,
+])
+
+D3_STRATUM_SUMMARY_SCHEMA = pa.schema([
+    pa.field("region", pa.string(), nullable=False),
+    pa.field("commodity_group", pa.string(), nullable=False),
+    pa.field("shape_class", pa.string(), nullable=False),
+    pa.field("n_footprints", pa.int64(), nullable=False),
+    pa.field("n_adequate_footprints", pa.int64(), nullable=False),
+    pa.field("adequate", pa.bool_(), nullable=False),
+    pa.field("n_selected", pa.int64(), nullable=False),
+    pa.field("protocol_digest", pa.string(), nullable=False),
+    _INPUT_DIGEST_FIELD,
+])  # exactly 54 rows, zero-count strata included
+
+D3_EXTRACTION_ASSETS_SCHEMA = pa.schema([
+    pa.field("source_id", pa.string(), nullable=False),
+    pa.field("tile_id", pa.string(), nullable=False),
+    pa.field("year", pa.int64(), nullable=False),
+    pa.field("asset_key", pa.string(), nullable=False),
+    pa.field("href", pa.string(), nullable=False),
+    pa.field("etag", pa.string(), nullable=True),
+    pa.field("last_modified", pa.string(), nullable=True),
+    pa.field("phase", pa.string(), nullable=False),  # "a" | "b"
+])
 ```
 
-Extend `_seed_derive_dea_volume_chain` (read it first) into
-`_seed_d3_inputs_chain(tmp_path, monkeypatch)` that ALSO: seeds the RDC
-regions snapshot (reuse Task 3's fixture bytes + the real
-`fetch-region-boundaries` CLI, monkeypatched fetch seam); freezes the
-protocol (`freeze-d3-protocol` via `runner.invoke`); and rewrites the DEA
-fixture assets so each item's asset hrefs point at LOCAL GeoTIFFs written
-into the snapshot directory with `_write_geotiff`-style content (reuse
-Task 11's helper from `tests/test_d3_inputs.py` — import it, do not
-duplicate) sized so the fixture Maus polygon covers ≥144 centres. Tests:
+**Step 1: Write the failing CLI tests** — extend
+`_seed_derive_dea_volume_chain` (read it first) into
+`_seed_d3_inputs_chain(tmp_path, monkeypatch)` returning a named tuple
+`(cfg_file, protocol_digest, d3_yaml_path)`. It must ALSO: seed the RDC
+regions snapshot (Task 3's fetch seam); freeze the protocol via
+`runner.invoke`; and rewrite the DEA fixture so asset hrefs point at LOCAL
+GeoTIFFs (`file://` or plain paths — verify what rasterio accepts for
+local paths and use that) written with Task 11's `_write_geotiff`
+(imported, not duplicated). **The fixture must contain at least 10
+distinct Maus footprints, each covering ≥144 pixel centres, each with
+≥10 fixture years of items in FC and one geomedian collection** —
+selection requires 10 adequate footprints; a single-footprint fixture
+cannot go green. Keep rasters tiny (e.g. 20×20) and years synthetic.
+Tests:
 
 ```python
 def test_build_d3_inputs_end_to_end_over_fixtures(tmp_path, monkeypatch):
-    cfg_file = _seed_d3_inputs_chain(tmp_path, monkeypatch)
+    seed = _seed_d3_inputs_chain(tmp_path, monkeypatch)
     result = runner.invoke(
-        app,
-        ["build-d3-inputs", "--config", str(cfg_file), "--date", "2026-08-18"],
+        app, ["build-d3-inputs", "--config", str(seed.cfg_file), "--date", "2026-08-18"]
     )
     assert result.exit_code == 0, result.output
     out_dir = tmp_path / "data" / "curated" / "d3-inputs" / "2026-08-18"
     inputs = tables.read_table(out_dir / "support_inputs.parquet")
-    assert (inputs["protocol_digest"] == inputs["protocol_digest"].iloc[0]).all()
+    assert (inputs["protocol_digest"] == seed.protocol_digest).all()
     assert (inputs["n_replicates"] == 100).all()
     assert set(inputs["support_px"]) <= {9, 16, 25, 36, 49, 64, 100, 144}
+    summary = tables.read_table(out_dir / "stratum_summary.parquet")
+    assert len(summary) == 54
+    support = tables.read_table(out_dir / "footprint_support.parquet")
+    assert support["selected"].sum() >= 10
     payload = json.loads(result.output)
-    assert payload["n_selected_footprints"] >= 1
+    assert payload["n_selected_footprints"] >= 10
     assert payload["n_candidate_footprints"] >= payload["n_selected_footprints"]
 
 
-def test_build_d3_inputs_refuses_drifted_protocol(tmp_path, monkeypatch):
-    cfg_file = _seed_d3_inputs_chain(tmp_path, monkeypatch)
-    d3_file = tmp_path / "d3.yaml"  # the copy the seed helper froze
-    raw = yaml.safe_load(d3_file.read_text())
-    raw["d3"]["commodity_token_rules"].append({"group": "other", "tokens": ["x"]})
-    d3_file.write_text(yaml.safe_dump(raw))
+def test_build_d3_inputs_refuses_existing_output_before_any_read(tmp_path, monkeypatch):
+    seed = _seed_d3_inputs_chain(tmp_path, monkeypatch)
+    (tmp_path / "data" / "curated" / "d3-inputs" / "2026-08-18").mkdir(parents=True)
+    calls = []
+    monkeypatch.setattr(  # any raster open records a call
+        "rasterio.open", lambda *a, **k: calls.append(a) or (_ for _ in ()).throw(AssertionError)
+    )
     result = runner.invoke(
-        app,
-        ["build-d3-inputs", "--config", str(cfg_file), "--date", "2026-08-18"],
+        app, ["build-d3-inputs", "--config", str(seed.cfg_file), "--date", "2026-08-18"]
+    )
+    assert result.exit_code == 1
+    assert calls == []  # preflight refused before raster access
+
+
+def test_build_d3_inputs_refuses_drifted_protocol(tmp_path, monkeypatch):
+    seed = _seed_d3_inputs_chain(tmp_path, monkeypatch)
+    raw = yaml.safe_load(seed.d3_yaml_path.read_text())
+    raw["d3"]["commodity_token_rules"].append({"group": "other", "tokens": ["x"]})
+    seed.d3_yaml_path.write_text(yaml.safe_dump(raw))
+    result = runner.invoke(
+        app, ["build-d3-inputs", "--config", str(seed.cfg_file), "--date", "2026-08-18"]
     )
     assert result.exit_code == 1
     assert "drift" in result.output
 
 
 def test_build_d3_inputs_refuses_bare_batch_b_register(tmp_path, monkeypatch):
-    # Seed WITHOUT running build-dea-coverage: latest register lacks the
-    # DEA coverage columns.
+    # Seed WITHOUT build-dea-coverage: latest register lacks coverage columns.
     ...
     assert result.exit_code == 1
     assert "build-dea-coverage" in result.output
 
 
 def test_build_d3_inputs_refuses_maus_digest_mismatch(tmp_path, monkeypatch):
-    # Re-seed the footprint areas from a DIFFERENT Maus snapshot date, then
-    # assert the refusal names the digest gate.
+    # Footprint areas re-seeded from a DIFFERENT Maus snapshot date.
     ...
     assert result.exit_code == 1
     assert "sha256" in result.output
+
+
+def test_build_d3_inputs_refuses_second_frozen_protocol(tmp_path, monkeypatch):
+    # Manually create a second dated dir under curated/d3-protocol/.
+    ...
+    assert result.exit_code == 1
+    assert "protocol" in result.output
 ```
 
-The two elided arrange blocks follow the seed-helper composition pattern
-`test_cli.py` already uses for `derive-dea-volume`'s refusal tests — read
-those tests first and mirror their arrangement rather than inventing one.
+The elided arrange blocks mirror `derive-dea-volume`'s refusal tests —
+read those first.
 
 **Step 2: Run them to verify they fail**
 
 Run: `uv run pytest tests/test_cli.py -k build_d3_inputs -q`
 Expected: FAIL (unknown command)
 
-**Step 3: Implement the command** following the numbered gate order above,
-the exemplar body structure (Conventions), and `derive-dea-volume` for the
-shared gates. Success echo (keys, exact):
+**Step 3: Implement** per the gate + computation order above. Success echo
+(keys, exact):
 
 ```python
 {
     "output_dir": ..., "protocol_digest": ...,
     "n_candidate_footprints": ..., "n_selected_footprints": ...,
-    "n_selected_sites": ..., "n_strata_adequate": ...,
-    "n_strata_inadequate": ..., "n_site_years_simulated": ...,
-    "n_site_years_not_computable": ...,
-    "n_sites_support_not_computed": ...,
-    "region_ambiguity": {...}, "manifest_paths": [...],
+    "n_strata_adequate": ..., "n_strata_inadequate": ...,
+    "n_footprint_years_simulated": ..., "n_footprint_years_not_computable": ...,
+    "n_footprints_support_not_computed": ...,
+    "n_spearman_not_computable": ...,
+    "region_ambiguity": {...}, "commodity_ties": {...},
+    "manifest_paths": [...],
 }
 ```
 
 **Step 4: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/test_cli.py -k build_d3_inputs -q`
-Expected: PASS (4 tests)
+Expected: PASS (6 tests)
 
 **Step 5: Run the full battery**
 
@@ -2450,189 +2788,72 @@ Expected: clean, full suite green.
 - Create: `src/wa_mine_monitor/d3_threshold.py`
 - Create: `tests/test_d3_threshold.py`
 
-Pure evaluation over the Task 12 tables. The criteria are the frozen
-protocol's (`REQUIRED_CRITERIA`, Task 4): per stratum × metric × support —
+Public surface per D13 D4: **`evaluate_threshold(inputs, protocol) ->
+ThresholdResult`** where `inputs` is a small container of the Task 12
+tables and `protocol` is the loaded frozen `D3Protocol` (criteria come
+FROM the protocol; the module hard-codes nothing the protocol carries —
+the earlier hard-coded-constants sketch is superseded).
 
-- geomedian metrics (nbr, ndmi): P90 across site-years of
-  `replicate_p90_abs_error` ≤ **0.03** (index units);
-- FC metrics: same statistic ≤ **5.0** (percentage points);
-- Spearman: median across site × replicate of `spearman` ≥ **0.95**;
-- computable fraction: site-years contributing at that support ÷
-  site-years contributing at full support ≥ **0.90**.
+Frozen statistics (design decision 6): P90 = `numpy.percentile(pooled
+per-replicate absolute errors across the stratum's footprint-years, 90,
+method="linear")`; median Spearman = `numpy.median` over rows; computable
+fraction per decision 12 (from `footprint_support` counts). Rules:
 
-A support PASSES when every adequate stratum passes every criterion for
-every metric of both kinds. `n_star` = smallest passing support. If no
-support ≤ 144 passes: `criteria_passed=false`, `n_star=144` (fall back to
-the full-support minimum — D13 §4 "the threshold never relaxes below the
-frozen floor"). `nominal_area_m2 = 900 * n_star`.
+- Evaluation is per **stratum × collection × metric**: geomedian sensor
+  variants (ls5t/ls7e/ls8cls9c) are evaluated SEPARATELY and each
+  (collection, metric) cell with data must pass — a strong sensor cannot
+  mask a weak one (D13 "sensor overlap variants remain separate").
+- The REQUIRED metric set per collection kind must be present wherever
+  that collection has rows (geomedian: nbr AND ndmi; FC: all three) —
+  a missing metric is a refusal, not a silent pass.
+- Every criterion cell records value, pass flag, AND sample counts
+  (n_footprint_years, n_error_values, n_spearman_rows, fraction
+  numerator/denominator) — D4 requires auditable failure details.
+- Statistics run on finite values; an empty or all-non-finite cell FAILS
+  that criterion (never passes vacuously) and records n=0.
+- `criteria_passed` is True only when a REDUCED support (< 144) passes;
+  otherwise `n_star=144`, `criteria_passed=False`, failed criteria listed.
+- Mixed `protocol_digest` across input rows, or a digest differing from
+  `protocol_digest(protocol)`, is a refusal.
 
-**Step 1: Write the failing tests**
+**Step 1: Write the failing tests** — build small frames directly (helper
+constructors `_inputs_frame`/`_spearman_frame`/`_support_frame` giving one
+adequate stratum, parameterized per-support error lists and rhos):
 
-```python
-# tests/test_d3_threshold.py
-"""D3 threshold evaluation (D13 Batch D task D4)."""
+- `test_smallest_passing_support_wins` — errors pass at 16 not 9 → n_star
+  16, `criteria_passed True`, `nominal_area_m2 == 900*16`.
+- `test_each_criterion_can_fail_independently` — parametrized: p90-error /
+  spearman / fraction each individually sink support 16 → n_star 144.
+- `test_no_passing_support_falls_back_to_144` — `criteria_passed False`,
+  failed criteria listed in `result.failed_criteria`.
+- `test_only_144_passing_is_not_criteria_passed` — all reduced supports
+  fail, 144 trivially fine → `criteria_passed False`.
+- `test_fc_uses_percentage_point_tolerance` — 4.0 pp passes FC, would fail
+  geomedian.
+- `test_sensor_variants_evaluated_separately` — ls5t passes, ls7e fails at
+  16 → 16 fails overall.
+- `test_missing_required_metric_is_refused` — geomedian rows with only nbr
+  → `D3ThresholdError`.
+- `test_inadequate_strata_excluded` — failing rows in a stratum absent
+  from `stratum_summary.adequate` don't sink the support.
+- `test_empty_cell_fails_not_passes` — a support with zero spearman rows
+  for one metric fails that criterion with n=0 recorded.
+- `test_mixed_protocol_digest_is_refused`.
+- `test_per_support_detail_records_counts` — every criteria cell carries
+  the count fields.
 
-import pandas as pd
-import pytest
+**Step 2: Run to verify they fail** — `uv run pytest
+tests/test_d3_threshold.py -q` → `ModuleNotFoundError`.
 
-from wa_mine_monitor import d3_threshold
-
-def _inputs_frame(*, p90_by_support):
-    rows = []
-    for support, p90 in p90_by_support.items():
-        for year in (2000, 2001, 2002):
-            rows.append(
-                {
-                    "site_id": "S1", "maus_id": "M1",
-                    "region": "pilbara", "commodity_group": "iron_ore",
-                    "shape_class": "compact", "year": year,
-                    "source_id": "dea_gm_ls5t", "metric_id": "nbr",
-                    "support_px": support, "full_support_px": 200,
-                    "valid_support_px": 200, "full_value": 0.5,
-                    "replicate_median_abs_error": p90 / 2,
-                    "replicate_p90_abs_error": p90,
-                    "n_replicates": 100, "protocol_digest": "d" * 64,
-                }
-            )
-    return pd.DataFrame(rows)
-
-
-def _spearman_frame(*, rho_by_support):
-    rows = []
-    for support, rho in rho_by_support.items():
-        for replicate in range(5):
-            rows.append(
-                {
-                    "site_id": "S1", "source_id": "dea_gm_ls5t",
-                    "metric_id": "nbr", "support_px": support,
-                    "replicate": replicate, "spearman": rho,
-                    "n_years": 3, "protocol_digest": "d" * 64,
-                }
-            )
-    return pd.DataFrame(rows)
-
-
-def test_smallest_passing_support_wins():
-    inputs = _inputs_frame(p90_by_support={9: 0.08, 16: 0.02, 25: 0.01, 144: 0.0})
-    spearman = _spearman_frame(rho_by_support={9: 0.80, 16: 0.99, 25: 0.99, 144: 1.0})
-    result = d3_threshold.evaluate_threshold(
-        inputs, spearman, adequate_strata=[("pilbara", "iron_ore", "compact")]
-    )
-    assert result.criteria_passed is True
-    assert result.n_star == 16
-    assert result.nominal_area_m2 == 900 * 16
-
-
-def test_no_passing_support_falls_back_to_144():
-    inputs = _inputs_frame(p90_by_support={9: 0.5, 144: 0.5})
-    spearman = _spearman_frame(rho_by_support={9: 0.1, 144: 0.1})
-    result = d3_threshold.evaluate_threshold(
-        inputs, spearman, adequate_strata=[("pilbara", "iron_ore", "compact")]
-    )
-    assert result.criteria_passed is False
-    assert result.n_star == 144
-
-
-def test_fc_metrics_use_percentage_point_tolerance():
-    inputs = _inputs_frame(p90_by_support={16: 4.0, 144: 0.0})
-    inputs["metric_id"] = "bare_soil"
-    inputs["source_id"] = "dea_fc_pc"
-    spearman = _spearman_frame(rho_by_support={16: 0.99, 144: 1.0})
-    spearman["metric_id"] = "bare_soil"
-    spearman["source_id"] = "dea_fc_pc"
-    result = d3_threshold.evaluate_threshold(
-        inputs, spearman, adequate_strata=[("pilbara", "iron_ore", "compact")]
-    )
-    # 4.0 pp is within the 5 pp tolerance -> 16 passes; the same number
-    # against the geomedian 0.03 tolerance would fail.
-    assert result.n_star == 16
-
-
-def test_computable_fraction_gate_fails_a_support():
-    inputs = _inputs_frame(p90_by_support={16: 0.01, 144: 0.0})
-    # Drop 2 of 3 years at support 16: fraction 1/3 < 0.90.
-    mask = (inputs["support_px"] == 16) & (inputs["year"] > 2000)
-    inputs = inputs[~mask]
-    spearman = _spearman_frame(rho_by_support={16: 0.99, 144: 1.0})
-    result = d3_threshold.evaluate_threshold(
-        inputs, spearman, adequate_strata=[("pilbara", "iron_ore", "compact")]
-    )
-    assert result.n_star == 144
-    assert result.criteria_passed is False
-
-
-def test_inadequate_strata_are_excluded_from_the_gate():
-    inputs = _inputs_frame(p90_by_support={16: 0.01, 144: 0.0})
-    bad = _inputs_frame(p90_by_support={16: 0.9, 144: 0.0})
-    bad["region"] = "other_wa"
-    spearman = _spearman_frame(rho_by_support={16: 0.99, 144: 1.0})
-    result = d3_threshold.evaluate_threshold(
-        pd.concat([inputs, bad], ignore_index=True),
-        spearman,
-        adequate_strata=[("pilbara", "iron_ore", "compact")],  # other_wa NOT adequate
-    )
-    assert result.n_star == 16
-
-
-def test_mixed_protocol_digest_is_refused():
-    inputs = _inputs_frame(p90_by_support={16: 0.01, 144: 0.0})
-    inputs.loc[0, "protocol_digest"] = "e" * 64
-    spearman = _spearman_frame(rho_by_support={16: 0.99, 144: 1.0})
-    with pytest.raises(d3_threshold.D3ThresholdError, match="digest"):
-        d3_threshold.evaluate_threshold(
-            inputs, spearman, adequate_strata=[("pilbara", "iron_ore", "compact")]
-        )
-
-
-def test_per_support_detail_is_returned_for_the_report():
-    inputs = _inputs_frame(p90_by_support={9: 0.08, 16: 0.02, 144: 0.0})
-    spearman = _spearman_frame(rho_by_support={9: 0.80, 16: 0.99, 144: 1.0})
-    result = d3_threshold.evaluate_threshold(
-        inputs, spearman, adequate_strata=[("pilbara", "iron_ore", "compact")]
-    )
-    detail = {d["support_px"]: d for d in result.per_support}
-    assert detail[9]["passed"] is False
-    assert detail[16]["passed"] is True
-    assert "criteria" in detail[9]
-```
-
-**Step 2: Run them to verify they fail**
-
-Run: `uv run pytest tests/test_d3_threshold.py -q`
-Expected: FAIL with `ModuleNotFoundError`
-
-**Step 3: Implement**
+**Step 3: Implement.** Container + result:
 
 ```python
-# src/wa_mine_monitor/d3_threshold.py
-"""D3 threshold evaluation (D13 Batch D task D4).
-
-Evaluates the frozen accuracy criteria over the Task-D3 simulation tables
-and returns the smallest passing effective-pixel support. The criteria
-values live in the frozen protocol; this module hard-codes the SAME frozen
-numbers and the CLI cross-checks them against the loaded protocol before
-calling in -- two sources must agree or the run refuses.
-"""
-
-from __future__ import annotations
-
-from dataclasses import dataclass, field
-
-import pandas as pd
-
-from wa_mine_monitor import d3_inputs, d3_protocol
-
-GEOMEDIAN_P90_TOLERANCE = 0.03
-FC_P90_TOLERANCE_PP = 5.0
-SPEARMAN_MIN_MEDIAN = 0.95
-COMPUTABLE_FRACTION_MIN = 0.90
-
-_FC_METRICS = frozenset(d3_inputs.FC_METRIC_ASSETS)
-_STRATUM_KEYS = ["region", "commodity_group", "shape_class"]
-
-
-class D3ThresholdError(ValueError):
-    """Threshold evaluation input violated the frozen protocol -- refused."""
+@dataclass(frozen=True)
+class ThresholdInputs:
+    support_inputs: pd.DataFrame
+    support_spearman: pd.DataFrame
+    footprint_support: pd.DataFrame
+    stratum_summary: pd.DataFrame
 
 
 @dataclass(frozen=True)
@@ -2641,133 +2862,31 @@ class ThresholdResult:
     criteria_passed: bool
     nominal_area_m2: int
     protocol_digest: str
-    per_support: tuple[dict[str, object], ...] = field(default=())
-
-
-def _single_digest(*frames: pd.DataFrame) -> str:
-    digests = set()
-    for frame in frames:
-        digests.update(frame["protocol_digest"].unique())
-    if len(digests) != 1:
-        raise D3ThresholdError(
-            f"expected one protocol digest across inputs, found {len(digests)}"
-        )
-    return digests.pop()
-
-
-def _support_criteria(
-    inputs: pd.DataFrame,
-    spearman: pd.DataFrame,
-    support: int,
-    stratum: tuple[str, str, str],
-) -> dict[str, object]:
-    sel = inputs[
-        (inputs["support_px"] == support)
-        & (inputs[_STRATUM_KEYS].apply(tuple, axis=1) == stratum)
-    ]
-    full = inputs[
-        (inputs["support_px"] == d3_protocol.MIN_FULL_SUPPORT_PX)
-        & (inputs[_STRATUM_KEYS].apply(tuple, axis=1) == stratum)
-    ]
-    criteria: dict[str, object] = {}
-    passed = True
-    for metric_id, group in sel.groupby("metric_id"):
-        tolerance = (
-            FC_P90_TOLERANCE_PP
-            if metric_id in _FC_METRICS
-            else GEOMEDIAN_P90_TOLERANCE
-        )
-        p90 = float(group["replicate_p90_abs_error"].quantile(0.9))
-        ok = p90 <= tolerance
-        criteria[f"p90_abs_error:{metric_id}"] = {"value": p90, "passed": ok}
-        passed = passed and ok
-
-        sp = spearman[
-            (spearman["support_px"] == support)
-            & (spearman["metric_id"] == metric_id)
-            & (spearman["site_id"].isin(group["site_id"].unique()))
-        ]
-        rho = float(sp["spearman"].median()) if len(sp) else float("nan")
-        ok = len(sp) > 0 and rho >= SPEARMAN_MIN_MEDIAN
-        criteria[f"spearman_median:{metric_id}"] = {"value": rho, "passed": ok}
-        passed = passed and ok
-
-    n_full_site_years = len(
-        full[["site_id", "source_id", "year"]].drop_duplicates()
-    )
-    n_here = len(sel[["site_id", "source_id", "year"]].drop_duplicates())
-    fraction = n_here / n_full_site_years if n_full_site_years else 0.0
-    ok = fraction >= COMPUTABLE_FRACTION_MIN
-    criteria["computable_fraction"] = {"value": fraction, "passed": ok}
-    passed = passed and ok
-
-    criteria["passed"] = passed
-    return criteria
-
-
-def evaluate_threshold(
-    inputs: pd.DataFrame,
-    spearman: pd.DataFrame,
-    *,
-    adequate_strata: list[tuple[str, str, str]],
-) -> ThresholdResult:
-    digest = _single_digest(inputs, spearman)
-    if not adequate_strata:
-        raise D3ThresholdError("no adequate strata -- nothing to evaluate")
-
-    per_support: list[dict[str, object]] = []
-    n_star: int | None = None
-    for support in d3_protocol.REQUIRED_SUPPORTS:
-        stratum_results = {
-            "/".join(s): _support_criteria(inputs, spearman, support, s)
-            for s in adequate_strata
-        }
-        passed = all(bool(r["passed"]) for r in stratum_results.values())
-        per_support.append(
-            {"support_px": support, "passed": passed, "criteria": stratum_results}
-        )
-        if passed and n_star is None:
-            n_star = support
-
-    criteria_passed = n_star is not None
-    if n_star is None:
-        n_star = d3_protocol.MIN_FULL_SUPPORT_PX
-    return ThresholdResult(
-        n_star=n_star,
-        criteria_passed=criteria_passed,
-        nominal_area_m2=900 * n_star,
-        protocol_digest=digest,
-        per_support=tuple(per_support),
-    )
+    per_support: tuple[dict[str, object], ...]
+    failed_criteria: tuple[str, ...]
 ```
 
-Note the P90-of-P90s statistic: each row already carries the per-site-year
-`replicate_p90_abs_error`; the stratum criterion takes the 0.9 quantile of
-those across site-years. That is the D13 §4 reading ("P90 across the
-sampled footprint-years of the replicate P90 absolute error"). If the
-implementing agent reads D13 §4 differently, STOP and escalate rather than
-pick silently — the statistic is frozen with the protocol.
-
-Also note support 144 itself always "passes" trivially in the loop
-(errors are 0 by construction). That is correct — 144 IS the fallback —
-but `criteria_passed` must reflect whether a REDUCED support passed; if
-the loop finds only 144, treat it as no reduced support passing:
-
-```python
-    criteria_passed = n_star is not None and n_star < d3_protocol.MIN_FULL_SUPPORT_PX
-    if not criteria_passed:
-        n_star = d3_protocol.MIN_FULL_SUPPORT_PX
-```
-
-Use this refined block, not the simpler one above, and keep both tests
-(`test_no_passing_support_falls_back_to_144` covers it; add an assertion
-to `test_smallest_passing_support_wins` that 144 alone would set
-`criteria_passed` False if you find the distinction untested).
+`evaluate_threshold(inputs: ThresholdInputs, protocol: d3_protocol.D3Protocol)`:
+adequate strata = `stratum_summary[stratum_summary.adequate]` rows;
+criteria values from `protocol.criteria`; loop supports ascending; per
+stratum × collection × metric compute pooled P90 (explode the
+`replicate_abs_errors` lists with `numpy.concatenate`), spearman median,
+computable fraction (`n_full_support_years` ÷ `n_epoch_covered_years`
+summed over the stratum's SELECTED footprints); every cell dict carries
+`{"value", "passed", "n_footprint_years", "n_error_values",
+"n_spearman_rows", "fraction_numerator", "fraction_denominator"}`; refuse
+missing required metrics; `n_star` = smallest passing support **strictly
+below 144**, else 144 with `criteria_passed=False` and `failed_criteria`
+naming every failing `stratum/collection/metric/criterion` at the best
+support. Cross-check module tolerance interpretation: tolerances come
+from `protocol.criteria` — if D13 §4's criterion values and the loaded
+protocol disagree, `load_protocol` already refused (Task 4 amendment); do
+not re-declare constants here.
 
 **Step 4: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/test_d3_threshold.py -q`
-Expected: PASS (7 tests)
+Expected: PASS (11+ tests; state the true count)
 
 ---
 
@@ -2779,84 +2898,73 @@ Expected: PASS (7 tests)
 
 **Command:** `derive-d3-threshold --config ... --date ...`
 
-Gates, in order: (1) frozen protocol loaded + digest recomputed from
-`--protocol-config` (same gate as `build-d3-inputs`); (2) latest
-`curated/d3-inputs/<date>/` digest-verified via its manifests; (3) BOTH
-tables' `protocol_digest` column must equal the frozen digest (refuse
-"inputs built under a different protocol"); (4) cross-check the module's
-hard-coded criteria constants against the loaded protocol's
-`REQUIRED_CRITERIA` — refuse on any mismatch ("criteria drift between
-d3_threshold module and frozen protocol").
+Gates, in order: (1) single frozen protocol, digest recomputed from
+`--protocol-config` (as Task 12 gate 1); (2) latest
+`curated/d3-inputs/<date>/` with ALL FIVE tables digest-verified via
+their manifests; (3) every table's `protocol_digest` equals the frozen
+digest (refuse "inputs built under a different protocol"); (4) the
+tables' `input_manifest_digests` values are identical across tables
+(refuse a mixed input set).
 
-Adequate strata are recomputed from the inputs table itself: group by
-(region, commodity_group, shape_class), count footprints with ≥10
-full-support years (rows at support 144, distinct maus_id with ≥10
-distinct years), keep strata meeting `Adequacy` — the SAME
-`stratum_adequacy` call Task 12 used, so the report can never claim
-adequacy the inputs don't support.
+Adequacy comes from `stratum_summary.parquet` directly (persisted by
+Task 12 over the full 54-stratum space) — the report includes both
+`adequate_strata` and `inadequate_strata` WITH their counts, recoverable
+because the summary table persists every stratum.
 
-Output: `reports/d3-threshold/<date>/threshold.json` (mirror
-`derive-dea-volume`'s reports layout) containing the full
-`ThresholdResult` serialized (n_star, criteria_passed, nominal_area_m2,
-protocol_digest, per_support detail), plus `adequate_strata`,
-`inadequate_strata` (with their counts), and the input table paths +
-digests. Manifest inputs: both parquet files + protocol.json. Success
-echo: `{"output_path", "n_star", "criteria_passed", "nominal_area_m2",
-"n_strata_adequate", "n_strata_inadequate", "manifest_path"}`.
+Output (design decision 14): **`curated/d3-threshold/<date>/
+threshold.json`** — atomic finalize with its manifest — containing the
+serialized `ThresholdResult` (n_star, criteria_passed, nominal_area_m2,
+protocol_digest, per_support detail with counts, failed_criteria),
+`adequate_strata`, `inadequate_strata`, and the input table paths +
+digests. Manifest inputs: all five parquet files + protocol.json.
+Success echo: `{"output_path", "n_star", "criteria_passed",
+"nominal_area_m2", "n_strata_adequate", "n_strata_inadequate",
+"manifest_path"}`.
 
 **Step 1: Write the failing tests**
 
 ```python
 def test_derive_d3_threshold_end_to_end(tmp_path, monkeypatch):
-    cfg_file = _seed_d3_inputs_chain(tmp_path, monkeypatch)
+    seed = _seed_d3_inputs_chain(tmp_path, monkeypatch)
     result = runner.invoke(
-        app, ["build-d3-inputs", "--config", str(cfg_file), "--date", "2026-08-18"]
+        app, ["build-d3-inputs", "--config", str(seed.cfg_file), "--date", "2026-08-18"]
     )
     assert result.exit_code == 0, result.output
     result = runner.invoke(
-        app,
-        ["derive-d3-threshold", "--config", str(cfg_file), "--date", "2026-08-19"],
+        app, ["derive-d3-threshold", "--config", str(seed.cfg_file), "--date", "2026-08-19"]
     )
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload["n_star"] in {9, 16, 25, 36, 49, 64, 100, 144}
     report = json.loads(
-        (tmp_path / "data" / "reports" / "d3-threshold" / "2026-08-19"
+        (tmp_path / "data" / "curated" / "d3-threshold" / "2026-08-19"
          / "threshold.json").read_text()
     )
     assert report["nominal_area_m2"] == 900 * payload["n_star"]
-    assert report["protocol_digest"] == payload_digest_from_freeze  # bind via seed helper
+    assert report["protocol_digest"] == seed.protocol_digest
+    assert len(report["adequate_strata"]) + len(report["inadequate_strata"]) == 54
 
 
 def test_derive_d3_threshold_refuses_digest_mismatch(tmp_path, monkeypatch):
-    # Build inputs, then re-freeze a MODIFIED protocol so the frozen digest
-    # no longer matches the tables' protocol_digest column.
+    # Build inputs, delete the frozen protocol dir, re-freeze a MODIFIED
+    # protocol under a new date -> frozen digest no longer matches tables.
     ...
     assert result.exit_code == 1
     assert "different protocol" in result.output
 
 
 def test_derive_d3_threshold_refuses_missing_inputs(tmp_path, monkeypatch):
-    cfg_file = _seed_d3_inputs_chain(tmp_path, monkeypatch)
+    seed = _seed_d3_inputs_chain(tmp_path, monkeypatch)
     result = runner.invoke(
-        app,
-        ["derive-d3-threshold", "--config", str(cfg_file), "--date", "2026-08-19"],
+        app, ["derive-d3-threshold", "--config", str(seed.cfg_file), "--date", "2026-08-19"]
     )
     assert result.exit_code == 1
     assert "d3-inputs" in result.output
 ```
 
-(`payload_digest_from_freeze`: have `_seed_d3_inputs_chain` return the
-frozen digest alongside the config path — adjust the Task 12 tests'
-unpacking accordingly, or return a small named tuple.)
+**Step 2: Run to verify they fail** — unknown command.
 
-**Step 2: Run them to verify they fail**
-
-Run: `uv run pytest tests/test_cli.py -k derive_d3_threshold -q`
-Expected: FAIL (unknown command)
-
-**Step 3: Implement the command** per the gate order and output contract
-above.
+**Step 3: Implement** per the gates and output contract.
 
 **Step 4: Run the tests to verify they pass**
 
@@ -2873,13 +2981,14 @@ Expected: PASS (3 tests)
 - Modify: `tests/test_register.py`
 - Modify: `tests/test_cli.py`
 
-**Part A — schema.** Add to `register.py`:
+**Part A — schema.** Add to `register.py` (nullability per D13 D5 —
+`d3_threshold_px` and `d3_eligible` are NULLABLE):
 
 ```python
 D3_ELIGIBILITY_COLUMNS = (
     "effective_pixel_support_px",  # int64, nullable (null = not computed)
-    "d3_threshold_px",             # int64, non-null (the applied n_star)
-    "d3_eligible",                 # bool, non-null
+    "d3_threshold_px",             # int64, nullable
+    "d3_eligible",                 # bool, nullable
     "trajectory_status",           # string, non-null, one of _TRAJECTORY_STATUSES
 )
 
@@ -2892,50 +3001,54 @@ _TRAJECTORY_STATUSES = (
 )
 ```
 
-plus `ELIGIBLE_REGISTER_SCHEMA` = `ENRICHED_REGISTER_SCHEMA` + the four
-fields (`effective_pixel_support_px` nullable int64; others non-null;
-follow how `ENRICHED_REGISTER_SCHEMA` extends the base — read it first).
+`ELIGIBLE_REGISTER_SCHEMA` = `ENRICHED_REGISTER_SCHEMA` + the four fields
+(follow how `ENRICHED_REGISTER_SCHEMA` extends the base — read it first).
 
-Status assignment rules (exactly one per site, first match wins):
-1. site not in `tier1_population` high-confidence crosswalk →
-   `crosswalk_not_high_confidence`;
-2. crosswalked but footprint geometry missing/invalid (support
-   not-computed, `None` from `build_pixel_support`) →
+**Status assignment (exactly one per site, first match wins; D13 D5 test
+"unmatched and unusable footprints receive no_usable_footprint"):**
+
+1. site matched to NO Maus footprint at all, OR matched to a footprint
+   whose support is not-computed (missing/invalid geometry) →
    `no_usable_footprint`;
-3. support computed but `< d3_threshold_px` →
-   `insufficient_pixel_support`;
-4. threshold report has `criteria_passed` False → every otherwise-eligible
-   site gets `threshold_not_computed` (the 144 fallback is applied as the
-   threshold but flagged — D13: eligibility under an unvalidated
-   threshold is disclosed, not silently granted). `d3_eligible` is True
-   ONLY for `trajectory_status == "eligible"`.
-5. otherwise → `eligible`.
+2. site matched but not in the HIGH-confidence `tier1_population` →
+   `crosswalk_not_high_confidence`;
+3. threshold artefact has `criteria_passed=False` → every site that would
+   otherwise be judged → `threshold_not_computed`, `d3_eligible=False`,
+   `d3_threshold_px=144` (forced value applied and disclosed, decision 14);
+4. computed support < `n_star` → `insufficient_pixel_support`,
+   `d3_eligible=False`;
+5. otherwise → `eligible`, `d3_eligible=True`.
 
-Register tests (in `tests/test_register.py`): schema field
-count/nullability; a table with a status outside `_TRAJECTORY_STATUSES`
-fails validation; `d3_eligible` True with a non-eligible status fails
-validation (add a consistency check to the existing validate function —
-read how `ENRICHED_REGISTER_SCHEMA` validation hooks in first).
+`d3_eligible` is True ONLY for `eligible`; it is False for statuses 3–4
+and NULL for statuses 1–2 (no judgement was possible — the nullable
+fields exist to represent exactly this). `d3_threshold_px` is the applied
+`n_star` on every judged row (3–5) and NULL on 1–2.
+
+Register tests: schema field count/nullability; unknown status fails
+validation; `d3_eligible=True` with non-eligible status fails validation;
+null `d3_eligible` with status 3–5 fails validation.
 
 **Part B — CLI.** `apply-d3-threshold --config ... --date ...`:
 
-Gates: enriched register (with coverage columns, digest-verified) +
-crosswalk + footprint areas (Maus digest equality, as Task 12 gates 2–4)
-+ latest `reports/d3-threshold/<date>/threshold.json` digest-verified +
-its `protocol_digest` equals the frozen protocol's. Per-site support
-comes from the `build-d3-inputs` support computation — but Task 12 only
-persisted SELECTED footprints. Persist per-site support in Task 12 as a
-third table `site_support.parquet` (site_id, maus_id, effective_pixel
-_support_px nullable, support_not_computed_reason nullable string,
-protocol_digest) — go back and add it to Task 12's outputs, schema next
-to the other two, one more assertion in the end-to-end test. This command
-then joins register × site_support × threshold.
+Gates: enriched register (coverage columns, digest-verified) + crosswalk
+(digest-verified) + latest `curated/d3-threshold/<date>/threshold.json`
+digest-verified with `protocol_digest` equal to the single frozen
+protocol's + **latest `curated/d3-inputs/<date>/footprint_support.parquet`
+digest-verified via its manifest, its `protocol_digest` matching the
+threshold's** (the support table is a gated input like any other — an
+unverified support table must not determine eligibility). Refuse when the
+threshold artefact is missing or altered; a `criteria_passed=False`
+artefact is applied per decision 14, never refused.
 
-Output: `curated/register/<date>/register.parquet` under
-`ELIGIBLE_REGISTER_SCHEMA` (a NEW dated register version — same
-convention as `build-dea-coverage`, distinct date). Success echo:
-`{"output_path", "d3_threshold_px", "criteria_passed", "n_eligible",
-"n_by_status": {...}, "rows": ..., "manifest_path"}` with rows-in =
+Join: register sites × crosswalk (all confidence tiers, to distinguish
+rule 1 from rule 2) × footprint_support on `maus_id`. Output: a NEW dated
+`curated/register/<date>/register.parquet` under
+`ELIGIBLE_REGISTER_SCHEMA` (distinct date, as `build-dea-coverage`).
+Manifest records status counts, computed/zero/not-computed support
+counts, threshold digest, `criteria_passed`, and (when False) the
+failed-criteria disclosure copied from the threshold artefact. Success
+echo: `{"output_path", "d3_threshold_px", "criteria_passed",
+"n_eligible", "n_by_status": {...}, "rows", "manifest_path"}`; rows-in ==
 rows-out asserted.
 
 **Step 1: Write the failing tests**
@@ -2947,17 +3060,32 @@ def test_apply_d3_threshold_assigns_every_site_exactly_one_status(tmp_path, monk
     out = tables.read_table(register_path)
     assert len(out) == n_register_rows
     assert set(out["trajectory_status"]) <= set(register._TRAJECTORY_STATUSES)
-    assert (out["d3_eligible"] == (out["trajectory_status"] == "eligible")).all()
+    eligible_mask = out["trajectory_status"] == "eligible"
+    assert (out.loc[eligible_mask, "d3_eligible"] == True).all()  # noqa: E712
+    assert not out.loc[~eligible_mask, "d3_eligible"].fillna(False).any()
     payload = json.loads(result.output)
     assert sum(payload["n_by_status"].values()) == len(out)
 
 
-def test_apply_d3_threshold_flags_unvalidated_threshold(tmp_path, monkeypatch):
-    # Arrange a threshold report with criteria_passed false (edit the seed
-    # fixture values so no reduced support passes), then assert every
-    # otherwise-eligible site carries threshold_not_computed and
-    # d3_eligible is False everywhere.
+def test_apply_d3_threshold_unmatched_site_is_no_usable_footprint(tmp_path, monkeypatch):
+    # A register site absent from the crosswalk entirely.
     ...
+    assert row["trajectory_status"] == "no_usable_footprint"
+    assert pd.isna(row["d3_eligible"]) and pd.isna(row["d3_threshold_px"])
+
+
+def test_apply_d3_threshold_forced_144_discloses(tmp_path, monkeypatch):
+    # Fixture values tuned so no reduced support passes ->
+    # criteria_passed False; command still succeeds; all judged sites
+    # threshold_not_computed with d3_threshold_px == 144; manifest carries
+    # failed-criteria disclosure.
+    ...
+
+
+def test_apply_d3_threshold_refuses_unverified_support_table(tmp_path, monkeypatch):
+    # Corrupt footprint_support.parquet after its manifest is written.
+    ...
+    assert result.exit_code == 1
 
 
 def test_apply_d3_threshold_refuses_protocol_mismatch(tmp_path, monkeypatch):
@@ -2966,9 +3094,7 @@ def test_apply_d3_threshold_refuses_protocol_mismatch(tmp_path, monkeypatch):
     assert "protocol" in result.output
 ```
 
-**Step 2: Run to verify they fail** — `uv run pytest tests/test_cli.py -k
-apply_d3_threshold -q` → FAIL (unknown command); register tests FAIL on
-missing schema.
+**Step 2: Run to verify they fail** — unknown command / missing schema.
 
 **Step 3: Implement** Part A then Part B.
 
@@ -2986,65 +3112,53 @@ Expected: PASS
 - Create: `docs/checkpoints/batch-d-result.md`
 
 **Step 1: Write the acceptance tests** — one fixture-driven end-to-end
-run of the full chain (`fetch-region-boundaries` → `freeze-d3-protocol` →
-`build-d3-inputs` → `derive-d3-threshold` → `apply-d3-threshold`) in one
-test module, then assertions mapped one-to-one to D13 §4's Batch D
-acceptance criteria (read lines 274–483 and quote each criterion in the
-test's docstring):
+chain (`fetch-region-boundaries` → `freeze-d3-protocol` →
+`build-d3-inputs` → `derive-d3-threshold` → `apply-d3-threshold`), then
+assertions mapped one-to-one to D13 §4's acceptance criteria (quote each
+criterion in the docstring):
 
-```python
-class TestBatchDAcceptance:
-    """Each test quotes the D13 SS4 criterion it verifies."""
+- `test_protocol_frozen_before_any_spectral_read` — the d3-inputs
+  manifest records the protocol digest as an input; freezing after
+  results is impossible (single-lineage refusal exercised).
+- `test_no_accuracy_result_can_change_sample_definitions` — build TWO
+  independently seeded, independently finalized fixture chains whose
+  spectral VALUES differ but whose null masks are identical (two separate
+  `_seed_d3_inputs_chain` invocations parameterized by a value offset —
+  never mutate a finalized snapshot in place); assert identical
+  `footprint_support.selected` sets and identical `stratum_summary`, with
+  different `full_value`s.
+- `test_every_register_row_has_exactly_one_trajectory_status`.
+- `test_sparse_strata_disclosed_not_pooled` — stratum_summary always has
+  54 rows; inadequate strata appear in the threshold report.
+- `test_determinism_same_inputs_same_outputs` — run `build-d3-inputs`
+  twice into two dates from the SAME seed; table contents equal
+  (compare DataFrames, not file bytes — manifests differ by date).
+- `test_refusals_are_structured_json` — each refusal exercised above
+  emitted `{"refusal": ...}` on stdout.
 
-    def test_protocol_frozen_before_any_spectral_read(...):
-        # manifest timestamps: protocol.json manifest precedes the
-        # d3-inputs manifests in the chain fixture; the d3-inputs manifest
-        # RECORDS the protocol digest as an input.
-
-    def test_no_accuracy_result_can_change_sample_definitions(...):
-        # selection inputs (adequacy counts, selected maus_ids) recorded in
-        # the d3-inputs manifest depend only on computability counts;
-        # rebuild with perturbed band VALUES (same nulls) -> identical
-        # selection, different metric values.
-
-    def test_every_register_row_has_exactly_one_trajectory_status(...):
-
-    def test_determinism_same_inputs_same_outputs(...):
-        # run build-d3-inputs twice into two dates; parquet bytes of
-        # support_inputs equal after dropping the date-dependent manifest.
-
-    def test_refusals_are_structured_json(...):
-        # each refusal exercised above emitted {"refusal": ...} on stdout.
-```
-
-Fill in real bodies — the sketches name the intent; the arrange code
-reuses `_seed_d3_inputs_chain`. Also verify the perturbed-values rebuild
-uses a distinct `--date` (existing-output refusal otherwise).
-
-**Step 2: Run** `uv run pytest tests/test_batch_d_acceptance.py -q` →
-grow them red-to-green individually if any fail; all must pass without
-touching src (they exercise already-built behaviour — a failure here is a
-Task 1–15 bug: run `kit:debugging` before fixing).
+**Step 2: Run** `uv run pytest tests/test_batch_d_acceptance.py -q` —
+all must pass without touching src (a failure here is a Task 1–15 bug:
+run `kit:debugging` before fixing).
 
 **Step 3: Checkpoint skeleton** — `docs/checkpoints/batch-d-result.md`
-mirroring `batch-c-result.md`'s structure: status line (fixture suite
-green, live run PENDING), `_pending_` fields for the live run (frozen
-protocol digest; regions fetch date + gpkg sha256; candidate/selected
-footprint counts per stratum; site-years simulated / not computable;
-n_star, criteria_passed, per-criterion margins; eligibility counts by
-trajectory_status), and a "Live run" section stating: extraction executes
-on luminosity (`/mnt/data`, per batch-c-result.md host decision),
-windowed streaming reads budgeted per 800×800 block, run deferred to a
-human-reviewed session — record the four-command chain with explicit
-`--date` flags, mirroring the Batch C handoff format.
+mirroring `batch-c-result.md`: status line (fixture suite green, live run
+PENDING), `_pending_` fields (frozen protocol digest; regions fetch date
++ gpkg sha256; candidate/selected footprint counts per stratum;
+footprint-years simulated / not computable; n_star, criteria_passed,
+per-criterion margins with counts; eligibility counts by
+trajectory_status), and a "Live run" section stating: execution on
+luminosity (`/mnt/data`, per batch-c-result.md), streaming reads with the
+bounded block cache (design decision 17) — **disk requirement = cache
+bound (default 50 GB), transfer budget 597 GB–3.30 TB block-granular**,
+run deferred to a human-reviewed session.
 
 **Step 4: Full battery**
 
 Run: `uv run ruff check src tests && uv run ruff format --check src tests && uv run mypy src && uv run pytest -q`
 Expected: all clean, full suite green (554 pre-batch tests + all new).
 
-**Step 5 (DEFERRED — live run):** Not part of this build. The live chain
-runs on luminosity in a later human-reviewed session:
+**Step 5 (DEFERRED — live run):** Not part of this build. The live
+five-command chain runs on luminosity in a later human-reviewed session:
 
 ```
 uv run wa-mine-monitor fetch-region-boundaries --config config/<cfg>.yaml --date <YYYY-MM-DD>
@@ -3054,14 +3168,30 @@ uv run wa-mine-monitor derive-d3-threshold     --config config/<cfg>.yaml --date
 uv run wa-mine-monitor apply-d3-threshold      --config config/<cfg>.yaml --date <YYYY-MM-DD>
 ```
 
-then fill the checkpoint's `_pending_` fields. Watch items: the frozen
-protocol digest must be committed BEFORE `build-d3-inputs` runs live;
-`build-d3-inputs` is the batch's big network step (~hundreds of GB of
-block-granular COG reads) — confirm `/mnt/data` free space ≥ 600 GB
-first, and if the DPIRD-020 download URL has moved, re-verify the licence
-page before re-pinning.
+then fill the checkpoint. Watch items: the frozen `protocol.json`, its
+run manifest, and `config/d3.yaml` must be **git-committed (clean tree,
+commit recorded in the freeze manifest's git state) BEFORE
+`build-d3-inputs` runs live** — "committed" means exactly that;
+`build-d3-inputs` is the batch's big network step — confirm `/mnt/data`
+free space ≥ the configured block-cache bound plus output headroom
+(NOT ≥ transfer volume; decision 17); if the DPIRD-020 download URL has
+moved, re-verify the licence page before re-pinning.
 
 ---
+
+## Codex review adjudication (2026-08-16)
+
+The plan was attacked pre-build by codex against a self-contained package
+(plan + D13 §4 + Batch C facts + module API surface): 16 blockers, 22
+majors, 4 minors. ALL findings were accepted and applied in place —
+design decisions 6–7 rewritten, decisions 9–17 added, amendment blocks
+appended to Tasks 2–8, Tasks 10–16 rewritten. Spec-interpretation rulings
+(frozen before any spectral read): pooled-P90 statistic (decision 6),
+computable fraction as data-completeness (decision 12), two-phase
+extraction (decision 11), footprint unit + stratum identity (decisions
+9–10), single protocol lineage + procedures digest (decision 13),
+threshold path/nullability/API corrected to D13's letter (decision 14,
+Tasks 13–15). Raw findings: `docs/reviews/2026-08-16-codex-batch-d-plan-attack.md`.
 
 ## Execution notes
 
@@ -3071,3 +3201,5 @@ page before re-pinning.
   Tasks 11–16 are strictly sequential.
 - The full battery command appears in Tasks 12 and 16; run it at least at
   those two points and always before finishing.
+- Where an amendment block contradicts its task's earlier text, the
+  amendment is binding.
