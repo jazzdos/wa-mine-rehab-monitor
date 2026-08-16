@@ -97,3 +97,15 @@ register and enriched register carry distinct dates).
   Because block-size metadata is absent (range-request
   count null), the extraction plan must verify actual COG block layout
   on a sampled asset before committing to the streaming budget.
+- COG block layout VERIFIED live (same day, from luminosity, one sampled
+  asset per collection read via rasterio 1.5.1 over HTTPS): all four
+  collections serve 3,200×3,200 tiled COGs with **800×800 internal
+  blocks**, deflate compression, overview levels 2/4/8/16/32; dtypes
+  uint8 (dea_fc_pc) and float32 (geomedians), consistent with the
+  estimate's observed `bytes_per_pixel`. Consequence for the streaming
+  plan: reads are block-granular — a floor window (67 px) intersects
+  1–4 blocks, so each site-year-asset read transfers whole 800×800
+  blocks (0.64–2.56 MB uncompressed each, less after deflate), not the
+  window's naive byte count. Effective transfer sits between the 597 GB
+  windowed estimate and the 3.30 TB whole-tile bound; the extraction
+  plan (Batch E) must budget per-block, not per-window.
