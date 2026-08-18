@@ -1329,7 +1329,12 @@ _D3_BAND_VALUE_FNS: dict[str, "object"] = {
 
 
 def _seed_d3_rasters(
-    tmp_path: Path, origin_x: float, origin_y: float, width: int, height: int
+    tmp_path: Path,
+    origin_x: float,
+    origin_y: float,
+    width: int,
+    height: int,
+    n_uncomputable_years: int = 0,
 ) -> dict[tuple[str, int], str]:
     """Write one small GeoTIFF per (band asset key, fixture year), filled
     UNIFORMLY over the whole tile (no nodata anywhere) so every footprint's
@@ -1343,15 +1348,18 @@ def _seed_d3_rasters(
     raster_dir.mkdir(exist_ok=True)
     hrefs: dict[tuple[str, int], str] = {}
     for band, value_fn in _D3_BAND_VALUE_FNS.items():
-        for year in _D3_YEARS:
+        years = list(_D3_YEARS) + [2020 + i for i in range(n_uncomputable_years)]
+        for year in years:
             array = np.full((height, width), value_fn(year), dtype=np.int16)
+            if n_uncomputable_years > 0 and year >= 2020 and band == "bs_pc_50":
+                array[0, 0] = 255
             path = raster_dir / f"{band}_{year}.tif"
             _write_geotiff(path, array, origin=(origin_x, origin_y))
             hrefs[(band, year)] = str(path)
     return hrefs
 
 
-def _d3_dea_fixture_pages(hrefs: dict[tuple[str, int], str]) -> dict:
+def _d3_dea_fixture_pages(hrefs: dict[tuple[str, int], str], n_uncomputable_years: int = 0) -> dict:
     """Ten-year, single-tile STAC fixture pages for every `DEA_COLLECTIONS`
     spec: one item per (collection, year), all on `_D3_TILE_ID`. The three
     geomedian band assets (or the three FC `_pc_50` assets) resolve to real
@@ -1378,7 +1386,8 @@ def _d3_dea_fixture_pages(hrefs: dict[tuple[str, int], str]) -> dict:
             "links": [],
         }
         features = []
-        for year in _D3_YEARS:
+        years = list(_D3_YEARS) + [2020 + i for i in range(n_uncomputable_years)]
+        for year in years:
             if spec.source_id == "dea_fc_pc":
                 band_keys = ("bs_pc_50", "pv_pc_50", "npv_pc_50")
             else:
@@ -1526,6 +1535,7 @@ def _seed_d3_inputs_chain(
     *,
     build_coverage: bool = True,
     extra_register_rows: list[dict] | None = None,
+    n_uncomputable_years: int = 0,
 ) -> D3Seed:
     """Arrange the full input chain `build-d3-inputs` reads, via the
     already-tested CLI seams, ending with a frozen D3 protocol. Returns a
@@ -1546,11 +1556,11 @@ def _seed_d3_inputs_chain(
 
     specs = _d3_footprint_specs()
     origin_x, origin_y, width, height = _d3_raster_grid(specs)
-    hrefs = _seed_d3_rasters(tmp_path, origin_x, origin_y, width, height)
+    hrefs = _seed_d3_rasters(tmp_path, origin_x, origin_y, width, height, n_uncomputable_years)
 
     _seed_d3_register(data_root, "2026-08-10", specs, extra_rows=extra_register_rows)
 
-    fake = _FakeCatalogueClient(_d3_dea_fixture_pages(hrefs))
+    fake = _FakeCatalogueClient(_d3_dea_fixture_pages(hrefs, n_uncomputable_years))
     monkeypatch.setattr("wa_mine_monitor.cli.new_dea_client", lambda: fake)
     catalogue_result = runner.invoke(
         app, ["fetch-dea-catalogue", "--config", str(cfg_file), "--date", "2026-08-11"]
@@ -2044,3 +2054,51 @@ def test_apply_d3_threshold_refuses_protocol_mismatch(tmp_path, monkeypatch):
     )
     assert result.exit_code == 1, result.output
     assert "protocol" in result.output
+
+
+def test_apply_d3_threshold_forced_144_discloses(tmp_path, monkeypatch):
+    import json
+    from pathlib import Path
+
+    from wa_mine_monitor import tables
+
+    seed = _seed_d3_inputs_chain(tmp_path, monkeypatch, n_uncomputable_years=2)
+
+    result = runner.invoke(
+        app, ["build-d3-inputs", "--config", str(seed.cfg_file), "--date", "2026-08-18"]
+    )
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(
+        app, ["derive-d3-threshold", "--config", str(seed.cfg_file), "--date", "2026-08-19"]
+    )
+    assert result.exit_code == 0, result.output
+
+    threshold_path = (
+        tmp_path / "data" / "curated" / "d3-threshold" / "2026-08-19" / "threshold.json"
+    )
+    with open(threshold_path) as f:
+        threshold = json.load(f)
+    assert threshold["criteria_passed"] is False
+
+    result = runner.invoke(
+        app, ["apply-d3-threshold", "--config", str(seed.cfg_file), "--date", "2026-08-20"]
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+
+    out = tables.read_table(Path(payload["output_path"]))
+    judged_mask = ~out["trajectory_status"].isin(
+        ["no_usable_footprint", "crosswalk_not_high_confidence"]
+    )
+    judged = out[judged_mask]
+
+    assert (judged["trajectory_status"] == "threshold_not_computed").all()
+    assert (judged["d3_threshold_px"] == 144).all()
+    assert (judged["d3_eligible"] == False).all()
+
+    manifest_path = Path(payload["manifest_path"])
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+    print("MANIFEST:", manifest.keys()); assert "failed_criteria" in manifest.get("resolved_args", {})
+    assert len(manifest["resolved_args"]["failed_criteria"]) > 0
