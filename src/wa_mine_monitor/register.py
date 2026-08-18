@@ -51,6 +51,7 @@ import pandas as pd
 import pyarrow as pa
 from shapely.geometry import Point
 
+from wa_mine_monitor import d3_protocol
 from wa_mine_monitor.snapshots import latest_dated_subdir
 
 #: The single declared CRS `build_register`'s `lon`/`lat` output columns are
@@ -1113,3 +1114,235 @@ def enrich_register_with_dea_coverage(
     for column in DEA_COVERAGE_COLUMNS:
         enriched[column] = coverage_df[column].array
     return enriched
+
+
+#: The four columns `apply-d3-threshold` appends on top of `ENRICHED_
+#: REGISTER_SCHEMA` (D13 D5) -- named here so a caller can enumerate them
+#: without re-deriving the set from `ELIGIBLE_REGISTER_SCHEMA`'s tail.
+D3_ELIGIBILITY_COLUMNS: tuple[str, ...] = (
+    "effective_pixel_support_px",
+    "d3_threshold_px",
+    "d3_eligible",
+    "trajectory_status",
+)
+
+#: The five `trajectory_status` categories `apply-d3-threshold` assigns,
+#: exactly one per register row (D13 D5) -- `validate_eligible_register`
+#: refuses any value outside this set.
+_TRAJECTORY_STATUSES: tuple[str, ...] = (
+    "eligible",
+    "no_usable_footprint",
+    "crosswalk_not_high_confidence",
+    "insufficient_pixel_support",
+    "threshold_not_computed",
+)
+
+#: The three "judged" statuses -- a site that reached the pixel-support
+#: comparison (or the forced-144 fallback, decision 14) always carries a
+#: computed `d3_eligible` (`True`/`False`), never `pd.NA`. `no_usable_
+#: footprint`/`crosswalk_not_high_confidence` are the only statuses where no
+#: judgement was ever possible, and `d3_eligible` is `pd.NA` on those.
+_JUDGED_TRAJECTORY_STATUSES: frozenset[str] = frozenset(
+    {"threshold_not_computed", "insufficient_pixel_support", "eligible"}
+)
+
+#: `ENRICHED_REGISTER_SCHEMA` plus the four D5 eligibility fields -- built
+#: FROM the enriched schema, the same way `ENRICHED_REGISTER_SCHEMA` is
+#: itself built from `REGISTER_SCHEMA`, so the three can never drift apart.
+#: `effective_pixel_support_px`/`d3_threshold_px`/`d3_eligible` are NULLABLE
+#: (null = no judgement was possible -- `no_usable_footprint`/`crosswalk_
+#: not_high_confidence`); `trajectory_status` is non-null -- every register
+#: row is assigned exactly one of `_TRAJECTORY_STATUSES`, never left
+#: unclassified.
+ELIGIBLE_REGISTER_SCHEMA = pa.schema(
+    list(ENRICHED_REGISTER_SCHEMA)
+    + [
+        pa.field("effective_pixel_support_px", pa.int64(), nullable=True),
+        pa.field("d3_threshold_px", pa.int64(), nullable=True),
+        pa.field("d3_eligible", pa.bool_(), nullable=True),
+        pa.field("trajectory_status", pa.string(), nullable=False),
+    ]
+)
+
+
+class TrajectoryStatusError(ValueError):
+    """`trajectory_status`/`d3_eligible` on an `ELIGIBLE_REGISTER_SCHEMA`
+    frame violates D13 D5's invariants -- refused."""
+
+
+def validate_eligible_register(df: pd.DataFrame) -> None:
+    """Validate D5's `trajectory_status`/`d3_eligible` invariants on an
+    `ELIGIBLE_REGISTER_SCHEMA`-shaped `df`. Raises `TrajectoryStatusError`,
+    naming every violation found, rather than accepting a malformed row
+    silently -- called by `apply-d3-threshold` on its own output before it
+    is written, the same "never write a state the module itself would
+    refuse to read back" discipline `reconcile_counts` applies to
+    `register_counts`.
+
+    Three checks, all independent (every one that fires is named, not just
+    the first):
+
+    - every `trajectory_status` value is one of `_TRAJECTORY_STATUSES` --
+      an unrecognised status is refused rather than silently accepted.
+    - `d3_eligible == True` is permitted ONLY on `trajectory_status ==
+      "eligible"` -- a judged-ineligible or unjudged row can never carry a
+      fabricated `True`.
+    - `d3_eligible` is refused NULL on a JUDGED status
+      (`_JUDGED_TRAJECTORY_STATUSES`: `threshold_not_computed`,
+      `insufficient_pixel_support`, `eligible`) -- these three statuses
+      always carry a computed verdict; only `no_usable_footprint`/
+      `crosswalk_not_high_confidence` (no judgement was ever possible) may
+      carry a null `d3_eligible`.
+    """
+    statuses = df["trajectory_status"]
+    unknown = sorted(set(statuses.dropna().astype(str)) - set(_TRAJECTORY_STATUSES))
+    if unknown:
+        raise TrajectoryStatusError(
+            f"{len(unknown)} unknown trajectory_status value(s) {unknown} -- every row must "
+            f"carry one of {list(_TRAJECTORY_STATUSES)}"
+        )
+
+    eligible = df["d3_eligible"]
+    eligible_is_true = (eligible == True).fillna(False)
+    bad_true = eligible_is_true & (statuses != "eligible")
+    if bad_true.any():
+        raise TrajectoryStatusError(
+            f"{int(bad_true.sum())} row(s) carry d3_eligible=True with a trajectory_status "
+            "other than 'eligible' -- d3_eligible=True is refused on any judged-ineligible or "
+            "unjudged row"
+        )
+
+    is_judged = statuses.isin(_JUDGED_TRAJECTORY_STATUSES)
+    bad_null = is_judged & eligible.isna()
+    if bad_null.any():
+        raise TrajectoryStatusError(
+            f"{int(bad_null.sum())} row(s) carry a judged trajectory_status "
+            f"({sorted(_JUDGED_TRAJECTORY_STATUSES)}) but a null d3_eligible -- a judged "
+            "status always carries a computed True/False verdict"
+        )
+
+
+#: `assign_trajectory_eligibility`'s required `crosswalk_df`/`footprint_
+#: support_df` columns -- presence-checked before either frame is indexed,
+#: the same discipline `owners_by_project`'s `_REQUIRED_OWNERS_COLUMNS`
+#: applies.
+_REQUIRED_CROSSWALK_ELIGIBILITY_COLUMNS: frozenset[str] = frozenset(
+    {"site_id", "maus_id", "confidence"}
+)
+_REQUIRED_FOOTPRINT_SUPPORT_COLUMNS: frozenset[str] = frozenset(
+    {"maus_id", "effective_pixel_support_px"}
+)
+
+
+def assign_trajectory_eligibility(
+    register_df: pd.DataFrame,
+    crosswalk_df: pd.DataFrame,
+    footprint_support_df: pd.DataFrame,
+    *,
+    n_star: int,
+    criteria_passed: bool,
+) -> pd.DataFrame:
+    """Append the four D5 eligibility columns (`D3_ELIGIBILITY_COLUMNS`)
+    onto `register_df`, exactly one `trajectory_status` per row (D13 D5,
+    `apply-d3-threshold`). Row identity, count and order are NEVER touched
+    -- the same append-only discipline `enrich_register_with_dea_coverage`
+    applies to the DEA coverage columns.
+
+    Status assignment, exactly one per row, first match wins:
+
+    1. `no_usable_footprint` -- `register_df["site_id"]` is absent from
+       `crosswalk_df` entirely (excluded from `build-crosswalk`'s own
+       input population: no usable location, or a duplicated `site_id`;
+       `crosswalk.filter_register_for_crosswalk`), OR the site's matched
+       `maus_id` carries no computed `effective_pixel_support_px` in
+       `footprint_support_df` (missing/invalid Maus geometry -- a null
+       value there). `d3_eligible` and `d3_threshold_px` are both NULL: no
+       judgement was ever possible.
+    2. `crosswalk_not_high_confidence` -- the site IS present in
+       `crosswalk_df` but its `confidence` is not `"high"`. NULL/NULL,
+       same as (1).
+    3. `threshold_not_computed` -- `criteria_passed` is `False`: EVERY
+       remaining (matched, high-confidence, support-computed) site lands
+       here, `d3_eligible=False`, `d3_threshold_px=144`
+       (`d3_protocol.MIN_FULL_SUPPORT_PX`) -- the forced value applied and
+       disclosed (decision 14), never a refusal.
+    4. `insufficient_pixel_support` -- `criteria_passed` is `True` and the
+       site's `effective_pixel_support_px < n_star`: `d3_eligible=False`,
+       `d3_threshold_px=n_star`.
+    5. `eligible` -- otherwise: `d3_eligible=True`, `d3_threshold_px=n_star`.
+
+    A site with more than one candidate `maus_id` row in `crosswalk_df` (an
+    ambiguous match -- `ambiguity_n > 1`, which can only occur at
+    `confidence == "high"`: two or more overlapping Maus polygons both
+    containing the same point) is reduced to ONE representative row before
+    the join, deterministically: `crosswalk_df` sorted by
+    `(site_id, maus_id)`, keeping the first (lexicographically smallest
+    `maus_id`) row per site. There is no ruling on which overlapping
+    polygon should be preferred, so a fixed, row-order-independent
+    tie-break is used rather than silently depending on `crosswalk_df`'s
+    incoming row order; `confidence` itself is uniform per site regardless
+    (`crosswalk.crosswalk_counts`'s own docstring), so this tie-break only
+    ever changes WHICH footprint's support an ambiguous high-confidence
+    site is judged against, never a site's rule-1-vs-rule-2 classification.
+    """
+    missing_crosswalk = sorted(_REQUIRED_CROSSWALK_ELIGIBILITY_COLUMNS - set(crosswalk_df.columns))
+    if missing_crosswalk:
+        raise ValueError(
+            f"crosswalk_df is missing required column(s) {missing_crosswalk} "
+            f"(columns present: {sorted(crosswalk_df.columns)})"
+        )
+    missing_support = sorted(
+        _REQUIRED_FOOTPRINT_SUPPORT_COLUMNS - set(footprint_support_df.columns)
+    )
+    if missing_support:
+        raise ValueError(
+            f"footprint_support_df is missing required column(s) {missing_support} "
+            f"(columns present: {sorted(footprint_support_df.columns)})"
+        )
+
+    crosswalk_dedup = crosswalk_df.sort_values(
+        ["site_id", "maus_id"], na_position="last", kind="stable"
+    ).drop_duplicates(subset="site_id", keep="first")
+    maus_id_by_site = crosswalk_dedup.set_index("site_id")["maus_id"]
+    confidence_by_site = crosswalk_dedup.set_index("site_id")["confidence"]
+    # `footprint_support_df` already carries one row per DISTINCT maus_id
+    # (build-d3-inputs' own docstring); `drop_duplicates` is defensive only.
+    support_by_maus = footprint_support_df.drop_duplicates(
+        subset="maus_id", keep="first"
+    ).set_index("maus_id")["effective_pixel_support_px"]
+
+    matched_maus_id = register_df["site_id"].map(maus_id_by_site)
+    confidence = register_df["site_id"].map(confidence_by_site)
+    effective_support = matched_maus_id.map(support_by_maus)
+
+    no_footprint_mask = matched_maus_id.isna()
+    not_high_confidence_mask = ~no_footprint_mask & (confidence != "high")
+    high_confidence_mask = ~no_footprint_mask & (confidence == "high")
+    support_not_computed_mask = high_confidence_mask & effective_support.isna()
+    judged_mask = high_confidence_mask & effective_support.notna()
+
+    status = pd.Series("", index=register_df.index, dtype="object")
+    status.loc[no_footprint_mask | support_not_computed_mask] = "no_usable_footprint"
+    status.loc[not_high_confidence_mask] = "crosswalk_not_high_confidence"
+    if not criteria_passed:
+        status.loc[judged_mask] = "threshold_not_computed"
+    else:
+        insufficient_mask = judged_mask & (effective_support < n_star)
+        eligible_mask = judged_mask & ~insufficient_mask
+        status.loc[insufficient_mask] = "insufficient_pixel_support"
+        status.loc[eligible_mask] = "eligible"
+
+    d3_eligible = pd.Series(pd.NA, index=register_df.index, dtype="boolean")
+    d3_eligible.loc[status == "eligible"] = True
+    d3_eligible.loc[status.isin(["threshold_not_computed", "insufficient_pixel_support"])] = False
+
+    d3_threshold_px = pd.Series(pd.NA, index=register_df.index, dtype="Int64")
+    d3_threshold_px.loc[status == "threshold_not_computed"] = d3_protocol.MIN_FULL_SUPPORT_PX
+    d3_threshold_px.loc[status.isin(["insufficient_pixel_support", "eligible"])] = n_star
+
+    result = register_df.copy()
+    result["effective_pixel_support_px"] = effective_support.astype("Int64")
+    result["d3_threshold_px"] = d3_threshold_px
+    result["d3_eligible"] = d3_eligible
+    result["trajectory_status"] = status
+    return result

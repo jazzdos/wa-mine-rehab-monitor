@@ -298,6 +298,29 @@ SOURCES: dict[str, SourceLicence] = {
             "context is redistributable."
         ),
     ),
+    "wa_rdc_regions": SourceLicence(
+        source_id="wa_rdc_regions",
+        title="WA Regional Development Commission Boundaries (DPIRD-020)",
+        source_url=(
+            "https://catalogue.data.wa.gov.au/dataset/regional-development-commission-boundaries"
+        ),
+        licence_id="CC-BY-4.0",
+        licence_url="https://creativecommons.org/licenses/by/4.0/",
+        attribution_text=(
+            "Contains Regional Development Commission Boundaries (DPIRD-020) "
+            "data © Department of Primary Industries and Regional Development "
+            "(WA), licensed under CC-BY-4.0."
+        ),
+        redistribute_public=True,
+        notes=(
+            "The nine regions defined under the Regional Development "
+            "Commissions Act 1993, pinned as the design doc D4's 'official "
+            "Pilbara and Goldfields-Esperance boundaries'. Licence read from "
+            "the Data WA catalogue record for DPIRD-020 (CC-BY-4.0), "
+            "source CRS GDA94 (EPSG:4283), download via SLIP "
+            "data-downloads.slip.wa.gov.au. Pinned 2026-08-16."
+        ),
+    ),
 }
 
 
