@@ -92,11 +92,24 @@ unchanged, D12.1–3 Batch B closeout built via workflow, merged as
 `72cf280` (440 tests), artefacts rebuilt with the new disclosures
 (`docs/checkpoints/batch-b-closeout.md`).
 
-**Next: D12.4 — the batch detailing pass for Batches C–G**, recording a
-deliberate reuse decision (port vs adopt vs build) per batch; preserve the
-C → D → E → F → G order (D12.5) and stand up the separate Tier 0
-public-RC lane holding the D2 checklist (D12.6). Batch C (DEA
-epoch-coverage) is authorized to start once detailed.
+D12.4 is DONE (later the same day): ruling D13 (Batches C–G detailing and
+reuse adjudication, produced by detached codex consult) is recorded at
+`docs/decisions/2026-08-16-d13-batches-c-g-detailing.md` and committed with
+the implementation plan's reuse-review note as `9697473`. The Batch C
+implementation plan was then drafted via the writing-plans skill at
+`docs/plans/2026-08-16-batch-c-implementation.md` (UNCOMMITTED) — 14 tasks
+covering D13 §3 tasks C1–C6 in failing-test-first steps with complete code.
+A detached codex plan attack returned three finding clusters (C5 estimator
+drifts from D13's required inputs; two manifest-API/sequencing breaks
+against the real `manifests.root_relative_path`; three red steps that fail
+for the wrong reason), all checked and standing; they are recorded IN the
+plan itself under "PRE-BUILD AMENDMENTS REQUIRED" at the top.
+
+**Next: apply the plan's PRE-BUILD AMENDMENTS section (editing the named
+tasks in place, then deleting the section), then execute the plan with the
+kit:build-flow skill.** Read order for a cold resume: the plan's amendments
+section → D13 §3 → the plan's tasks. The Tier 0 public-RC lane (D13 §8)
+may run in parallel.
 
 Doc-reconciliation note: implementation-plan Task 11 still says the evidence
 json should show `adjudicated: false` — written before the D6–D8 rework added
