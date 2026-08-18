@@ -17,7 +17,7 @@ def test_protocol_frozen_before_any_spectral_read(tmp_path, monkeypatch):
         app, ["freeze-d3-protocol", "--config", str(seed.cfg_file), "--date", "2026-08-18"]
     )
     assert result.exit_code != 0
-    assert "already exists" in result.output
+    assert "already has dated directory" in result.output
 
 
 def test_no_accuracy_result_can_change_sample_definitions(tmp_path, monkeypatch):
