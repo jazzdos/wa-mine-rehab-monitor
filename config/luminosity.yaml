@@ -1,0 +1,5 @@
+run:
+  data_root: "/mnt/data/wa-mine-monitor"
+  redistribute_public: false
+sources:
+  minedex_public_export_blocked: true
