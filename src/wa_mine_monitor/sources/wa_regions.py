@@ -18,9 +18,10 @@ from shapely.geometry import MultiPolygon, Polygon
 from wa_mine_monitor import crosswalk
 
 #: Region-name column candidates, in preference order. DPIRD-020's SLIP
-#: exports have carried both spellings; the loader requires exactly one of
-#: them to be present.
-_NAME_COLUMNS: tuple[str, ...] = ("dpird_region_name", "region_name", "name")
+#: exports have carried `dpird_region_name`/`region_name`/`name`; the SLIP
+#: public ArcGIS REST layer (pinned 2026-08-21) carries `region`. The
+#: loader requires exactly one of them to be present.
+_NAME_COLUMNS: tuple[str, ...] = ("dpird_region_name", "region_name", "region", "name")
 
 #: The two regions the D3 protocol names as their own strata. Their absence
 #: means the wrong dataset (or a truncated download) -- refuse, never guess.

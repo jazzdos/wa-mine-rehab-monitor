@@ -999,11 +999,8 @@ def test_derive_dea_volume_refuses_mismatched_maus_digests(tmp_path, monkeypatch
 # --- fetch-region-boundaries CLI command ------------------------------------
 
 
-def _rdc_fixture_gpkg_bytes() -> bytes:
-    """Nine-region synthetic DPIRD-020 stand-in as GeoPackage bytes."""
-    import io
-    from pathlib import Path
-
+def _rdc_fixture_geojson_bytes() -> bytes:
+    """Nine-region synthetic DPIRD-020 stand-in as GeoJSON bytes."""
     names = [
         "Pilbara",
         "Goldfields-Esperance",
@@ -1020,28 +1017,14 @@ def _rdc_fixture_gpkg_bytes() -> bytes:
         geometry=[Polygon([(i, 0), (i + 1, 0), (i + 1, 1), (i, 1)]) for i in range(len(names))],
         crs="EPSG:4283",
     )
-    # Try BytesIO first, fall back to temp file if unsupported
-    try:
-        buffer = io.BytesIO()
-        gdf.to_file(buffer, driver="GPKG")
-        return buffer.getvalue()
-    except Exception:  # noqa: BLE001
-        # Fall back to temp file
-        import tempfile
-
-        with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as f:
-            gdf.to_file(f.name, driver="GPKG")
-            tmp_path = Path(f.name)
-        result = tmp_path.read_bytes()
-        tmp_path.unlink()
-        return result
+    return gdf.to_json().encode("utf-8")
 
 
 def test_fetch_region_boundaries_writes_finalized_snapshot(tmp_path, monkeypatch):
     _init_git_repo(tmp_path)
     monkeypatch.setattr("wa_mine_monitor.cli._REPO_ROOT", tmp_path)
     cfg_file = _write_monitor_config(tmp_path)
-    payload = _rdc_fixture_gpkg_bytes()
+    payload = _rdc_fixture_geojson_bytes()
     monkeypatch.setattr("wa_mine_monitor.cli._fetch_region_boundaries_bytes", lambda: payload)
     result = runner.invoke(
         app,
@@ -1049,19 +1032,60 @@ def test_fetch_region_boundaries_writes_finalized_snapshot(tmp_path, monkeypatch
     )
     assert result.exit_code == 0, result.output
     snapshot_dir = tmp_path / "data" / "raw" / "wa_rdc_regions" / "2026-08-16"
-    assert (snapshot_dir / "regions.gpkg").exists()
+    assert (snapshot_dir / "regions.geojson").exists()
+    assert not (snapshot_dir / "regions.gpkg").exists()
     assert (snapshot_dir / "SHA256SUMS.txt").exists()
     manifest = json.loads((snapshot_dir / "SHA256SUMS.txt.run_manifest.json").read_text())
-    assert manifest["resolved_args"]["source_url"]
+    assert manifest["resolved_args"]["source_url"].startswith(
+        "https://public-services.slip.wa.gov.au/public/rest/services/"
+        "SLIP_Public_Services/Boundaries/MapServer/25/query?"
+    )
     payload_out = json.loads(result.output)
     assert payload_out["region_count"] == 9
+
+
+def test_fetch_region_boundaries_refuses_non_geojson_body(tmp_path, monkeypatch):
+    """A login page (what the old download portal now returns) must be
+    refused by shape, never handed to GDAL."""
+    _init_git_repo(tmp_path)
+    monkeypatch.setattr("wa_mine_monitor.cli._REPO_ROOT", tmp_path)
+    cfg_file = _write_monitor_config(tmp_path)
+    monkeypatch.setattr(
+        "wa_mine_monitor.cli._fetch_region_boundaries_bytes",
+        lambda: b"<!DOCTYPE html><html><body>Sign in</body></html>",
+    )
+    result = runner.invoke(
+        app, ["fetch-region-boundaries", "--config", str(cfg_file), "--date", "2026-08-21"]
+    )
+    assert result.exit_code == 1
+    assert "not a GeoJSON FeatureCollection" in json.loads(result.output)["refusal"]
+    assert not (tmp_path / "data" / "raw" / "wa_rdc_regions" / "2026-08-21").exists()
+
+
+def test_fetch_region_boundaries_refuses_truncated_rest_response(tmp_path, monkeypatch):
+    """ArcGIS REST flags a page-limited result with exceededTransferLimit;
+    a partial region set must never be snapshotted."""
+    _init_git_repo(tmp_path)
+    monkeypatch.setattr("wa_mine_monitor.cli._REPO_ROOT", tmp_path)
+    cfg_file = _write_monitor_config(tmp_path)
+    body = json.loads(_rdc_fixture_geojson_bytes())
+    body["exceededTransferLimit"] = True
+    monkeypatch.setattr(
+        "wa_mine_monitor.cli._fetch_region_boundaries_bytes",
+        lambda: json.dumps(body).encode("utf-8"),
+    )
+    result = runner.invoke(
+        app, ["fetch-region-boundaries", "--config", str(cfg_file), "--date", "2026-08-21"]
+    )
+    assert result.exit_code == 1
+    assert "exceededTransferLimit" in json.loads(result.output)["refusal"]
+    assert not (tmp_path / "data" / "raw" / "wa_rdc_regions" / "2026-08-21").exists()
 
 
 def test_fetch_region_boundaries_refuses_extract_missing_required_region(tmp_path, monkeypatch):
     _init_git_repo(tmp_path)
     monkeypatch.setattr("wa_mine_monitor.cli._REPO_ROOT", tmp_path)
     cfg_file = _write_monitor_config(tmp_path)
-    import io
 
     gdf = gpd.GeoDataFrame(
         {"dpird_region_name": ["Pilbara", "Kimberley"]},
@@ -1071,20 +1095,7 @@ def test_fetch_region_boundaries_refuses_extract_missing_required_region(tmp_pat
         ],
         crs="EPSG:4283",
     )
-    try:
-        buffer = io.BytesIO()
-        gdf.to_file(buffer, driver="GPKG")
-        payload = buffer.getvalue()
-    except Exception:  # noqa: BLE001
-        # Fall back to temp file
-        import tempfile
-        from pathlib import Path
-
-        with tempfile.NamedTemporaryFile(suffix=".gpkg", delete=False) as f:
-            gdf.to_file(f.name, driver="GPKG")
-            tmp_gpkg = Path(f.name)
-        payload = tmp_gpkg.read_bytes()
-        tmp_gpkg.unlink()
+    payload = gdf.to_json().encode("utf-8")
 
     monkeypatch.setattr(
         "wa_mine_monitor.cli._fetch_region_boundaries_bytes",
@@ -1501,14 +1512,12 @@ def _seed_d3_maus_extract(data_root: Path, date_str: str, specs: list[dict]) -> 
     return snapshot_dir
 
 
-def _d3_regions_gpkg_bytes(specs: list[dict]) -> bytes:
+def _d3_regions_geojson_bytes(specs: list[dict]) -> bytes:
     """A two-region DPIRD-020 stand-in: "Pilbara" covers the WHOLE footprint
     field (every representative point falls inside it, so every footprint's
     `region` stratum is "pilbara" -- again, all 10 in ONE stratum);
     "Goldfields-Esperance" sits well away, satisfying `wa_regions.
     load_regions`'s `REQUIRED_REGIONS` check without overlapping it."""
-    import io
-
     lons = [s["lon"] for s in specs]
     lats = [s["lat"] for s in specs]
     pilbara = box(min(lons) - 0.5, min(lats) - 0.5, max(lons) + 0.5, max(lats) + 0.5)
@@ -1518,9 +1527,7 @@ def _d3_regions_gpkg_bytes(specs: list[dict]) -> bytes:
         geometry=[pilbara, goldfields],
         crs="EPSG:4283",
     )
-    buffer = io.BytesIO()
-    gdf.to_file(buffer, driver="GPKG")
-    return buffer.getvalue()
+    return gdf.to_json().encode("utf-8")
 
 
 class D3Seed(NamedTuple):
@@ -1594,7 +1601,7 @@ def _seed_d3_inputs_chain(
     )
     assert crosswalk_result.exit_code == 0, crosswalk_result.output
 
-    regions_payload = _d3_regions_gpkg_bytes(specs)
+    regions_payload = _d3_regions_geojson_bytes(specs)
     monkeypatch.setattr(
         "wa_mine_monitor.cli._fetch_region_boundaries_bytes", lambda: regions_payload
     )

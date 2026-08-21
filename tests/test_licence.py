@@ -409,3 +409,9 @@ def test_wa_rdc_regions_licence_is_pinned_cc_by():
     assert record.redistribute_public is True
     assert "DPIRD-020" in record.title
     assert "catalogue.data.wa.gov.au" in record.source_url
+
+
+def test_wa_rdc_regions_licence_notes_record_the_2026_08_21_repin():
+    record = SOURCES["wa_rdc_regions"]
+    assert "public-services.slip.wa.gov.au" in record.notes
+    assert "2026-08-21" in record.notes

@@ -6,6 +6,7 @@ import geopandas as gpd
 import pytest
 from shapely.geometry import Polygon
 
+from wa_mine_monitor import crosswalk
 from wa_mine_monitor.sources import wa_regions
 
 
@@ -145,3 +146,20 @@ def test_load_regions_allows_touching_boundaries(tmp_path):
     out = wa_regions.load_regions(path)
     # Should succeed with touching boundaries
     assert len(out) == 3
+
+
+def test_load_regions_accepts_slip_rest_region_column_from_geojson(tmp_path):
+    gdf = gpd.GeoDataFrame(
+        {"objectid": [1, 2], "region": ["Pilbara", "Goldfields-Esperance"], "link": ["", ""]},
+        geometry=[
+            Polygon([(117, -22), (119, -22), (119, -20), (117, -20)]),
+            Polygon([(120, -31), (122, -31), (122, -29), (120, -29)]),
+        ],
+        crs="EPSG:4326",
+    )
+    path = tmp_path / "regions.geojson"
+    path.write_text(gdf.to_json())
+    out = wa_regions.load_regions(path)
+    assert list(out.columns) == ["region_name", "geometry"]
+    assert sorted(out["region_name"]) == ["Goldfields-Esperance", "Pilbara"]
+    assert out.crs is not None and out.crs.to_string() == crosswalk.TARGET_CRS

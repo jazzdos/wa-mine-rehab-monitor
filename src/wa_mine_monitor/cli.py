@@ -298,9 +298,19 @@ SourceGpkgOption = typer.Option(
 )
 
 
-#: DPIRD-020 GeoPackage download, pinned 2026-08-16 (Data WA catalogue
-#: record `regional-development-commission-boundaries`, licence CC-BY-4.0).
-_RDC_REGIONS_DOWNLOAD_URL = "https://data-downloads.slip.wa.gov.au/DPIRD-020/Geopackage"
+#: DPIRD-020 via the SLIP public ArcGIS REST layer, pinned 2026-08-21
+#: (Data WA catalogue record `regional-development-commission-boundaries`,
+#: licence CC-BY-4.0 re-verified the same day via the CKAN API). The
+#: previous pin, `https://data-downloads.slip.wa.gov.au/DPIRD-020/Geopackage`
+#: (2026-08-16), now redirects to SLIP SSO and returns 403 anonymously.
+#: `orderByFields=objectid` keeps the byte stream -- and so the snapshot
+#: digest -- stable across fetches of unchanged data.
+_RDC_REGIONS_DOWNLOAD_URL = (
+    "https://public-services.slip.wa.gov.au/public/rest/services/"
+    "SLIP_Public_Services/Boundaries/MapServer/25/query"
+    "?where=1%3D1&outFields=*&outSR=4326&orderByFields=objectid&f=geojson"
+)
+_RDC_REGIONS_FILENAME = "regions.geojson"
 
 ProtocolConfigOption = typer.Option(
     Path("config/d3.yaml"),
@@ -310,9 +320,35 @@ ProtocolConfigOption = typer.Option(
 
 
 def _fetch_region_boundaries_bytes() -> bytes:
-    """Download the pinned DPIRD-020 GeoPackage (network seam, monkeypatchable)."""
+    """Download the pinned DPIRD-020 GeoJSON (network seam, monkeypatchable)."""
     client = HttpClient()
     return client.get_bytes(_RDC_REGIONS_DOWNLOAD_URL)
+
+
+class RegionPayloadError(ValueError):
+    """The fetched region-boundary bytes are not a complete GeoJSON body."""
+
+
+def _refuse_unless_complete_geojson(payload: bytes) -> None:
+    """Refuse by SHAPE before GDAL sees the bytes: a login page or an
+    ArcGIS page-limited result must never become a snapshot."""
+    try:
+        body = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RegionPayloadError(
+            f"region boundaries payload is not a GeoJSON FeatureCollection: {exc}"
+        ) from exc
+    if not isinstance(body, dict) or body.get("type") != "FeatureCollection":
+        found = body.get("type") if isinstance(body, dict) else type(body).__name__
+        raise RegionPayloadError(
+            "region boundaries payload is not a GeoJSON FeatureCollection "
+            f"(top-level type={found!r})"
+        )
+    if body.get("exceededTransferLimit"):
+        raise RegionPayloadError(
+            "region boundaries payload has exceededTransferLimit=true -- the REST "
+            "layer paged the result; refusing a partial region set"
+        )
 
 
 def _refuse_if_snapshot_already_finalized(
@@ -3112,7 +3148,7 @@ def cmd_fetch_region_boundaries(
 ) -> None:
     """Capture the pinned DPIRD-020 RDC boundaries into a dated snapshot.
 
-    Downloads the GeoPackage, validates it with
+    Downloads the GeoJSON, validates it with
     `wa_regions.load_regions` (both protocol regions present, non-null
     unique names) BEFORE finalization, and writes an immutable snapshot at
     `<data_root>/raw/wa_rdc_regions/<date>/` with one run manifest. A
@@ -3147,14 +3183,20 @@ def cmd_fetch_region_boundaries(
         typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
         raise typer.Exit(1) from None
 
+    try:
+        _refuse_unless_complete_geojson(payload)
+    except RegionPayloadError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
     snapshot_dir.mkdir(parents=True, exist_ok=True)
-    gpkg_path = snapshot_dir / "regions.gpkg"
-    gpkg_path.write_bytes(payload)
+    regions_path = snapshot_dir / _RDC_REGIONS_FILENAME
+    regions_path.write_bytes(payload)
 
     try:
-        regions = wa_regions.load_regions(gpkg_path)
+        regions = wa_regions.load_regions(regions_path)
     except Exception as exc:  # noqa: BLE001
-        gpkg_path.unlink(missing_ok=True)
+        regions_path.unlink(missing_ok=True)
         typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
         raise typer.Exit(1) from None
 
@@ -3164,7 +3206,7 @@ def cmd_fetch_region_boundaries(
 
     input_asset = SourceAsset(
         uri=_RDC_REGIONS_DOWNLOAD_URL,
-        sha256=sha256_file(gpkg_path),
+        sha256=sha256_file(regions_path),
         collection=None,
         snapshot_date=dt_date.fromisoformat(date),
         licence="CC-BY-4.0",
@@ -3689,9 +3731,9 @@ def build_d3_inputs_cmd(
         typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
         raise typer.Exit(1) from None
     _verify_snapshot_or_refuse(
-        regions_dir, source_id="wa_rdc_regions", required_files=("regions.gpkg",)
+        regions_dir, source_id="wa_rdc_regions", required_files=(_RDC_REGIONS_FILENAME,)
     )
-    regions_path = regions_dir / "regions.gpkg"
+    regions_path = regions_dir / _RDC_REGIONS_FILENAME
     try:
         regions_gdf = wa_regions.load_regions(regions_path)
     except wa_regions.RegionExtractError as exc:

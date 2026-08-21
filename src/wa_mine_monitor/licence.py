@@ -316,9 +316,13 @@ SOURCES: dict[str, SourceLicence] = {
             "The nine regions defined under the Regional Development "
             "Commissions Act 1993, pinned as the design doc D4's 'official "
             "Pilbara and Goldfields-Esperance boundaries'. Licence read from "
-            "the Data WA catalogue record for DPIRD-020 (CC-BY-4.0), "
-            "source CRS GDA94 (EPSG:4283), download via SLIP "
-            "data-downloads.slip.wa.gov.au. Pinned 2026-08-16."
+            "the Data WA catalogue record for DPIRD-020 (CC-BY-4.0); "
+            "re-verified 2026-08-21 via the CKAN API when the fetch was "
+            "re-pinned from data-downloads.slip.wa.gov.au (now SSO-gated) to "
+            "the SLIP public ArcGIS REST layer "
+            "public-services.slip.wa.gov.au/.../Boundaries/MapServer/25, "
+            "served as GeoJSON in GDA2020 / EPSG:4326. Pinned 2026-08-16, "
+            "re-pinned 2026-08-21."
         ),
     ),
 }
