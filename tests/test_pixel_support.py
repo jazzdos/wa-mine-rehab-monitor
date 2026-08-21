@@ -124,10 +124,11 @@ def test_wrong_pixel_size_refused():
 
 
 def test_dea_tile_lattice_validation_positive_indices():
-    # DEA tile x5y10 should have origin (5*96000, (10+1)*96000) = (480000, 1056000).
+    # DEA tile x5y10: origin (-4416000 + 5*96000, -6912000 + (10+1)*96000)
+    # = (-3936000, -5856000) on the collection-3 `au-30` lattice.
     grid = pixel_support.GridSpec(
         crs="EPSG:3577",
-        transform=(30.0, 0.0, 480000.0, 0.0, -30.0, 1056000.0),
+        transform=(30.0, 0.0, -3936000.0, 0.0, -30.0, -5856000.0),
         width=3200,
         height=3200,
         tile_id="x5y10",
@@ -136,25 +137,47 @@ def test_dea_tile_lattice_validation_positive_indices():
     pixel_support._validate_grid(grid)
 
 
-def test_dea_tile_lattice_validation_negative_indices():
-    # DEA tile x-15y-35 should have origin (-15*96000, (-35+1)*96000) = (-1440000, -3264000).
-    # This matches the captured item we verified.
+@pytest.mark.parametrize(
+    ("tile_id", "origin_x", "origin_y"),
+    [
+        # Read live from dea-public-data ga_ls5t_gm_cyear_3/4-0-0 on 2026-08-21:
+        # .../x31/y37/1986--P1Y/..._x31y37_..._nbart_nir.tif and
+        # .../x34/y37/1986--P1Y/..._x34y37_..._nbart_nir.tif (both 3200x3200, 30 m).
+        ("x31y37", -1440000.0, -3264000.0),
+        ("x34y37", -1152000.0, -3264000.0),
+    ],
+)
+def test_dea_tile_lattice_validation_live_wa_tiles(tile_id, origin_x, origin_y):
     grid = pixel_support.GridSpec(
         crs="EPSG:3577",
-        transform=(30.0, 0.0, -1440000.0, 0.0, -30.0, -3264000.0),
+        transform=(30.0, 0.0, origin_x, 0.0, -30.0, origin_y),
         width=3200,
         height=3200,
-        tile_id="x-15y-35",
+        tile_id=tile_id,
     )
     # Should not raise.
     pixel_support._validate_grid(grid)
+
+
+def test_dea_tile_lattice_refuses_zero_origin_convention():
+    # The pre-2026-08-21 formula (origin at 0,0) placed x34y37 at (3264000, 3648000);
+    # that is a different tile and must be refused.
+    wrong = pixel_support.GridSpec(
+        crs="EPSG:3577",
+        transform=(30.0, 0.0, 3264000.0, 0.0, -30.0, 3648000.0),
+        width=3200,
+        height=3200,
+        tile_id="x34y37",
+    )
+    with pytest.raises(pixel_support.PixelSupportError, match="inconsistent"):
+        pixel_support._validate_grid(wrong)
 
 
 def test_dea_tile_lattice_refused_wrong_origin():
     # Tile x5y10 but origin is off by 1 pixel.
     wrong = pixel_support.GridSpec(
         crs="EPSG:3577",
-        transform=(30.0, 0.0, 480030.0, 0.0, -30.0, 1056000.0),
+        transform=(30.0, 0.0, -3935970.0, 0.0, -30.0, -5856000.0),
         width=3200,
         height=3200,
         tile_id="x5y10",

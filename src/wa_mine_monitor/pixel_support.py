@@ -6,11 +6,15 @@ all_touched are prohibited by the D3 protocol. The assignment identity
 binds grid CRS, affine transform, width, height and product tile identity,
 so the same polygon on a different tile is a DIFFERENT assignment.
 
-DEA collection-3 tiling convention (verified 2026-08-16 against live data):
-grid origins follow the 96,000 m (3200 × 30 m) tile lattice with formula
-`origin_x = x_index * 96_000` and `origin_y = (y_index + 1) * 96_000`,
-where tile_id = f"x{x_index}y{y_index}" (indices can be negative). The
-tile's upper-left corner (in north-up EPSG:3577) is at (origin_x, origin_y).
+DEA collection-3 tiling convention (the `au-30` GridSpec; verified
+2026-08-21 against live tiles x31y37 and x34y37 of ga_ls5t_gm_cyear_3):
+tile indices count 96,000 m (3200 × 30 m) tiles from the lattice origin
+(-4,416,000, -6,912,000) in EPSG:3577, so for tile_id =
+f"x{x_index}y{y_index}" the tile's upper-left corner (north-up) is at
+`origin_x = -4_416_000 + x_index * 96_000` and
+`origin_y = -6_912_000 + (y_index + 1) * 96_000`. The 2026-08-16 note that
+placed the lattice origin at (0, 0) with negative indices was wrong: it
+back-solved indices from one tile's origin instead of reading its id.
 """
 
 from __future__ import annotations
@@ -28,6 +32,9 @@ from wa_mine_monitor import crosswalk
 PIXEL_METRES = 30.0
 #: DEA collection-3 tile size in metres (3200 pixels * 30 m/pixel).
 TILE_SIZE_METRES = 96_000.0
+#: Lower-left corner of tile x0y0 in the DEA collection-3 `au-30` lattice (EPSG:3577).
+LATTICE_ORIGIN_X_METRES = -4_416_000.0
+LATTICE_ORIGIN_Y_METRES = -6_912_000.0
 
 
 class PixelSupportError(ValueError):
@@ -76,14 +83,15 @@ def _validate_grid(grid: GridSpec) -> None:
         )
 
     # If tile_id matches the DEA xNyN pattern, validate against collection-3
-    # tile lattice: origin_x = x_index * 96_000, origin_y = (y_index + 1) * 96_000.
+    # `au-30` tile lattice (see module docstring): upper-left corner at
+    # (LATTICE_ORIGIN_X + x_index * 96_000, LATTICE_ORIGIN_Y + (y_index + 1) * 96_000).
     tile_match = re.match(r"^x(-?\d+)y(-?\d+)$", grid.tile_id)
     if tile_match:
         x_index = int(tile_match.group(1))
         y_index = int(tile_match.group(2))
 
-        expected_origin_x = x_index * TILE_SIZE_METRES
-        expected_origin_y = (y_index + 1) * TILE_SIZE_METRES
+        expected_origin_x = LATTICE_ORIGIN_X_METRES + x_index * TILE_SIZE_METRES
+        expected_origin_y = LATTICE_ORIGIN_Y_METRES + (y_index + 1) * TILE_SIZE_METRES
 
         if c != expected_origin_x or f != expected_origin_y:
             raise PixelSupportError(

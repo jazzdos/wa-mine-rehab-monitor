@@ -1852,6 +1852,12 @@ encodes the definition.
   transform before hard-coding signs, and freeze what the data shows).
   Non-matching tile_id formats skip the lattice check (fixture grids) but
   still require EPSG:3577 and the 30 m lattice.
+  Amended 2026-08-21: the live run refused tile x34y37 because the
+  origin-at-(0, 0) formula above is wrong. DEA collection 3 uses the `au-30`
+  lattice with origin (-4 416 000, -6 912 000): origin_x == -4 416 000 +
+  x_index * 96 000, origin_y == -6 912 000 + (y_index + 1) * 96 000,
+  confirmed on live tiles x31y37 and x34y37 (`pixel_support.py`,
+  `tests/test_pixel_support.py`).
 - D13 D2 requires an exact **144-centre** test; add
   `test_exact_144_centre_square` (12×12 polygon → support 144). With the
   refusal additions the test count rises — state the true count in Step 4
