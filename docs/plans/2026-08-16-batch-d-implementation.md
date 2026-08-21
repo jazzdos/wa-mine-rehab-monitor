@@ -178,6 +178,13 @@ Batch C checkpoint host decision.
    cache bound, NOT the transfer volume. The transfer budget is disclosed
    as 597 GB–3.30 TB block-granular (Batch C measured 800×800 deflate
    blocks).
+   Amended 2026-08-21: `CPL_VSIL_CURL_CACHE_SIZE` is a RAM cache, not a
+   disk cache. The first live run on luminosity (15 GB RAM) with the 50 GB
+   setting was OOM-killed after 91 min at 10.5 GB RSS with nothing written
+   to disk. The live run uses `CPL_VSIL_CURL_CACHE_SIZE=1073741824` (1 GB)
+   and `GDAL_CACHEMAX=1024`; the transfer volume is unchanged and no disk
+   requirement follows from the cache at all. Output on disk is the five
+   parquet tables only.
 
 ## Conventions binding every task
 
