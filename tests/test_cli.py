@@ -2100,5 +2100,6 @@ def test_apply_d3_threshold_forced_144_discloses(tmp_path, monkeypatch):
     manifest_path = Path(payload["manifest_path"])
     with open(manifest_path) as f:
         manifest = json.load(f)
-    print("MANIFEST:", manifest.keys()); assert "failed_criteria" in manifest.get("resolved_args", {})
+    print("MANIFEST:", manifest.keys())
+    assert "failed_criteria" in manifest.get("resolved_args", {})
     assert len(manifest["resolved_args"]["failed_criteria"]) > 0

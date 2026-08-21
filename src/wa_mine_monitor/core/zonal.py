@@ -39,6 +39,7 @@ module default. `.clear()` is always safe — results are unchanged, only rebuil
 Heavy deps (numpy, shapely) import lazily inside the functions, per the core/
 convention — importing this module costs nothing.
 """
+
 from __future__ import annotations
 
 # Module-default assignment cache. Keyed by grid_key(); safe to .clear().
@@ -60,8 +61,7 @@ def bounds_from_affine(transform, height: int, width: int):
     return (c, f, c + a * width, f + e * height)
 
 
-def pixel_centre_lonlat(ulx, uly, lrx, lry, height: int, width: int,
-                        transformer=None):
+def pixel_centre_lonlat(ulx, uly, lrx, lry, height: int, width: int, transformer=None):
     """Pixel-centre lon/lat (EPSG:4326), each shaped (height, width), for a
     rectilinear grid with outer corner bounds (ulx, uly, lrx, lry) in the grid
     CRS. Pixel-centre coordinates: x = ULx + (col+0.5)·(LRx−ULx)/W,
@@ -69,11 +69,12 @@ def pixel_centre_lonlat(ulx, uly, lrx, lry, height: int, width: int,
     `transformer` is a pyproj Transformer (always_xy=True) from the grid CRS to
     EPSG:4326; None means the bounds are already lon/lat."""
     import numpy as np
+
     cols = np.arange(width)
     rows = np.arange(height)
     xs_1d = ulx + (cols + 0.5) * (lrx - ulx) / width
     ys_1d = uly + (rows + 0.5) * (lry - uly) / height
-    x2d, y2d = np.meshgrid(xs_1d, ys_1d)             # (height, width)
+    x2d, y2d = np.meshgrid(xs_1d, ys_1d)  # (height, width)
     if transformer is None:
         return x2d, y2d
     lon2d, lat2d = transformer.transform(x2d, y2d)
@@ -85,28 +86,44 @@ def region_signature(bounds_by_region: dict) -> tuple:
     sorted (region_id, rounded lon/lat bbox) tuples. Two runs over the same
     region tessellation share it; a different region set (global rollout) keys a
     distinct cache entry."""
-    return tuple(sorted(
-        (rid,) + tuple(round(float(c), 6) for c in bounds)
-        for rid, bounds in bounds_by_region.items()
-    ))
+    return tuple(
+        sorted(
+            (rid,) + tuple(round(float(c), 6) for c in bounds)
+            for rid, bounds in bounds_by_region.items()
+        )
+    )
 
 
-def grid_key(ulx, uly, lrx, lry, height: int, width: int,
-             regions_sig: tuple) -> tuple:
+def grid_key(ulx, uly, lrx, lry, height: int, width: int, regions_sig: tuple) -> tuple:
     """Cache key for one physical grid × region set: the corner bounds (rounded)
     + grid dims + the region signature. Day-INVARIANT — the same grid on any day
     maps to the same key, so the mesh + assignment build once."""
-    return (round(float(ulx), 3), round(float(uly), 3),
-            round(float(lrx), 3), round(float(lry), 3),
-            int(height), int(width), regions_sig)
+    return (
+        round(float(ulx), 3),
+        round(float(uly), 3),
+        round(float(lrx), 3),
+        round(float(lry), 3),
+        int(height),
+        int(width),
+        regions_sig,
+    )
 
 
-def build_assignment(ulx, uly, lrx, lry, height: int, width: int,
-                     polygons: dict, *, transformer=None,
-                     bounds_by_region: dict | None = None,
-                     regions_sig: tuple | None = None,
-                     cache: dict | None = None,
-                     lonlat_fn=None) -> dict:
+def build_assignment(
+    ulx,
+    uly,
+    lrx,
+    lry,
+    height: int,
+    width: int,
+    polygons: dict,
+    *,
+    transformer=None,
+    bounds_by_region: dict | None = None,
+    regions_sig: tuple | None = None,
+    cache: dict | None = None,
+    lonlat_fn=None,
+) -> dict:
     """Map (grid cell → region) for one grid: {region_id: flat-index array of
     the grid's in-polygon pixel centres} (indices into the raveled (H·W,) grid).
     Only regions with ≥1 member pixel appear.
@@ -154,12 +171,15 @@ def build_assignment(ulx, uly, lrx, lry, height: int, width: int,
 
     for rid, poly in polygons.items():
         minlon, minlat, maxlon, maxlat = bounds_by_region[rid]
-        if (maxlon < gminlon or minlon > gmaxlon
-                or maxlat < gminlat or minlat > gmaxlat):
+        if maxlon < gminlon or minlon > gmaxlon or maxlat < gminlat or minlat > gmaxlat:
             continue  # region bbox does not touch this grid
-        sel = (finite
-               & (lon_flat >= minlon) & (lon_flat <= maxlon)
-               & (lat_flat >= minlat) & (lat_flat <= maxlat))
+        sel = (
+            finite
+            & (lon_flat >= minlon)
+            & (lon_flat <= maxlon)
+            & (lat_flat >= minlat)
+            & (lat_flat <= maxlat)
+        )
         idx = np.where(sel)[0]
         if idx.size == 0:
             continue
@@ -173,8 +193,7 @@ def build_assignment(ulx, uly, lrx, lry, height: int, width: int,
     return assign
 
 
-def zonal_stats(values, assignment: dict, *, valid=None,
-                stat: str = "mean") -> dict:
+def zonal_stats(values, assignment: dict, *, valid=None, stat: str = "mean") -> dict:
     """Reduce a pixel field onto regions: {region_id: (stat, n_valid_pixels)}.
 
     `values` is (height, width) or a stacked (n, height, width) — e.g. multiple
@@ -188,6 +207,7 @@ def zonal_stats(values, assignment: dict, *, valid=None,
     Adapters needing more than one number per region (maiac's dual clean/total
     QA counts) should consume `build_assignment()` directly instead."""
     import numpy as np
+
     values = np.asarray(values)
     if values.ndim == 2:
         values = values[None, :, :]
