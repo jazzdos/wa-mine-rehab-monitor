@@ -143,6 +143,13 @@ Set the status line to `Live run COMPLETE ($D)`; commit the checkpoint. Batch E 
 
 ## Part C — D13 E3: spectral metrics and trajectory schema (kit:build-flow)
 
+> **REMINDER (2026-08-21):** Part A is done on `main`. Part B runs in a separate luminosity session and does NOT gate Part C. Start Part C now in a fresh session with:
+>
+> > Read `docs/plans/2026-08-21-batch-d-live-run-and-batch-e-e3.md` and execute Part C using the kit:build-flow skill.
+>
+> Merge this plan branch (`worktree-plan-batch-d-live-run-and-e3`) into `main` first, or build-flow will branch from a `main` that lacks the plan file.
+
+
 Conventions (from `cli.py`, `register.py`, `tests/test_dea_raster.py`): module-level pyarrow schemas; `tables.write_table(df, path, schema)` / `tables.read_table(path)`; errors are `ValueError` subclasses named `<Module>Error`; tests are plain functions, no conftest. Run `kit:code-standards` for Python before editing.
 
 ### Task 1: `spectral_metrics.py` — geomedian site-year metrics with not-computable reasons
