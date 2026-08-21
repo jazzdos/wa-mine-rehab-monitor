@@ -93,6 +93,31 @@ def test_spearman_refuses_fewer_than_min_years():
         d3_inputs.spearman(pd.Series([1.0]), pd.Series([2.0]))
 
 
+def test_spearman_equals_pandas_rank_corr_within_1e12_including_ties():
+    rng = np.random.default_rng(20260822)
+    for _ in range(200):
+        n = int(rng.integers(2, 40))
+        full = pd.Series(np.round(rng.normal(size=n), int(rng.integers(0, 3))))
+        reduced = pd.Series(np.round(full.to_numpy() + rng.normal(scale=0.5, size=n), 2))
+        if full.nunique() < 2 or reduced.nunique() < 2:
+            assert d3_inputs.spearman(full, reduced) is None
+            continue
+        expected = float(full.rank().corr(reduced.rank()))
+        got = d3_inputs.spearman(full, reduced)
+        assert got is not None
+        assert got == pytest.approx(expected, abs=1e-12), (n, full.tolist(), reduced.tolist())
+
+
+def test_spearman_is_exactly_one_for_identical_series():
+    s = pd.Series([3.0, 1.0, 2.0, 2.0, 5.0])
+    assert d3_inputs.spearman(s, s.copy()) == pytest.approx(1.0, abs=1e-12)
+
+
+def test_spearman_refuses_length_mismatch():
+    with pytest.raises(d3_inputs.D3InputsError, match="years"):
+        d3_inputs.spearman(pd.Series([1.0, 2.0, 3.0]), pd.Series([1.0, 2.0]))
+
+
 def _write_geotiff(path, array, *, origin=(0.0, 300.0), nodata=None):
     import rasterio
     from rasterio.transform import from_origin
@@ -254,3 +279,42 @@ def test_year_computable_matches_simulate_none_result():
     assert d3_inputs.year_computable(bands, kind="geomedian") is True
     bands["nbart_nir"][3] = np.nan
     assert d3_inputs.year_computable(bands, kind="geomedian") is False
+
+
+import hashlib
+import random
+
+
+def _rank_all_reference(members, *, replicate, seed_material):
+    """The pre-perf implementation, kept verbatim as the ordering oracle."""
+
+    def key(member):
+        token = f"{seed_material}|{replicate}|{member[0]},{member[1]},{member[2]}"
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    distinct = sorted(set(members))
+    return tuple(sorted(distinct, key=key))
+
+
+def test_rank_all_ordering_is_identical_to_reference_over_random_inputs():
+    rng = random.Random(20260822)
+    for trial in range(25):
+        tiles = [f"x{rng.randint(0, 99)}y{rng.randint(0, 99)}" for _ in range(rng.randint(1, 3))]
+        members = [
+            (rng.choice(tiles), rng.randint(0, 4000), rng.randint(0, 4000))
+            for _ in range(rng.randint(1, 400))
+        ]
+        members += members[: rng.randint(0, len(members))]  # duplicates must collapse
+        seed = f"digest{trial}|maus-{trial}|src|{1990 + trial}"
+        for replicate in (0, 1, 17, 99):
+            got = d3_inputs._rank_all(members, replicate=replicate, seed_material=seed)
+            want = _rank_all_reference(members, replicate=replicate, seed_material=seed)
+            assert got == want, (trial, replicate)
+            assert len(got) == len(set(members))
+
+
+def test_rank_all_is_a_strict_prefix_relation_across_supports():
+    members = [("t", r, c) for r in range(20) for c in range(20)]
+    ranked = d3_inputs._rank_all(members, replicate=3, seed_material="s")
+    assert d3_inputs.sample_support(members, 144, replicate=3, seed_material="s") == ranked[:144]
+    assert d3_inputs.sample_support(members, 300, replicate=3, seed_material="s") == ranked[:300]
