@@ -1255,9 +1255,18 @@ def assign_trajectory_eligibility(
        input population: no usable location, or a duplicated `site_id`;
        `crosswalk.filter_register_for_crosswalk`), OR the site's matched
        `maus_id` carries no computed `effective_pixel_support_px` in
-       `footprint_support_df` (missing/invalid Maus geometry -- a null
-       value there). `d3_eligible` and `d3_threshold_px` are both NULL: no
-       judgement was ever possible.
+       `footprint_support_df` -- a null value there, which covers TWO
+       causes at the `build-d3-inputs` end and this function cannot tell
+       apart: missing/invalid Maus geometry, OR the footprint's
+       representative point is covered by no RDC polygon (decision
+       2026-08-21 -- `d3_protocol.OUTSIDE_RDC_REGIONS_REASON`; e.g. a
+       Perth-metro quarry excluded from region-stratified D3 derivation
+       even though its own Maus geometry is valid). Both land in
+       `no_usable_footprint` here regardless of which caused the missing
+       support value; `footprint_support_df["support_not_computed_
+       reason"]` (not consulted by this function) is where a caller that
+       needs to separate the two causes must look. `d3_eligible` and
+       `d3_threshold_px` are both NULL: no judgement was ever possible.
     2. `crosswalk_not_high_confidence` -- the site IS present in
        `crosswalk_df` but its `confidence` is not `"high"`. NULL/NULL,
        same as (1).

@@ -266,6 +266,44 @@ def test_assign_regions_works_with_footprint_representative_points():
     assert assigned.tolist() == ["pilbara", "goldfields_esperance"]
 
 
+def test_partition_uncovered_points_splits_by_covered_by():
+    regions = gpd.GeoDataFrame(
+        {"region_name": ["Pilbara", "Goldfields-Esperance"]},
+        geometry=[
+            Polygon([(0, 0), (10, 0), (10, 10), (0, 10)]),
+            Polygon([(10, 0), (20, 0), (20, 10), (10, 10)]),
+        ],
+        crs="EPSG:3577",
+    )
+    points = gpd.GeoDataFrame(
+        {"site_id": ["A", "B", "C", "D"]},
+        geometry=[Point(5, 5), Point(99, 99), Point(15, 5), Point(10, 5)],  # D on shared border
+        crs="EPSG:3577",
+    )
+    covered, uncovered = d3_protocol.partition_uncovered_points(points, regions)
+    assert covered["site_id"].tolist() == ["A", "C", "D"]
+    assert uncovered == ["B"]
+    assert covered.crs == points.crs
+
+
+def test_partition_uncovered_points_refuses_crs_mismatch():
+    regions = gpd.GeoDataFrame(
+        {"region_name": ["Pilbara"]}, geometry=[Polygon([(0, 0), (1, 0), (1, 1)])], crs="EPSG:3577"
+    )
+    points = gpd.GeoDataFrame({"site_id": ["A"]}, geometry=[Point(0.5, 0.2)], crs="EPSG:4326")
+    with pytest.raises(d3_protocol.D3ProtocolError, match="CRS"):
+        d3_protocol.partition_uncovered_points(points, regions)
+
+
+def test_partition_uncovered_points_empty_input():
+    regions = gpd.GeoDataFrame(
+        {"region_name": ["Pilbara"]}, geometry=[Polygon([(0, 0), (1, 0), (1, 1)])], crs="EPSG:3577"
+    )
+    points = gpd.GeoDataFrame({"site_id": []}, geometry=[], crs="EPSG:3577")
+    covered, uncovered = d3_protocol.partition_uncovered_points(points, regions)
+    assert len(covered) == 0 and uncovered == []
+
+
 # ==============================================================================
 # Task 6: Selection (adequacy + stable hash)
 # ==============================================================================

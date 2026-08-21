@@ -38,6 +38,15 @@ REQUIRED_CRITERIA: dict[str, float] = {
     "computable_site_year_fraction_min": 0.90,
 }
 REQUIRED_REPLICATES = 100
+
+# Decision 2026-08-21 (docs/decisions/2026-08-21-d3-outside-rdc-exclusion.md):
+# footprints whose representative point is covered by no RDC polygon are
+# excluded from D3 derivation with disclosure, bounded by this ceiling.
+MAX_UNCOVERED_FRACTION = 0.05
+OUTSIDE_RDC_REGIONS_REASON = (
+    "representative point covered by no DPIRD-020 RDC polygon "
+    "(excluded from D3 derivation; decision 2026-08-21)"
+)
 REQUIRED_SHAPE_CLASSES = {"elongated_below": 0.20, "compact_at_least": 0.50}
 REQUIRED_ADEQUACY = {"min_footprints": 10, "min_full_support_years": 10}
 REQUIRED_SELECTION = {"use_all_below": 30, "select_n": 30}
@@ -293,6 +302,31 @@ def assign_regions(
         pd.Series(assigned, index=points.index, name="region"),
         {"n_ambiguous_boundary_points": n_ambiguous},
     )
+
+
+def partition_uncovered_points(
+    points: gpd.GeoDataFrame, regions: gpd.GeoDataFrame
+) -> tuple[gpd.GeoDataFrame, list[str]]:
+    """Split `points` into (covered subset, sorted uncovered site_ids).
+
+    Uses the same `covered_by` predicate as `assign_regions`, so a point on a
+    shared boundary counts as covered. Order of the covered frame is
+    preserved. Refuses on CRS mismatch exactly like `assign_regions`.
+    """
+    if str(points.crs) != str(regions.crs):
+        raise D3ProtocolError(f"points CRS {points.crs} != regions CRS {regions.crs}")
+    if points.empty:
+        return points.copy(), []
+    joined = gpd.sjoin(
+        points[["site_id", "geometry"]],
+        regions[["region_name", "geometry"]],
+        how="left",
+        predicate="covered_by",
+    )
+    covered_ids = set(joined.loc[joined["region_name"].notna(), "site_id"].astype(str))
+    mask = points["site_id"].astype(str).isin(covered_ids)
+    uncovered = sorted(points.loc[~mask, "site_id"].astype(str))
+    return points.loc[mask].copy(), uncovered
 
 
 Stratum = tuple[str, str, str]  # (region, commodity_group, shape_class)

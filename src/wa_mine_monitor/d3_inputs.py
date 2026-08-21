@@ -53,14 +53,32 @@ def _rank_key(member: Member, replicate: int, seed_material: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def _rank_all(
+    members: Sequence[Member], *, replicate: int, seed_material: str
+) -> tuple[Member, ...]:
+    """Every distinct member ranked by sha256(seed_material|replicate|member),
+    ascending -- the full ordering `sample_support` slices a prefix of.
+
+    The ranking depends only on `(replicate, seed_material)`, never on a
+    requested support size, so a caller needing several support levels for
+    the SAME replicate (`simulate_footprint_year`, sweeping the frozen
+    `supports` tuple) must compute this once and slice, rather than calling
+    `sample_support` once per support -- that would re-sort (and re-hash
+    every member) once per support for no behavioural difference, an O(len
+    (supports)) multiplier this project's fixtures make expensive at real
+    pixel counts.
+    """
+    distinct = sorted(set(members))
+    return tuple(sorted(distinct, key=lambda m: _rank_key(m, replicate, seed_material)))
+
+
 def sample_support(
     members: Sequence[Member], n: int, *, replicate: int, seed_material: str
 ) -> tuple[Member, ...]:
-    distinct = sorted(set(members))
-    if n > len(distinct):
-        raise D3InputsError(f"requested support {n} exceeds available {len(distinct)} members")
-    ranked = sorted(distinct, key=lambda m: _rank_key(m, replicate, seed_material))
-    return tuple(ranked[:n])
+    ranked = _rank_all(members, replicate=replicate, seed_material=seed_material)
+    if n > len(ranked):
+        raise D3InputsError(f"requested support {n} exceeds available {len(ranked)} members")
+    return ranked[:n]
 
 
 def geomedian_valid_mask(bands: Mapping[str, np.ndarray]) -> np.ndarray:
@@ -222,15 +240,26 @@ def simulate_footprint_year(
     member_index = {m: i for i, m in enumerate(canonical)}
     seed_material = f"{protocol_digest}|{maus_id}|{source_id}|{year}"
 
+    # One ranking per replicate, computed ONCE and reused for every support
+    # level below (the ranking is independent of `n` -- see `_rank_all`).
+    # `supports` is frozen at 8 values and `replicates` at 100 (D13 C1/D1),
+    # so this avoids re-sorting (and re-hashing every member) 8x over.
+    replicate_rankings = {
+        replicate: _rank_all(canonical, replicate=replicate, seed_material=seed_material)
+        for replicate in range(replicates)
+    }
+
     rows: list[dict[str, object]] = []
     reduced_series: dict[tuple[str, int], list[float]] = {}
     for support in supports:
+        if support > len(canonical):
+            raise D3InputsError(
+                f"requested support {support} exceeds available {len(canonical)} members"
+            )
         per_metric_errors: dict[str, list[float]] = {m: [] for m in full}
         per_metric_reduced: dict[str, list[float]] = {m: [] for m in full}
         for replicate in range(replicates):
-            sample = sample_support(
-                canonical, support, replicate=replicate, seed_material=seed_material
-            )
+            sample = replicate_rankings[replicate][:support]
             indices = [member_index[m] for m in sample]
             reduced = metric_fn({band: values[indices] for band, values in band_values.items()})
             for metric, value in reduced.items():

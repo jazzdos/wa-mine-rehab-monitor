@@ -3845,7 +3845,11 @@ def build_d3_inputs_cmd(
         raise typer.Exit(1) from None
 
     region_by_id: dict[str, str] = {}
-    region_disclosure: dict[str, int] = {"n_ambiguous_boundary_points": 0}
+    region_disclosure: dict[str, Any] = {
+        "n_ambiguous_boundary_points": 0,
+        "n_footprints_outside_rdc_regions": 0,
+        "footprints_outside_rdc_regions": [],
+    }
     if footprint_geometry:
         points_gdf = gpd.GeoDataFrame(
             {"site_id": list(footprint_geometry.keys())},
@@ -3853,13 +3857,55 @@ def build_d3_inputs_cmd(
             crs=crosswalk.TARGET_CRS,
         )
         try:
-            region_series, region_disclosure = d3_protocol.assign_regions(
-                points_gdf, regions_gdf, protocol
+            points_gdf, outside_ids = d3_protocol.partition_uncovered_points(
+                points_gdf, regions_gdf
             )
         except d3_protocol.D3ProtocolError as exc:
             typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
             raise typer.Exit(1) from None
-        region_by_id = dict(zip(points_gdf["site_id"], region_series, strict=True))
+        # Decision 2026-08-21: exclude-with-disclosure, bounded by the ceiling.
+        # `n_for_ceiling` is Tier-1 footprints with usable Maus geometry
+        # (`footprint_geometry`'s size at this point: `tier1_maus_ids` minus
+        # the missing/empty/invalid-geometry exclusions above). This is
+        # DELIBERATELY not `n_candidate_footprints` (support >= 144px and
+        # >=1 epoch year, computed later from `footprint_support_df`) --
+        # the ceiling must be checkable before support is derived at all, so
+        # it is measured against the broader population the region split
+        # actually partitions, not the narrower "candidate" population.
+        n_for_ceiling = len(footprint_geometry)
+        if outside_ids and len(outside_ids) / n_for_ceiling > d3_protocol.MAX_UNCOVERED_FRACTION:
+            typer.echo(
+                json.dumps(
+                    {
+                        "refusal": (
+                            f"{len(outside_ids)} of {n_for_ceiling} Tier-1 footprints with "
+                            f"usable Maus geometry ({len(outside_ids) / n_for_ceiling:.1%}) lie "
+                            f"outside every RDC polygon, above the "
+                            f"{d3_protocol.MAX_UNCOVERED_FRACTION:.0%} ceiling -- check the "
+                            f"region snapshot: {outside_ids}"
+                        )
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            raise typer.Exit(1) from None
+        for maus_id in outside_ids:
+            footprint_geometry.pop(maus_id, None)
+            shape_class_by_id.pop(maus_id, None)
+            support_not_computed_reason[maus_id] = d3_protocol.OUTSIDE_RDC_REGIONS_REASON
+        region_disclosure["n_footprints_outside_rdc_regions"] = len(outside_ids)
+        region_disclosure["footprints_outside_rdc_regions"] = outside_ids
+        if not points_gdf.empty:
+            try:
+                region_series, ambiguity = d3_protocol.assign_regions(
+                    points_gdf, regions_gdf, protocol
+                )
+            except d3_protocol.D3ProtocolError as exc:
+                typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+                raise typer.Exit(1) from None
+            region_disclosure.update(ambiguity)
+            region_by_id = dict(zip(points_gdf["site_id"], region_series, strict=True))
 
     try:
         commodity_by_id, commodity_disclosure = d3_inputs.assign_footprint_commodities(

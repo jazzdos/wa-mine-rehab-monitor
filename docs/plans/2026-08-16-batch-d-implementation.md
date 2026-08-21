@@ -40,7 +40,9 @@ Batch C checkpoint host decision.
    covered by any OTHER RDC polygon. A register point covered by NO RDC
    polygon is a refusal (unclassified), not `other_wa` — `other_wa` is a
    positive classification, never a fallback for a point the boundaries do
-   not explain.
+   not explain. Amended 2026-08-21: such footprints are excluded from D3
+   derivation with disclosure (`n_footprints_outside_rdc_regions`), bounded by
+   a 5% ceiling; see docs/decisions/2026-08-21-d3-outside-rdc-exclusion.md.
 2. **Commodity grouping is a declared token map, not inference.**
    `config/d3.yaml` carries an ordered, case-insensitive token→group map from
    raw MINEDEX `commodity` free text to the six D13 groups. First matching

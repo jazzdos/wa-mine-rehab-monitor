@@ -11,9 +11,10 @@ import pytest
 import typer
 import yaml
 from shapely.geometry import Polygon, box
+from shapely.ops import unary_union
 from typer.testing import CliRunner
 
-from wa_mine_monitor import manifests, register, snapshots, tables
+from wa_mine_monitor import d3_protocol, manifests, register, snapshots, tables
 from wa_mine_monitor.cli import (
     _collect_git_state_disclosing_gaps,
     _latest_curated_dated_dir,
@@ -1512,15 +1513,30 @@ def _seed_d3_maus_extract(data_root: Path, date_str: str, specs: list[dict]) -> 
     return snapshot_dir
 
 
-def _d3_regions_geojson_bytes(specs: list[dict]) -> bytes:
-    """A two-region DPIRD-020 stand-in: "Pilbara" covers the WHOLE footprint
-    field (every representative point falls inside it, so every footprint's
-    `region` stratum is "pilbara" -- again, all 10 in ONE stratum);
-    "Goldfields-Esperance" sits well away, satisfying `wa_regions.
-    load_regions`'s `REQUIRED_REGIONS` check without overlapping it."""
-    lons = [s["lon"] for s in specs]
-    lats = [s["lat"] for s in specs]
-    pilbara = box(min(lons) - 0.5, min(lats) - 0.5, max(lons) + 0.5, max(lats) + 0.5)
+def _d3_regions_geojson_bytes(specs: list[dict], margin: float = 0.5) -> bytes:
+    """A two-region DPIRD-020 stand-in: "Pilbara" is the union of a
+    `margin`-radius square around each spec's point (every representative
+    point falls inside its own square, so every footprint's `region`
+    stratum is "pilbara" -- all 10 in ONE stratum when `specs` is the full
+    fixture set); "Goldfields-Esperance" sits well away, satisfying
+    `wa_regions.load_regions`'s `REQUIRED_REGIONS` check without
+    overlapping it.
+
+    Built as a union of per-point squares rather than one bounding box so
+    that a caller can pass a SUBSET of `specs` (dropping footprints meant
+    to fall outside every RDC region) and have "Pilbara" genuinely exclude
+    them: the fixture grid is 5 cols x 2 rows at 0.01 deg spacing, so any
+    single point's lon/lat is shared by another row/column, and a bounding
+    box over the remaining points would still reach the dropped one's
+    corner. `margin` must stay below the 0.005 deg half-step for a dropped
+    point to land outside every kept point's square.
+    """
+    pilbara = unary_union(
+        [
+            box(s["lon"] - margin, s["lat"] - margin, s["lon"] + margin, s["lat"] + margin)
+            for s in specs
+        ]
+    )
     goldfields = box(120.0, -31.0, 121.0, -30.0)
     gdf = gpd.GeoDataFrame(
         {"dpird_region_name": ["Pilbara", "Goldfields-Esperance"]},
@@ -1543,6 +1559,7 @@ def _seed_d3_inputs_chain(
     build_coverage: bool = True,
     extra_register_rows: list[dict] | None = None,
     n_uncomputable_years: int = 0,
+    n_outside_region: int = 0,
 ) -> D3Seed:
     """Arrange the full input chain `build-d3-inputs` reads, via the
     already-tested CLI seams, ending with a frozen D3 protocol. Returns a
@@ -1555,6 +1572,12 @@ def _seed_d3_inputs_chain(
 
     `extra_register_rows` (Task 15) is passed straight through to `_seed_d3_
     register`.
+
+    `n_outside_region` (Decision 2026-08-21) shrinks the "Pilbara" RDC
+    polygon to exclude the LAST `n_outside_region` footprint specs (e.g.
+    `n=1` drops spec idx 9 = maus_id "D3FP09"): they stay in the register,
+    crosswalk and Maus extract, so they are still Tier-1 candidates, but
+    their representative point is covered by no RDC region.
     """
     _init_git_repo(tmp_path)
     monkeypatch.setattr("wa_mine_monitor.cli._REPO_ROOT", tmp_path)
@@ -1601,7 +1624,9 @@ def _seed_d3_inputs_chain(
     )
     assert crosswalk_result.exit_code == 0, crosswalk_result.output
 
-    regions_payload = _d3_regions_geojson_bytes(specs)
+    regions_specs = specs[: len(specs) - n_outside_region] if n_outside_region else specs
+    regions_margin = 0.002 if n_outside_region else 0.5
+    regions_payload = _d3_regions_geojson_bytes(regions_specs, margin=regions_margin)
     monkeypatch.setattr(
         "wa_mine_monitor.cli._fetch_region_boundaries_bytes", lambda: regions_payload
     )
@@ -1662,6 +1687,63 @@ def test_build_d3_inputs_end_to_end_over_fixtures(tmp_path, monkeypatch):
 
     assert payload["n_selected_footprints"] >= 10
     assert payload["n_candidate_footprints"] >= payload["n_selected_footprints"]
+
+
+def test_build_d3_inputs_excludes_footprints_outside_rdc_regions(tmp_path, monkeypatch):
+    """Decision 2026-08-21: a Tier-1 footprint covered by no RDC polygon is
+    excluded with disclosure, not a refusal. 1 of 10 fixtures is outside
+    (10%), so lift the 5% ceiling for this happy path."""
+    monkeypatch.setattr("wa_mine_monitor.d3_protocol.MAX_UNCOVERED_FRACTION", 0.5)
+    seed = _seed_d3_inputs_chain(tmp_path, monkeypatch, n_outside_region=1)
+    data_root = tmp_path / "data"
+    result = runner.invoke(
+        app,
+        [
+            "build-d3-inputs",
+            "--config",
+            str(seed.cfg_file),
+            "--protocol-config",
+            str(seed.d3_yaml_path),
+            "--date",
+            "2026-08-18",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["region_ambiguity"]["n_footprints_outside_rdc_regions"] == 1
+    assert payload["region_ambiguity"]["footprints_outside_rdc_regions"] == ["D3FP09"]
+
+    out_dir = data_root / "curated" / "d3-inputs" / "2026-08-18"
+    footprint_support = tables.read_table(out_dir / "footprint_support.parquet")
+    row = footprint_support[footprint_support["maus_id"] == "D3FP09"].iloc[0]
+    assert row["region"] is None or pd.isna(row["region"])
+    assert row["support_not_computed_reason"] == d3_protocol.OUTSIDE_RDC_REGIONS_REASON
+    assert not bool(row["selected"])
+    manifest = json.loads((out_dir / "footprint_support.parquet.run_manifest.json").read_text())
+    assert manifest["resolved_args"]["region_ambiguity"]["n_footprints_outside_rdc_regions"] == 1
+
+
+def test_build_d3_inputs_refuses_when_too_many_footprints_outside_rdc_regions(
+    tmp_path, monkeypatch
+):
+    """1 of 10 outside = 10% > MAX_UNCOVERED_FRACTION (5%): refuse, naming the ids."""
+    seed = _seed_d3_inputs_chain(tmp_path, monkeypatch, n_outside_region=1)
+    result = runner.invoke(
+        app,
+        [
+            "build-d3-inputs",
+            "--config",
+            str(seed.cfg_file),
+            "--protocol-config",
+            str(seed.d3_yaml_path),
+            "--date",
+            "2026-08-18",
+        ],
+    )
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.output)
+    assert "outside" in payload["refusal"] and "D3FP09" in payload["refusal"]
+    assert not (tmp_path / "data" / "curated" / "d3-inputs" / "2026-08-18").exists()
 
 
 def test_build_d3_inputs_refuses_existing_output_before_any_read(tmp_path, monkeypatch):
