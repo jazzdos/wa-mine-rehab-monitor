@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import contextlib
 import csv
+import functools
 import io
 import json
 import os
 import subprocess
 import zipfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date as dt_date
 from pathlib import Path
 from typing import Any, cast
@@ -316,6 +318,13 @@ ProtocolConfigOption = typer.Option(
     Path("config/d3.yaml"),
     "--protocol-config",
     help="Path to the D3 protocol YAML to freeze.",
+)
+
+ReadWorkersOption = typer.Option(
+    8,
+    "--read-workers",
+    min=1,
+    help="Concurrent raster reads per footprint (round-trip-latency bound; wall-clock only, outputs identical).",
 )
 
 
@@ -3473,11 +3482,37 @@ def _read_footprint_year_bands(
     return band_values, extraction_rows
 
 
+def _run_reads_in_serial_order[T](jobs: Sequence[Callable[[], T]], *, workers: int) -> list[T]:
+    """Run `jobs` concurrently on a thread pool and return their results in
+    SUBMISSION order. If any job raised, the exception of the FIRST failing
+    job in submission order is re-raised (after every job has finished), so
+    refusal text never depends on thread timing. `workers=1` takes the same
+    path. Used for raster reads, which are round-trip-latency bound."""
+    if workers < 1:
+        raise ValueError(f"read_workers must be >= 1, got {workers}")
+    if not jobs:
+        return []
+    with ThreadPoolExecutor(max_workers=min(workers, len(jobs))) as pool:
+        futures = [pool.submit(job) for job in jobs]
+        results: list[T] = []
+        first_error: BaseException | None = None
+        for future in futures:
+            try:
+                results.append(future.result())
+            except BaseException as exc:  # noqa: BLE001 -- re-raised below in serial order
+                if first_error is None:
+                    first_error = exc
+    if first_error is not None:
+        raise first_error
+    return results
+
+
 @app.command("build-d3-inputs")
 def build_d3_inputs_cmd(
     config: Path = ConfigOption,
     protocol_config: Path = ProtocolConfigOption,
     date: str = DateOption,
+    read_workers: int = ReadWorkersOption,
 ) -> None:
     """Build the D3 reduced-support simulation inputs from real DEA rasters.
 
@@ -4022,13 +4057,18 @@ def build_d3_inputs_cmd(
         n_full = 0
         computable_by_footprint[maus_id] = {}
         if effective_support[maus_id] >= d3_protocol.MIN_FULL_SUPPORT_PX and candidate_years:
+            read_keys: list[tuple[int, str, str]] = []
+            read_jobs: list[
+                Callable[[], tuple[dict[str, np.ndarray], list[dict[str, object]]]]
+            ] = []
             for year in sorted(candidate_years):
-                by_source: dict[str, bool] = {}
                 for source_id, kind in d3_inputs.D3_COLLECTION_KIND.items():
                     if not all((source_id, tile_id, year) in item_index for tile_id in touched):
                         continue
-                    try:
-                        raw_bands, extraction_rows = _read_footprint_year_bands(
+                    read_keys.append((year, source_id, kind))
+                    read_jobs.append(
+                        functools.partial(
+                            _read_footprint_year_bands,
                             source_id=source_id,
                             kind=kind,
                             year=year,
@@ -4037,12 +4077,23 @@ def build_d3_inputs_cmd(
                             item_index=item_index,
                             phase="a",
                         )
-                    except (rasterio.errors.RasterioError, OSError, d3_inputs.D3InputsError) as exc:
-                        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
-                        raise typer.Exit(1) from None
-                    phase_a_extraction_rows.extend(extraction_rows)
-                    decoded = _decode_d3_bands(raw_bands, kind=kind)
-                    by_source[source_id] = d3_inputs.year_computable(decoded, kind=kind)
+                    )
+            try:
+                read_results = _run_reads_in_serial_order(read_jobs, workers=read_workers)
+            except (rasterio.errors.RasterioError, OSError, d3_inputs.D3InputsError) as exc:
+                typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+                raise typer.Exit(1) from None
+            by_year_source: dict[int, dict[str, bool]] = {}
+            for (year, source_id, kind), (raw_bands, extraction_rows) in zip(
+                read_keys, read_results, strict=True
+            ):
+                phase_a_extraction_rows.extend(extraction_rows)
+                decoded = _decode_d3_bands(raw_bands, kind=kind)
+                by_year_source.setdefault(year, {})[source_id] = d3_inputs.year_computable(
+                    decoded, kind=kind
+                )
+            for year in sorted(candidate_years):
+                by_source = by_year_source.get(year, {})
                 computable_by_footprint[maus_id][year] = by_source
                 fc_ok = by_source.get("dea_fc_pc", False)
                 gm_ok = any(by_source.get(s, False) for s in _GEOMEDIAN_SOURCES)
@@ -4169,13 +4220,19 @@ def build_d3_inputs_cmd(
         reduced_by_source_metric_support: dict[tuple[str, str, int], dict[int, list[float]]] = {}
         full_value_by_key: dict[tuple[int, str, str], float] = {}
 
+        phase_b_read_keys: list[tuple[int, str, str]] = []
+        phase_b_read_jobs: list[
+            Callable[[], tuple[dict[str, np.ndarray], list[dict[str, object]]]]
+        ] = []
         for year in full_support_years:
             by_source = computable_by_footprint[maus_id][year]
             for source_id, kind in d3_inputs.D3_COLLECTION_KIND.items():
                 if not by_source.get(source_id, False):
                     continue
-                try:
-                    raw_bands, extraction_rows = _read_footprint_year_bands(
+                phase_b_read_keys.append((year, source_id, kind))
+                phase_b_read_jobs.append(
+                    functools.partial(
+                        _read_footprint_year_bands,
                         source_id=source_id,
                         kind=kind,
                         year=year,
@@ -4184,64 +4241,69 @@ def build_d3_inputs_cmd(
                         item_index=item_index,
                         phase="b",
                     )
-                except (rasterio.errors.RasterioError, OSError, d3_inputs.D3InputsError) as exc:
-                    typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
-                    raise typer.Exit(1) from None
-                for row in extraction_rows:
-                    key = (row["source_id"], row["tile_id"], row["year"], row["asset_key"])
-                    prior_etag = phase_a_etag_by_asset.get(key)
-                    if (
-                        prior_etag is not None
-                        and row["etag"] is not None
-                        and prior_etag != row["etag"]
-                    ):
-                        typer.echo(
-                            json.dumps(
-                                {
-                                    "refusal": (
-                                        f"asset {row['href']} ETag changed between Phase A "
-                                        f"and Phase B: {prior_etag} -> {row['etag']}"
-                                    )
-                                },
-                                indent=2,
-                                sort_keys=True,
-                            )
-                        )
-                        raise typer.Exit(1)
-                phase_b_extraction_rows.extend(extraction_rows)
-                decoded = _decode_d3_bands(raw_bands, kind=kind)
-                result = d3_inputs.simulate_footprint_year(
-                    maus_id=maus_id,
-                    year=year,
-                    source_id=source_id,
-                    members=members,
-                    band_values=decoded,
-                    kind=kind,
-                    supports=protocol.supports,
-                    replicates=protocol.replicates,
-                    protocol_digest=frozen_digest,
                 )
-                if result is None:
-                    continue
-                rows, reduced_series = result
-                n_footprint_years_simulated += 1
-                for row in rows:
-                    full_value_by_key[(year, source_id, cast(str, row["metric_id"]))] = cast(
-                        float, row["full_value"]
+        try:
+            phase_b_read_results = _run_reads_in_serial_order(
+                phase_b_read_jobs, workers=read_workers
+            )
+        except (rasterio.errors.RasterioError, OSError, d3_inputs.D3InputsError) as exc:
+            typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+            raise typer.Exit(1) from None
+
+        for (year, source_id, kind), (raw_bands, extraction_rows) in zip(
+            phase_b_read_keys, phase_b_read_results, strict=True
+        ):
+            for row in extraction_rows:
+                key = (row["source_id"], row["tile_id"], row["year"], row["asset_key"])
+                prior_etag = phase_a_etag_by_asset.get(key)
+                if prior_etag is not None and row["etag"] is not None and prior_etag != row["etag"]:
+                    typer.echo(
+                        json.dumps(
+                            {
+                                "refusal": (
+                                    f"asset {row['href']} ETag changed between Phase A "
+                                    f"and Phase B: {prior_etag} -> {row['etag']}"
+                                )
+                            },
+                            indent=2,
+                            sort_keys=True,
+                        )
                     )
-                    support_inputs_rows.append(
-                        {
-                            **row,
-                            "region": region,
-                            "commodity_group": commodity_group,
-                            "shape_class": shape_cls,
-                            "input_manifest_digests": input_digests_json,
-                        }
-                    )
-                for (metric_id, support_px), values in reduced_series.items():
-                    reduced_by_source_metric_support.setdefault(
-                        (source_id, metric_id, support_px), {}
-                    )[year] = values
+                    raise typer.Exit(1)
+            phase_b_extraction_rows.extend(extraction_rows)
+            decoded = _decode_d3_bands(raw_bands, kind=kind)
+            result = d3_inputs.simulate_footprint_year(
+                maus_id=maus_id,
+                year=year,
+                source_id=source_id,
+                members=members,
+                band_values=decoded,
+                kind=kind,
+                supports=protocol.supports,
+                replicates=protocol.replicates,
+                protocol_digest=frozen_digest,
+            )
+            if result is None:
+                continue
+            rows, reduced_series = result
+            n_footprint_years_simulated += 1
+            for row in rows:
+                full_value_by_key[(year, source_id, cast(str, row["metric_id"]))] = cast(
+                    float, row["full_value"]
+                )
+                support_inputs_rows.append(
+                    {
+                        **row,
+                        "region": region,
+                        "commodity_group": commodity_group,
+                        "shape_class": shape_cls,
+                        "input_manifest_digests": input_digests_json,
+                    }
+                )
+            for (metric_id, support_px), values in reduced_series.items():
+                reduced_by_source_metric_support.setdefault((source_id, metric_id, support_px), {})[
+                    year
+                ] = values
 
         for (source_id, metric_id, support_px), by_year in reduced_by_source_metric_support.items():
             years = sorted(by_year)
@@ -4350,6 +4412,7 @@ def build_d3_inputs_cmd(
         "commodity_ties": commodity_disclosure,
         "n_candidate_footprints": n_candidate_footprints,
         "n_selected_footprints": n_selected_footprints,
+        "read_workers": read_workers,
     }
 
     tmp_dir = output_dir.parent / f"{output_dir.name}.tmp"
@@ -4403,6 +4466,7 @@ def build_d3_inputs_cmd(
                 "protocol_digest": frozen_digest,
                 "n_candidate_footprints": n_candidate_footprints,
                 "n_selected_footprints": n_selected_footprints,
+                "read_workers": read_workers,
                 "n_strata_adequate": n_strata_adequate,
                 "n_strata_inadequate": n_strata_inadequate,
                 "n_footprint_years_simulated": n_footprint_years_simulated,
