@@ -49,6 +49,11 @@ class D3InputsError(ValueError):
 
 
 def _rank_key(member: Member, replicate: int, seed_material: str) -> str:
+    """Hex sha256 of `seed_material|replicate|tile,row,col` -- the ranking key.
+
+    Retained as the readable single-member form; `_rank_all` computes the
+    same digest for every member without re-formatting the prefix.
+    """
     token = f"{seed_material}|{replicate}|{member[0]},{member[1]},{member[2]}"
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
@@ -67,9 +72,17 @@ def _rank_all(
     every member) once per support for no behavioural difference, an O(len
     (supports)) multiplier this project's fixtures make expensive at real
     pixel counts.
+
+    Digest BYTES sort identically to their hex encoding (hex is a
+    monotone byte-wise encoding), so the comparison key is the raw digest
+    and the token is `prefix + member_bytes` with the prefix encoded once.
     """
     distinct = sorted(set(members))
-    return tuple(sorted(distinct, key=lambda m: _rank_key(m, replicate, seed_material)))
+    prefix = f"{seed_material}|{replicate}|".encode()
+    sha256 = hashlib.sha256
+    digests = [sha256(prefix + f"{m[0]},{m[1]},{m[2]}".encode()).digest() for m in distinct]
+    order = sorted(range(len(distinct)), key=digests.__getitem__)
+    return tuple(distinct[i] for i in order)
 
 
 def sample_support(
@@ -111,15 +124,40 @@ def fc_metrics(values: Mapping[str, np.ndarray]) -> dict[str, float]:
     return {metric: float(np.mean(values[asset])) for metric, asset in FC_METRIC_ASSETS.items()}
 
 
+def _average_ranks(values: np.ndarray) -> np.ndarray:
+    """1-based average ranks with ties averaged -- pandas `rank(method="average")`."""
+    order = np.argsort(values, kind="stable")
+    sorted_vals = values[order]
+    # Boundaries of tie groups in sorted order.
+    is_new_group = np.concatenate(([True], sorted_vals[1:] != sorted_vals[:-1]))
+    group_id = np.cumsum(is_new_group) - 1
+    group_start = np.flatnonzero(is_new_group)
+    group_end = np.append(group_start[1:], len(values))  # exclusive
+    # Average of 1-based positions start+1 .. end  ==  (start + 1 + end) / 2
+    group_rank = (group_start + 1 + group_end) / 2.0
+    ranks = np.empty(len(values), dtype=np.float64)
+    ranks[order] = group_rank[group_id]
+    return ranks
+
+
 def spearman(full: pd.Series, reduced: pd.Series) -> float | None:
     if len(full) < MIN_SPEARMAN_YEARS or len(full) != len(reduced):
         raise D3InputsError(
             f"spearman needs >= {MIN_SPEARMAN_YEARS} paired years, got "
             f"{len(full)} vs {len(reduced)}"
         )
-    if full.nunique() < 2 or reduced.nunique() < 2:
+    a = np.asarray(full, dtype=np.float64)
+    b = np.asarray(reduced, dtype=np.float64)
+    # Caller gates NaN out before this point (year_computable), so
+    # len(np.unique(...)) here never diverges from Series.nunique().
+    if len(np.unique(a)) < 2 or len(np.unique(b)) < 2:
         return None  # undefined for a constant series -- caller discloses
-    return float(full.rank().corr(reduced.rank()))
+    ra = _average_ranks(a)
+    rb = _average_ranks(b)
+    ra -= ra.mean()
+    rb -= rb.mean()
+    denom = math.sqrt(float(ra @ ra) * float(rb @ rb))
+    return float(ra @ rb) / denom
 
 
 def grid_spec_from_dataset(

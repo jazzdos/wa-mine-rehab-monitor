@@ -1,6 +1,9 @@
 # Batch E Implementation Plan — Tier 1 Trajectory Extraction
 
 **Status:** DRAFT
+**Superseded (2026-08-21):** Tasks 18–20 are replaced by
+`2026-08-21-batch-d-live-run-and-batch-e-e3.md` (E3) and a follow-on E4–E7
+plan. CLI name per D13 §5 is `extract-trajectories`. Task 17 is done (90a4f50).
 **Lineage:** Derived from `2026-08-15-wa-mine-rehab-monitor-implementation.md`
 **Scope:** Windowed zonal reads over geomedian + FC percentiles, sensor/version/count columns, overlap-year sensitivity runs, and validation against the jarrah Huntly cube.
 
