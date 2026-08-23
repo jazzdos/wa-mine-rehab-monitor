@@ -69,3 +69,4 @@ SHA256SUMS.txt
 data/
 data_root/
 site/build/
+.claude/worktrees/
