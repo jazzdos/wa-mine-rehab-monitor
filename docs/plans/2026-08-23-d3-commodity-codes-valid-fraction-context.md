@@ -1,0 +1,9 @@
+# Context for plan attack (2026-08-23)
+- Batch D live run 2026-08-22 (luminosity, commit b17d5ef): criteria_passed=false, n_star=144, 0 eligible. Recorded in docs/checkpoints/batch-d-result.md.
+- Defect 1: config/d3.yaml commodity_token_rules are English substrings; register `commodity` is verbatim MINEDEX codes (Au, "Au, Ag", Fe, "Ni, Co", Bx, HM...). classify_commodity -> "other" for all 1,252 footprints. Substring matching is unsafe for codes (fe in Fel).
+- Defect 2: d3_inputs.year_computable requires every member pixel valid. Diagnostics (scripts/diag_d3_*.py, run on luminosity): catalogue coverage 100% 1987-2025; geomedian 99-100% computable; zero-denominator never fires; failures are dea_fc_pc nodata (all 3 bands 255) — interior blobs, median 0.8% / p90 5.4% of members. computable_fraction 0.75-0.89 vs 0.90 floor in 5/6 strata, identical at every support.
+- Design (approved): exact-token commodity_code_rules; adequacy.min_valid_member_fraction 0.95; metrics and replicate draws over valid members only; valid_support_px column already in D3_SUPPORT_INPUTS_SCHEMA; accuracy criteria untouched. D13 never specified all-pixels-valid (Batch D plan decision 11).
+- Protocol digest covers the whole D3Protocol incl. rules and procedures text; freeze-d3-protocol single-lineage rule requires a decision doc and moving curated/d3-protocol/2026-08-18 aside; build-d3-inputs has no resume/subset flag.
+- Dry run with new mapping on existing footprint_support: 17 adequate strata, 416 selected footprints (was 6/180); rerun ~16 h with --read-workers 32.
+- Run chain on luminosity: freeze-d3-protocol -> build-d3-inputs -> derive-d3-threshold -> apply-d3-threshold, all refuse if dated output dir exists. Mac is on a metered hotspot: do not copy support_inputs.parquet back.
+- Tests: 722 passing at baseline in this worktree. Oracle tests in tests/test_d3_inputs.py pin _rank_all / simulate_footprint_year behaviour.

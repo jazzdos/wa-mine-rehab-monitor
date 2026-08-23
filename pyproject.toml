@@ -53,5 +53,13 @@ check_untyped_defs = true
 module = ["pandas.*", "pyarrow.*", "geopandas.*", "pyogrio.*", "shapely.*"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+# rasterio ships no py.typed marker mypy will resolve without stubs
+# installed, and is imported by the read-only diagnostic scripts under
+# scripts/ (diag_d3_coverage.py, diag_d3_computability.py) that reuse the
+# repo's own raster-read code paths.
+module = ["rasterio", "rasterio.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

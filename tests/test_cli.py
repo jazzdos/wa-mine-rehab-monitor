@@ -665,7 +665,7 @@ def _seed_curated_register(data_root, date_str):
         {
             "site_id": ["site-a", "site-b"],
             "site_name": ["Site A", "Site B"],
-            "commodity": ["Gold", "Iron Ore"],
+            "commodity": ["Au", "Fe"],
             "stage": ["Operating", "Shut"],
             "owners_at_snapshot": ["Owner A", "Owner B"],
             "snapshot_date": [date_str, date_str],
@@ -1434,7 +1434,7 @@ def _seed_d3_register(
 ) -> Path:
     """A minimal, schema-conforming `curated/register/<date_str>/
     register.parquet` -- one row per `_d3_footprint_specs` entry, all
-    `commodity="Gold"` (-> `d3_protocol.classify_commodity` == "gold" for
+    `commodity="Au"` (-> `d3_protocol.classify_commodity` == "gold" for
     every footprint, so all 10 land in the SAME commodity-group stratum;
     see this section's module comment).
 
@@ -1452,7 +1452,7 @@ def _seed_d3_register(
         {
             "site_id": [s["site_id"] for s in specs],
             "site_name": [f"Site {s['idx']}" for s in specs],
-            "commodity": ["Gold"] * len(specs),
+            "commodity": ["Au"] * len(specs),
             "stage": ["Operating"] * len(specs),
             "owners_at_snapshot": [f"Owner {s['idx']}" for s in specs],
             "snapshot_date": [date_str] * len(specs),
@@ -1875,7 +1875,7 @@ def test_build_d3_inputs_refuses_existing_output_before_any_read(tmp_path, monke
 def test_build_d3_inputs_refuses_drifted_protocol(tmp_path, monkeypatch):
     seed = _seed_d3_inputs_chain(tmp_path, monkeypatch)
     raw = yaml.safe_load(seed.d3_yaml_path.read_text())
-    raw["d3"]["commodity_token_rules"].append({"group": "gold", "tokens": ["aurum"]})
+    raw["d3"]["commodity_code_rules"].append({"group": "gold", "codes": ["Aurum"]})
     seed.d3_yaml_path.write_text(yaml.safe_dump(raw))
 
     result = runner.invoke(
@@ -2035,7 +2035,7 @@ def test_derive_d3_threshold_refuses_digest_mismatch(tmp_path, monkeypatch):
 
     shutil.rmtree(data_root / "curated" / "d3-protocol" / "2026-08-17")
     raw = yaml.safe_load(seed.d3_yaml_path.read_text())
-    raw["d3"]["commodity_token_rules"].append({"group": "gold", "tokens": ["aurum"]})
+    raw["d3"]["commodity_code_rules"].append({"group": "gold", "codes": ["Aurum"]})
     seed.d3_yaml_path.write_text(yaml.safe_dump(raw))
 
     refreeze_result = runner.invoke(
@@ -2216,7 +2216,7 @@ def test_apply_d3_threshold_refuses_protocol_mismatch(tmp_path, monkeypatch):
     # threshold artefact and footprint_support table were built under.
     shutil.rmtree(data_root / "curated" / "d3-protocol" / "2026-08-17")
     raw = yaml.safe_load(seed.d3_yaml_path.read_text())
-    raw["d3"]["commodity_token_rules"].append({"group": "gold", "tokens": ["aurum"]})
+    raw["d3"]["commodity_code_rules"].append({"group": "gold", "codes": ["Aurum"]})
     seed.d3_yaml_path.write_text(yaml.safe_dump(raw))
     refreeze_result = runner.invoke(
         app,

@@ -126,6 +126,48 @@ def test_load_requires_all_procedure_keys(tmp_path):
         d3_protocol.load_protocol(drifted)
 
 
+def test_load_exposes_code_rules_and_valid_fraction():
+    protocol = _protocol()
+    assert protocol.adequacy.min_valid_member_fraction == 0.95
+    assert [r.group for r in protocol.commodity_code_rules] == [
+        "iron_ore",
+        "bauxite_alumina",
+        "nickel",
+        "mineral_sands",
+        "gold",
+    ]
+    assert protocol.commodity_code_rules[4].codes == ("Au",)
+    assert "commodity_code_rules" in d3_protocol.canonical_protocol(protocol)
+    assert "commodity_token_rules" not in d3_protocol.canonical_protocol(protocol)
+
+
+def test_load_refuses_drifted_valid_member_fraction(tmp_path):
+    raw = yaml.safe_load(_CONFIG.read_text())
+    raw["d3"]["adequacy"]["min_valid_member_fraction"] = 0.90
+    drifted = tmp_path / "d3.yaml"
+    drifted.write_text(yaml.safe_dump(raw))
+    with pytest.raises(d3_protocol.D3ProtocolError, match="min_valid_member_fraction"):
+        d3_protocol.load_protocol(drifted)
+
+
+def test_load_refuses_duplicate_code_across_rules(tmp_path):
+    raw = yaml.safe_load(_CONFIG.read_text())
+    raw["d3"]["commodity_code_rules"].append({"group": "other", "codes": ["au"]})
+    drifted = tmp_path / "d3.yaml"
+    drifted.write_text(yaml.safe_dump(raw))
+    with pytest.raises(d3_protocol.D3ProtocolError, match="duplicate"):
+        d3_protocol.load_protocol(drifted)
+
+
+def test_load_refuses_empty_code_list(tmp_path):
+    raw = yaml.safe_load(_CONFIG.read_text())
+    raw["d3"]["commodity_code_rules"].append({"group": "other", "codes": []})
+    drifted = tmp_path / "d3.yaml"
+    drifted.write_text(yaml.safe_dump(raw))
+    with pytest.raises(d3_protocol.D3ProtocolError, match="empty"):
+        d3_protocol.load_protocol(drifted)
+
+
 def test_digest_is_stable_and_key_order_independent(tmp_path):
     protocol = d3_protocol.load_protocol(_CONFIG)
     digest_one = d3_protocol.protocol_digest(protocol)
@@ -154,9 +196,24 @@ def test_digest_is_stable_and_key_order_independent(tmp_path):
 
 def test_classify_commodity_first_rule_wins_and_other_is_catch_all():
     protocol = _protocol()
-    assert d3_protocol.classify_commodity("IRON ORE - Hematite", protocol) == "iron_ore"
-    assert d3_protocol.classify_commodity("Gold, Nickel", protocol) == "nickel"
-    assert d3_protocol.classify_commodity("Zircon; Rutile", protocol) == "mineral_sands"
+    assert d3_protocol.classify_commodity("Fe,Hem", protocol) == "iron_ore"
+    assert d3_protocol.classify_commodity("Au,Ni", protocol) == "nickel"
+    assert d3_protocol.classify_commodity("Zrn,Rt", protocol) == "mineral_sands"
+    assert d3_protocol.classify_commodity("Coal", protocol) == "other"
+
+
+def test_classify_commodity_is_case_insensitive():
+    protocol = _protocol()
+    assert d3_protocol.classify_commodity("Au", protocol) == "gold"
+    assert d3_protocol.classify_commodity("au", protocol) == "gold"
+    assert d3_protocol.classify_commodity("AU", protocol) == "gold"
+    assert d3_protocol.classify_commodity(" au ", protocol) == "gold"
+
+
+def test_classify_commodity_requires_exact_token_not_substring():
+    protocol = _protocol()
+    # "Fe" must not match inside a longer non-code token via substring containment.
+    assert d3_protocol.classify_commodity("FeatherstoneCo", protocol) == "other"
     assert d3_protocol.classify_commodity("Coal", protocol) == "other"
 
 

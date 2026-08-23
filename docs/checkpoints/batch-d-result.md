@@ -1,6 +1,6 @@
 # Batch D Result — D3 Protocol, Simulation, and Threshold
 
-**Status:** Live run COMPLETE (2026-08-22, luminosity, commit b17d5ef) — criteria FAILED; commodity stratification defect found (see below)
+**Status:** 2026-08-21 live run FAILED (commodity rules never matched); protocol re-frozen 2026-08-23 per decision doc — rerun _pending_
 
 ## Result parameters
 
@@ -33,3 +33,23 @@ Root cause: the register's `commodity` column holds MINEDEX abbreviation codes (
 Consequence: the stratification is degenerate (region × shape only), and the criteria failures above are measured on mixed-commodity strata. `n_star = 144` and `criteria_passed = false` are not a usable D3 result.
 
 Required fix is a protocol change (token rules over MINEDEX codes, e.g. `Fe`/`Mag` → iron_ore, `Au` → gold, `Bx`/`Al` → bauxite_alumina, `Ni` → nickel, `HM`/`Ilm`/`Rt`/`Zr` → mineral_sands), which changes the protocol digest and requires a new `freeze-d3-protocol` date and a full rerun of the chain. Per the `config/d3.yaml` freeze rule this is a design decision, not a code fix; record it in `docs/decisions/` before re-freezing. The Batch E E4/E5 gate stays closed.
+
+## Rerun 2026-08-23 — commodity codes + valid-fraction protocol
+
+Decision: `docs/decisions/2026-08-23-d3-commodity-codes-and-valid-fraction.md` (supersedes the 2026-08-18 freeze; `curated/d3-protocol/2026-08-18` moved to `curated/d3-protocol.superseded-2026-08-18` on luminosity).
+
+- **Frozen protocol digest:** _pending_ (freeze 2026-08-23)
+- **Commit:** _pending_
+- **Candidate footprint counts per stratum:** _pending_ (dry-run expectation: gold 726 / other 267 / iron_ore 136 / nickel 95 / mineral_sands 16 / bauxite_alumina 12; 17 adequate strata)
+- **Selected footprint counts per stratum:** _pending_ (dry-run expectation: 416 selected)
+- **Footprint-years simulated:** _pending_
+- **Footprint-years not computable:** _pending_
+- **computable_fraction per adequate stratum:** _pending_
+- **n_star (threshold):** _pending_
+- **criteria_passed:** _pending_
+- **Per-criterion margins with counts:** _pending_
+- **Eligibility counts by trajectory_status:** _pending_
+- **Run timing:** _pending_ (start/end AWST, `--read-workers 32`, tmux `wmm-d3`, logs `reports/{freeze-d3-protocol,build-d3-inputs,derive-d3-threshold,apply-d3-threshold}-2026-08-23.log`)
+- **Copied to lux:** _pending_ (small tables only; `support_inputs.parquet` left on luminosity)
+
+Batch E E4/E5 gate: reopen only if `criteria_passed=true`.

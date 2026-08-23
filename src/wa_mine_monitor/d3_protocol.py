@@ -48,7 +48,12 @@ OUTSIDE_RDC_REGIONS_REASON = (
     "(excluded from D3 derivation; decision 2026-08-21)"
 )
 REQUIRED_SHAPE_CLASSES = {"elongated_below": 0.20, "compact_at_least": 0.50}
-REQUIRED_ADEQUACY = {"min_footprints": 10, "min_full_support_years": 10}
+REQUIRED_ADEQUACY = {
+    "min_footprints": 10,
+    "min_full_support_years": 10,
+    # Decision 2026-08-23 (docs/decisions/2026-08-23-d3-commodity-codes-and-valid-fraction.md)
+    "min_valid_member_fraction": 0.95,
+}
 REQUIRED_SELECTION = {"use_all_below": 30, "select_n": 30}
 MIN_FULL_SUPPORT_PX = 144
 REQUIRED_PROCEDURE_KEYS = (
@@ -83,6 +88,7 @@ class Criteria:
 class Adequacy:
     min_footprints: int
     min_full_support_years: int
+    min_valid_member_fraction: float
 
 
 @dataclass(frozen=True)
@@ -100,7 +106,7 @@ class ShapeClasses:
 @dataclass(frozen=True)
 class CommodityRule:
     group: str
-    tokens: tuple[str, ...]
+    codes: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -109,7 +115,7 @@ class D3Protocol:
     regions: tuple[str, ...]
     region_source_names: tuple[tuple[str, str], ...]
     commodity_groups: tuple[str, ...]
-    commodity_token_rules: tuple[CommodityRule, ...]
+    commodity_code_rules: tuple[CommodityRule, ...]
     shape_classes: ShapeClasses
     adequacy: Adequacy
     selection: Selection
@@ -128,9 +134,9 @@ def load_protocol(path: Path) -> D3Protocol:
             regions=tuple(d3["regions"]),
             region_source_names=tuple(sorted(d3["region_source_names"].items())),
             commodity_groups=tuple(d3["commodity_groups"]),
-            commodity_token_rules=tuple(
-                CommodityRule(group=r["group"], tokens=tuple(r["tokens"]))
-                for r in d3["commodity_token_rules"]
+            commodity_code_rules=tuple(
+                CommodityRule(group=r["group"], codes=tuple(str(c) for c in r["codes"]))
+                for r in d3["commodity_code_rules"]
             ),
             shape_classes=ShapeClasses(**d3["shape_classes"]),
             adequacy=Adequacy(**d3["adequacy"]),
@@ -180,6 +186,14 @@ def load_protocol(path: Path) -> D3Protocol:
             f"adequacy.min_full_support_years {protocol.adequacy.min_full_support_years} "
             f"!= frozen {REQUIRED_ADEQUACY['min_full_support_years']}"
         )
+    if (
+        protocol.adequacy.min_valid_member_fraction
+        != REQUIRED_ADEQUACY["min_valid_member_fraction"]
+    ):
+        raise D3ProtocolError(
+            f"adequacy.min_valid_member_fraction {protocol.adequacy.min_valid_member_fraction} "
+            f"!= frozen {REQUIRED_ADEQUACY['min_valid_member_fraction']}"
+        )
     # Validate selection
     if protocol.selection.use_all_below != REQUIRED_SELECTION["use_all_below"]:
         raise D3ProtocolError(
@@ -196,10 +210,24 @@ def load_protocol(path: Path) -> D3Protocol:
     if missing_procedures:
         raise D3ProtocolError(f"procedures missing required keys: {sorted(missing_procedures)}")
 
-    rule_groups = {rule.group for rule in protocol.commodity_token_rules}
+    rule_groups = {rule.group for rule in protocol.commodity_code_rules}
     unknown = rule_groups - set(protocol.commodity_groups)
     if unknown:
-        raise D3ProtocolError(f"token rules name unknown groups: {sorted(unknown)}")
+        raise D3ProtocolError(f"code rules name unknown groups: {sorted(unknown)}")
+    seen: dict[str, str] = {}
+    for rule in protocol.commodity_code_rules:
+        if not rule.codes:
+            raise D3ProtocolError(f"code rule for group {rule.group!r} has an empty code list")
+        for code in rule.codes:
+            key = code.strip().lower()
+            if not key:
+                raise D3ProtocolError(f"code rule for group {rule.group!r} has an empty code")
+            if key in seen:
+                raise D3ProtocolError(
+                    f"duplicate commodity code {code!r} in rules for {seen[key]!r} and "
+                    f"{rule.group!r} -- first-rule-wins would be ambiguous"
+                )
+            seen[key] = rule.group
     return protocol
 
 
@@ -231,9 +259,9 @@ def classify_commodity(raw: str | None, protocol: D3Protocol) -> str:
     """Map raw MINEDEX commodity text to a frozen group. Refuses blank."""
     if raw is None or not str(raw).strip():
         raise D3ProtocolError("commodity is unclassified: null or blank raw value refused")
-    lowered = str(raw).lower()
-    for rule in protocol.commodity_token_rules:
-        if any(token in lowered for token in rule.tokens):
+    parts = {p.strip().lower() for p in str(raw).split(",")}
+    for rule in protocol.commodity_code_rules:
+        if any(c.strip().lower() in parts for c in rule.codes):
             return rule.group
     return "other"
 

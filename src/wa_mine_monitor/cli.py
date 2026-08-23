@@ -4090,7 +4090,9 @@ def build_d3_inputs_cmd(
                 phase_a_extraction_rows.extend(extraction_rows)
                 decoded = _decode_d3_bands(raw_bands, kind=kind)
                 by_year_source.setdefault(year, {})[source_id] = d3_inputs.year_computable(
-                    decoded, kind=kind
+                    decoded,
+                    kind=kind,
+                    min_valid_member_fraction=protocol.adequacy.min_valid_member_fraction,
                 )
             for year in sorted(candidate_years):
                 by_source = by_year_source.get(year, {})
@@ -4282,6 +4284,7 @@ def build_d3_inputs_cmd(
                 supports=protocol.supports,
                 replicates=protocol.replicates,
                 protocol_digest=frozen_digest,
+                min_valid_member_fraction=protocol.adequacy.min_valid_member_fraction,
             )
             if result is None:
                 continue

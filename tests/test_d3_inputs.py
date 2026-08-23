@@ -191,6 +191,13 @@ def _bands(n):
     }
 
 
+def _bands_with_invalid(n, n_invalid):
+    bands = _bands(n)
+    for i in range(n_invalid):
+        bands["nbart_nir"][i] = np.nan
+    return bands
+
+
 def test_simulate_footprint_year_produces_rows_and_series():
     members = tuple(sorted(("x0y0", r, c) for r in range(12) for c in range(12)))
     result = d3_inputs.simulate_footprint_year(
@@ -203,6 +210,7 @@ def test_simulate_footprint_year_produces_rows_and_series():
         supports=(9, 16),
         replicates=25,
         protocol_digest="d" * 64,
+        min_valid_member_fraction=0.95,
     )
     assert result is not None
     rows, reduced_series = result
@@ -237,6 +245,7 @@ def test_simulate_footprint_year_requires_canonical_member_order():
             supports=(9,),
             replicates=5,
             protocol_digest="d" * 64,
+            min_valid_member_fraction=0.95,
         )
 
 
@@ -253,13 +262,30 @@ def test_simulate_footprint_year_refuses_below_144_support():
             supports=(9,),
             replicates=5,
             protocol_digest="d" * 64,
+            min_valid_member_fraction=0.95,
         )
 
 
-def test_simulate_footprint_year_invalid_pixel_returns_none():
+def test_simulate_footprint_year_below_valid_fraction_returns_none():
     members = tuple(sorted(("x0y0", r, c) for r in range(12) for c in range(12)))
-    bands = _bands(144)
-    bands["nbart_nir"][3] = np.nan
+    result = d3_inputs.simulate_footprint_year(
+        maus_id="M1",
+        year=2005,
+        source_id="dea_gm_ls5t",
+        members=members,
+        band_values=_bands_with_invalid(144, 9),  # 135 valid < 137
+        kind="geomedian",
+        supports=(9,),
+        replicates=5,
+        protocol_digest="d" * 64,
+        min_valid_member_fraction=0.95,
+    )
+    assert result is None  # not computable at 93.75% valid
+
+
+def test_simulate_footprint_year_uses_valid_members_only():
+    members = tuple(sorted(("x0y0", r, c) for r in range(12) for c in range(12)))
+    bands = _bands_with_invalid(144, 5)  # members 0..4 invalid, 139 valid
     result = d3_inputs.simulate_footprint_year(
         maus_id="M1",
         year=2005,
@@ -267,18 +293,114 @@ def test_simulate_footprint_year_invalid_pixel_returns_none():
         members=members,
         band_values=bands,
         kind="geomedian",
-        supports=(9,),
+        supports=(9, 100),
+        replicates=20,
+        protocol_digest="d" * 64,
+        min_valid_member_fraction=0.95,
+    )
+    assert result is not None
+    rows, reduced_series = result
+    frame = pd.DataFrame(rows)
+    assert (frame["full_support_px"] == 144).all()
+    assert (frame["valid_support_px"] == 139).all()
+    # full value is the mean over the 139 valid members only
+    valid = d3_inputs.valid_member_mask(bands, kind="geomedian")
+    expected = d3_inputs.geomedian_metrics({b: v[valid] for b, v in bands.items()})
+    nbr_rows = frame[frame["metric_id"] == "nbr"]
+    assert nbr_rows["full_value"].unique().tolist() == pytest.approx([expected["nbr"]])
+    # no NaN ever reached a replicate value
+    assert all(np.isfinite(v).all() for v in reduced_series.values())
+    assert frame["replicate_abs_errors"].map(lambda v: np.isfinite(v).all()).all()
+
+
+def test_simulate_footprint_year_never_draws_an_invalid_member():
+    members = tuple(sorted(("x0y0", r, c) for r in range(12) for c in range(12)))
+    invalid = set(members[:5])
+    seed = f"{'d' * 64}|M1|dea_gm_ls5t|2005"
+    valid_members = tuple(m for m in members if m not in invalid)
+    for replicate in range(100):
+        sample = d3_inputs.sample_support(
+            valid_members, 100, replicate=replicate, seed_material=seed
+        )
+        assert not (set(sample) & invalid)
+        # ranking the valid subset == full ranking with invalid members removed
+        full_rank = d3_inputs._rank_all(members, replicate=replicate, seed_material=seed)
+        assert sample == tuple(m for m in full_rank if m not in invalid)[:100]
+
+
+def test_simulate_footprint_year_refuses_sub_full_support_above_valid_count():
+    members = tuple(sorted(("x0y0", r, c) for r in range(12) for c in range(12)))
+    with pytest.raises(d3_inputs.D3InputsError, match="valid"):
+        d3_inputs.simulate_footprint_year(
+            maus_id="M1",
+            year=2005,
+            source_id="dea_gm_ls5t",
+            members=members,
+            band_values=_bands_with_invalid(144, 5),
+            kind="geomedian",
+            supports=(140,),  # 140 > 139 valid and 140 is not the full-support row
+            replicates=5,
+            protocol_digest="d" * 64,
+            min_valid_member_fraction=0.95,
+        )
+
+
+def test_simulate_footprint_year_full_support_row_is_the_reference_when_valid_below_144():
+    # Frozen supports always include 144; with 139 valid members the 144 row
+    # must be emitted (not refused) as the reference itself: zero error,
+    # reduced series == full series.
+    members = tuple(sorted(("x0y0", r, c) for r in range(12) for c in range(12)))
+    result = d3_inputs.simulate_footprint_year(
+        maus_id="M1",
+        year=2005,
+        source_id="dea_gm_ls5t",
+        members=members,
+        band_values=_bands_with_invalid(144, 5),
+        kind="geomedian",
+        supports=(100, 144),
         replicates=5,
         protocol_digest="d" * 64,
+        min_valid_member_fraction=0.95,
     )
-    assert result is None  # not full-support computable
+    assert result is not None
+    rows, reduced_series = result
+    full_rows = [r for r in rows if r["support_px"] == 144]
+    assert full_rows and all(r["valid_support_px"] == 139 for r in full_rows)
+    assert all(max(r["replicate_abs_errors"]) == 0.0 for r in full_rows)
+    for (metric, support), series in reduced_series.items():
+        if support == 144:
+            full_value = next(r["full_value"] for r in full_rows if r["metric_id"] == metric)
+            assert series == [full_value] * 5
 
 
-def test_year_computable_matches_simulate_none_result():
-    bands = _bands(144)
-    assert d3_inputs.year_computable(bands, kind="geomedian") is True
-    bands["nbart_nir"][3] = np.nan
-    assert d3_inputs.year_computable(bands, kind="geomedian") is False
+def test_year_computable_uses_valid_member_fraction():
+    # 144 members: ceil(0.95 * 144) = 137 valid required.
+    ok_96 = _bands_with_invalid(144, 5)  # 139 valid = 96.5%
+    bad_94 = _bands_with_invalid(144, 9)  # 135 valid = 93.75%
+    assert d3_inputs.year_computable(ok_96, kind="geomedian", min_valid_member_fraction=0.95)
+    assert not d3_inputs.year_computable(bad_94, kind="geomedian", min_valid_member_fraction=0.95)
+    assert d3_inputs.year_computable(_bands(144), kind="geomedian", min_valid_member_fraction=1.0)
+    assert not d3_inputs.year_computable(ok_96, kind="geomedian", min_valid_member_fraction=1.0)
+
+
+def test_year_computable_threshold_is_exact_at_the_boundary():
+    # 100 members at 0.95 -> exactly 95 valid is computable, 94 is not
+    # (guards float noise in 0.95 * 100).
+    assert d3_inputs.year_computable(
+        _bands_with_invalid(100, 5), kind="geomedian", min_valid_member_fraction=0.95
+    )
+    assert not d3_inputs.year_computable(
+        _bands_with_invalid(100, 6), kind="geomedian", min_valid_member_fraction=0.95
+    )
+
+
+def test_valid_member_mask_for_fc_kind():
+    values = {
+        "bs_pc_50": np.array([10.0, np.nan, 30.0]),
+        "pv_pc_50": np.array([1.0, 2.0, 3.0]),
+        "npv_pc_50": np.array([1.0, 2.0, 3.0]),
+    }
+    assert d3_inputs.valid_member_mask(values, kind="fc").tolist() == [True, False, True]
 
 
 import hashlib
@@ -318,3 +440,30 @@ def test_rank_all_is_a_strict_prefix_relation_across_supports():
     ranked = d3_inputs._rank_all(members, replicate=3, seed_material="s")
     assert d3_inputs.sample_support(members, 144, replicate=3, seed_material="s") == ranked[:144]
     assert d3_inputs.sample_support(members, 300, replicate=3, seed_material="s") == ranked[:300]
+
+
+def _procedures():
+    from pathlib import Path
+
+    import yaml
+
+    cfg = Path(__file__).resolve().parents[1] / "config" / "d3.yaml"
+    return dict(yaml.safe_load(cfg.read_text())["d3"]["procedures"])
+
+
+def test_check_procedures_consistency_accepts_frozen_text():
+    d3_inputs.check_procedures_consistency(_procedures())
+
+
+def test_check_procedures_consistency_refuses_substring_commodity_text():
+    procedures = _procedures()
+    procedures["commodity_mode"] = "case-insensitive substring match"
+    with pytest.raises(d3_inputs.D3InputsError, match="commodity_mode"):
+        d3_inputs.check_procedures_consistency(procedures)
+
+
+def test_check_procedures_consistency_refuses_all_pixels_valid_text():
+    procedures = _procedures()
+    procedures["full_support_year"] = "Every contributing band pixel non-null"
+    with pytest.raises(d3_inputs.D3InputsError, match="full_support_year"):
+        d3_inputs.check_procedures_consistency(procedures)

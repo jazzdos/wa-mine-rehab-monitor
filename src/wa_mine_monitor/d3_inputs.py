@@ -232,10 +232,25 @@ def _require_canonical(members: Sequence[Member]) -> tuple[Member, ...]:
     return canonical
 
 
-def year_computable(band_values: Mapping[str, np.ndarray], *, kind: str) -> bool:
-    """Phase A computability: every member pixel valid (design decision 11)."""
-    mask = geomedian_valid_mask(band_values) if kind == "geomedian" else fc_valid_mask(band_values)
-    return bool(mask.all())
+def valid_member_mask(band_values: Mapping[str, np.ndarray], *, kind: str) -> np.ndarray:
+    """Per-member validity for `kind` ("geomedian" | "fc"), positionally
+    aligned to the canonical member order the arrays were read in."""
+    return geomedian_valid_mask(band_values) if kind == "geomedian" else fc_valid_mask(band_values)
+
+
+def _mask_computable(mask: np.ndarray, min_valid_member_fraction: float) -> bool:
+    """valid >= ceil(fraction * members). `round(.., 9)` keeps `0.95 * 100`
+    (not exactly 95.0 in binary) from ceiling to 96."""
+    required = math.ceil(round(min_valid_member_fraction * len(mask), 9))
+    return int(mask.sum()) >= required
+
+
+def year_computable(
+    band_values: Mapping[str, np.ndarray], *, kind: str, min_valid_member_fraction: float
+) -> bool:
+    """Phase A computability (decision 2026-08-23): at least
+    ceil(min_valid_member_fraction * members) member pixels valid."""
+    return _mask_computable(valid_member_mask(band_values, kind=kind), min_valid_member_fraction)
 
 
 def simulate_footprint_year(
@@ -249,14 +264,16 @@ def simulate_footprint_year(
     supports: Sequence[int],
     replicates: int,
     protocol_digest: str,
+    min_valid_member_fraction: float,
 ) -> tuple[list[dict[str, object]], dict[tuple[str, int], list[float]]] | None:
     """Full + reduced metrics for one footprint-year-collection (Phase B).
 
     `members` MUST be canonical (sorted, unique) and `band_values` arrays
     MUST be positionally aligned to it -- refused otherwise, because a
     silent misalignment assigns raster values to the wrong pixels.
-    Support below 144 is a caller error (refused); an invalid pixel is a
-    data property (year not computable -> None).
+    Support below 144 is a caller error (refused); fewer than
+    ceil(min_valid_member_fraction * members) valid pixels is a data
+    property (year not computable -> None).
     """
     canonical = _require_canonical(members)
     if len(canonical) < d3_protocol.MIN_FULL_SUPPORT_PX:
@@ -270,12 +287,17 @@ def simulate_footprint_year(
                 f"band {band} has {len(values)} values for "
                 f"{len(canonical)} members -- misaligned input"
             )
-    if not year_computable(band_values, kind=kind):
+    valid = valid_member_mask(band_values, kind=kind)
+    if not _mask_computable(valid, min_valid_member_fraction):
         return None
+    # Decision 2026-08-23: full and replicate values are computed over the
+    # VALID members only; invalid members are never sampled.
+    valid_members = tuple(m for m, ok in zip(canonical, valid, strict=True) if ok)
+    valid_values = {band: values[valid] for band, values in band_values.items()}
 
     metric_fn = geomedian_metrics if kind == "geomedian" else fc_metrics
-    full = metric_fn(band_values)
-    member_index = {m: i for i, m in enumerate(canonical)}
+    full = metric_fn(valid_values)
+    member_index = {m: i for i, m in enumerate(valid_members)}
     seed_material = f"{protocol_digest}|{maus_id}|{source_id}|{year}"
 
     # One ranking per replicate, computed ONCE and reused for every support
@@ -283,23 +305,36 @@ def simulate_footprint_year(
     # `supports` is frozen at 8 values and `replicates` at 100 (D13 C1/D1),
     # so this avoids re-sorting (and re-hashing every member) 8x over.
     replicate_rankings = {
-        replicate: _rank_all(canonical, replicate=replicate, seed_material=seed_material)
+        replicate: _rank_all(valid_members, replicate=replicate, seed_material=seed_material)
         for replicate in range(replicates)
     }
 
     rows: list[dict[str, object]] = []
     reduced_series: dict[tuple[str, int], list[float]] = {}
     for support in supports:
-        if support > len(canonical):
-            raise D3InputsError(
-                f"requested support {support} exceeds available {len(canonical)} members"
-            )
+        if support > len(valid_members):
+            if support != d3_protocol.MIN_FULL_SUPPORT_PX:
+                raise D3InputsError(
+                    f"requested support {support} exceeds the {len(valid_members)} valid "
+                    f"members of {len(canonical)} (maus_id={maus_id}, source_id={source_id}, "
+                    f"year={year})"
+                )
+            # The full-support row IS the reference: sample = all valid members.
+            draw = len(valid_members)
+        else:
+            draw = support
         per_metric_errors: dict[str, list[float]] = {m: [] for m in full}
         per_metric_reduced: dict[str, list[float]] = {m: [] for m in full}
         for replicate in range(replicates):
-            sample = replicate_rankings[replicate][:support]
-            indices = [member_index[m] for m in sample]
-            reduced = metric_fn({band: values[indices] for band, values in band_values.items()})
+            if draw == len(valid_members):
+                # Same member set AND same order as `full` -- guarantees an
+                # exact (not merely close) match, since summation order
+                # affects floating-point results.
+                indices = list(range(len(valid_members)))
+            else:
+                sample = replicate_rankings[replicate][:draw]
+                indices = [member_index[m] for m in sample]
+            reduced = metric_fn({band: values[indices] for band, values in valid_values.items()})
             for metric, value in reduced.items():
                 per_metric_errors[metric].append(abs(value - full[metric]))
                 per_metric_reduced[metric].append(value)
@@ -312,7 +347,7 @@ def simulate_footprint_year(
                     "metric_id": metric,
                     "support_px": support,
                     "full_support_px": len(canonical),
-                    "valid_support_px": len(canonical),
+                    "valid_support_px": len(valid_members),
                     "full_value": full[metric],
                     "replicate_abs_errors": sorted(errors),
                     "n_replicates": replicates,
@@ -489,6 +524,20 @@ def check_procedures_consistency(procedures: Mapping[str, str]) -> None:
         raise D3InputsError(
             f"protocol drift: procedures.decode_rules no longer names decode "
             f"constant(s) {missing_decode} that dea_raster.py actually implements"
+        )
+
+    commodity_mode = str(procedures.get("commodity_mode", ""))
+    if "exact token" not in commodity_mode:
+        raise D3InputsError(
+            "protocol drift: procedures.commodity_mode no longer describes the exact "
+            "token match d3_protocol.classify_commodity implements (decision 2026-08-23)"
+        )
+
+    full_support_year = str(procedures.get("full_support_year", ""))
+    if "min_valid_member_fraction" not in full_support_year:
+        raise D3InputsError(
+            "protocol drift: procedures.full_support_year no longer names the "
+            "min_valid_member_fraction rule year_computable implements (decision 2026-08-23)"
         )
 
 
