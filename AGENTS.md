@@ -1,12 +1,8 @@
-profile: research-code
-status: active
-standards: ~/Documents/standards/STANDARDS.md
-
 # wa-mine-rehab-monitor — instruction file
 
-This is CLAUDE.md: Claude Code's automatic project context, loaded at
-the start of every session in this repo. AGENTS.md carries the same
-content for non-Claude coding agents; keep the two in sync.
+This is AGENTS.md: the AGENTS.md-convention file read by non-Claude
+coding agents (e.g. Codex). Claude Code reads CLAUDE.md instead; keep
+the two in sync.
 
 ## What this project is
 
