@@ -112,6 +112,13 @@ uv run wa-mine-monitor derive-d3-threshold --config config/luminosity.yaml --dat
 uv run wa-mine-monitor apply-d3-threshold  --config config/luminosity.yaml --date $D
 ```
 
+Pass `--read-workers 8` (default) to `build-d3-inputs` on luminosity; measured
+2026-08-22: serial reads are ~0.25 s round-trip each (≈1.5–2 days for Phase
+A+B), link capacity 15 MB/s. Required env for the public DEA bucket:
+`AWS_NO_SIGN_REQUEST=YES AWS_REGION=ap-southeast-2`; use
+`CPL_VSIL_CURL_CACHE_SIZE=1073741824 GDAL_CACHEMAX=1024` — the curl cache is
+RAM (50 GB OOM-killed the first run).
+
 Expected outputs (each with a `.manifest.json` beside it):
 - `curated/d3-inputs/$D/` — five tables incl. `footprint_support.parquet`
 - `curated/d3-threshold/$D/threshold.json` — carries `n_star`, `criteria_passed`, `protocol_digest` equal to the 2026-08-18 freeze

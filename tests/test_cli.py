@@ -14,7 +14,7 @@ from shapely.geometry import Polygon, box
 from shapely.ops import unary_union
 from typer.testing import CliRunner
 
-from wa_mine_monitor import d3_protocol, manifests, register, snapshots, tables
+from wa_mine_monitor import d3_inputs, d3_protocol, manifests, register, snapshots, tables
 from wa_mine_monitor.cli import (
     _collect_git_state_disclosing_gaps,
     _latest_curated_dated_dir,
@@ -1654,6 +1654,34 @@ def _seed_d3_inputs_chain(
     return D3Seed(cfg_file=cfg_file, protocol_digest=protocol_digest, d3_yaml_path=d3_yaml_path)
 
 
+def test_run_reads_in_serial_order_preserves_order_and_first_error():
+    from wa_mine_monitor import cli as cli_mod
+
+    calls: list[int] = []
+
+    def make(i):
+        def job():
+            calls.append(i)
+            if i in (2, 4):
+                raise d3_inputs.D3InputsError(f"job {i} failed")
+            return i * 10
+
+        return job
+
+    # All succeed: results come back in submission order regardless of workers.
+    out = cli_mod._run_reads_in_serial_order([make(0), make(1), make(3)], workers=4)
+    assert out == [0, 10, 30]
+
+    # Two failures: the FIRST IN SERIAL ORDER (job 2) is raised, not job 4.
+    with pytest.raises(d3_inputs.D3InputsError, match="job 2 failed"):
+        cli_mod._run_reads_in_serial_order([make(0), make(2), make(4)], workers=4)
+
+    # workers=1 uses the same path.
+    assert cli_mod._run_reads_in_serial_order([make(5)], workers=1) == [50]
+    with pytest.raises(ValueError, match="read_workers"):
+        cli_mod._run_reads_in_serial_order([make(5)], workers=0)
+
+
 def test_build_d3_inputs_end_to_end_over_fixtures(tmp_path, monkeypatch):
     seed = _seed_d3_inputs_chain(tmp_path, monkeypatch)
     data_root = tmp_path / "data"
@@ -1687,6 +1715,73 @@ def test_build_d3_inputs_end_to_end_over_fixtures(tmp_path, monkeypatch):
 
     assert payload["n_selected_footprints"] >= 10
     assert payload["n_candidate_footprints"] >= payload["n_selected_footprints"]
+
+
+def test_build_d3_inputs_parallel_reads_are_byte_identical_to_serial(tmp_path, monkeypatch):
+    """--read-workers changes wall-clock only: every output table must be
+    byte-identical between 1 and 4 workers, and the manifest discloses it.
+
+    A single seed is reused for both runs (rather than one seed per root):
+    the raster hrefs `_seed_d3_rasters` writes are absolute paths under
+    `tmp_path`, so two independently-seeded roots would embed different
+    `href` strings in `extraction_assets.parquet` and fail this comparison
+    for a reason that has nothing to do with `--read-workers`. Reusing one
+    seed and varying only `--date` (no output column encodes `date`, per
+    `d3_inputs.D3_EXTRACTION_ASSETS_SCHEMA` et al.) isolates the read-worker
+    count as the only variable.
+    """
+    import hashlib
+
+    seed = _seed_d3_inputs_chain(tmp_path, monkeypatch)
+    dates = {1: "2026-08-18", 4: "2026-08-19"}
+    digests: dict[int, dict[str, str]] = {}
+    for workers, date in dates.items():
+        result = runner.invoke(
+            app,
+            [
+                "build-d3-inputs",
+                "--config",
+                str(seed.cfg_file),
+                "--protocol-config",
+                str(seed.d3_yaml_path),
+                "--date",
+                date,
+                "--read-workers",
+                str(workers),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        out_dir = tmp_path / "data" / "curated" / "d3-inputs" / date
+        digests[workers] = {
+            p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sorted(out_dir.glob("*.parquet"))
+        }
+        manifest = json.loads(
+            (out_dir / "footprint_support.parquet.run_manifest.json").read_text(encoding="utf-8")
+        )
+        assert manifest["resolved_args"]["read_workers"] == workers
+    assert len(digests[1]) == 5
+    assert digests[1] == digests[4]
+
+
+def test_build_d3_inputs_refuses_read_workers_below_one(tmp_path, monkeypatch):
+    seed = _seed_d3_inputs_chain(tmp_path, monkeypatch)
+    result = runner.invoke(
+        app,
+        [
+            "build-d3-inputs",
+            "--config",
+            str(seed.cfg_file),
+            "--protocol-config",
+            str(seed.d3_yaml_path),
+            "--date",
+            "2026-08-18",
+            "--read-workers",
+            "0",
+        ],
+    )
+    assert result.exit_code != 0
+    assert not (tmp_path / "data" / "curated" / "d3-inputs" / "2026-08-18").exists()
 
 
 def test_build_d3_inputs_excludes_footprints_outside_rdc_regions(tmp_path, monkeypatch):
