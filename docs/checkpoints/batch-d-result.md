@@ -38,18 +38,18 @@ Required fix is a protocol change (token rules over MINEDEX codes, e.g. `Fe`/`Ma
 
 Decision: `docs/decisions/2026-08-23-d3-commodity-codes-and-valid-fraction.md` (supersedes the 2026-08-18 freeze; `curated/d3-protocol/2026-08-18` moved to `curated/d3-protocol.superseded-2026-08-18` on luminosity).
 
-- **Frozen protocol digest:** _pending_ (freeze 2026-08-23)
-- **Commit:** _pending_
-- **Candidate footprint counts per stratum:** _pending_ (dry-run expectation: gold 726 / other 267 / iron_ore 136 / nickel 95 / mineral_sands 16 / bauxite_alumina 12; 17 adequate strata)
-- **Selected footprint counts per stratum:** _pending_ (dry-run expectation: 416 selected)
-- **Footprint-years simulated:** _pending_
-- **Footprint-years not computable:** _pending_
-- **computable_fraction per adequate stratum:** _pending_
-- **n_star (threshold):** _pending_
-- **criteria_passed:** _pending_
-- **Per-criterion margins with counts:** _pending_
-- **Eligibility counts by trajectory_status:** _pending_
-- **Run timing:** _pending_ (start/end AWST, `--read-workers 32`, tmux `wmm-d3`, logs `reports/{freeze-d3-protocol,build-d3-inputs,derive-d3-threshold,apply-d3-threshold}-2026-08-23.log`)
-- **Copied to lux:** _pending_ (small tables only; `support_inputs.parquet` left on luminosity)
+- **Frozen protocol digest:** `10875cef8450c96a1bdc606aebc47d6a1621e3bf72344d45afe1537c431d06fa` (freeze 2026-08-23)
+- **Commit:** 98488ae (`feat(d3): exact MINEDEX commodity codes and valid-member-fraction computability`, now on main)
+- **Candidate footprint counts per stratum:** gold 726 / other 247 / iron_ore 136 / nickel 95 / mineral_sands 16 / bauxite_alumina 12; total 1,232; 17 adequate strata as expected (dry-run expectation was other 267 — actual 247; 20 footprints fall outside RDC regions and were dropped)
+- **Selected footprint counts per stratum:** 413 total (gold 143 / other 131 / iron_ore 88 / nickel 51 / bauxite_alumina 0 / mineral_sands 0); dry-run expected 416
+- **Footprint-years simulated:** 15,847 computable of 16,517 attempted (across the 17 adequate strata)
+- **Footprint-years not computable:** 670 (4.1%)
+- **computable_fraction per adequate stratum:** all 17 pass the ≥0.90 gate; range 0.9050 (other_wa:iron_ore:intermediate, 362/400) to 0.9750; most strata 0.94–0.975
+- **n_star (threshold):** 144 px (forced-144 fallback — every candidate support size 9/16/25/36/49/64/100/144 px fails at least one criterion, so no support passes and 144 is disclosed, not selected)
+- **criteria_passed:** false
+- **Per-criterion margins with counts:** across all 8 supports, 2,584 criterion cells: computable_fraction 136/136 pass; p90_abs_error 1,100 pass / 124 fail; spearman_median 558 pass / 666 fail. At n_star=144 px, 25 cells still fail — all `spearman_median` (< 0.95), concentrated in `dea_gm_ls8cls9c` NBR/NDMI (plus a few `dea_gm_ls7e` and one `dea_fc_pc` NPV cell). Worst margins: goldfields_esperance:nickel:compact ls8c/ls9c NDMI 0.522, other_wa:gold:intermediate NDMI 0.528, NBR values 0.57–0.59 in the same strata; near-misses up to 0.9499. Geomedian SWIR-index rank stability at 144 px is the binding failure, not computability or absolute error.
+- **Eligibility counts by trajectory_status:** 50,164 rows — eligible 0, insufficient_pixel_support 0, threshold_not_computed 10,910, no_usable_footprint 30,833, crosswalk_not_high_confidence 8,421 (`curated/register/2026-08-23/register.parquet` on luminosity)
+- **Run timing:** freeze 2026-08-24 01:27; first build-d3-inputs attempt failed at 01:27 (stale `register/2026-08-21` moved aside), relaunched 01:28; build done 13:04, derive done 13:16, apply done 13:16 (log timestamps +10:00; `--read-workers 32`, tmux `wmm-d3`, logs `/mnt/data/wa-mine-monitor/reports/{freeze-d3-protocol,build-d3-inputs,derive-d3-threshold,apply-d3-threshold,d3-chain}-2026-08-23.log`)
+- **Copied to lux:** not yet (small tables only; `support_inputs.parquet` stays on luminosity)
 
 Batch E E4/E5 gate: reopen only if `criteria_passed=true`.
