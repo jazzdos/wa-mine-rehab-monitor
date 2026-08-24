@@ -1,8 +1,4 @@
-# wa-mine-rehab-monitor — instruction file
-
-This is AGENTS.md: the AGENTS.md-convention file read by non-Claude
-coding agents (e.g. Codex). Claude Code reads CLAUDE.md instead; keep
-the two in sync.
+# wa-mine-rehab-monitor
 
 ## What this project is
 
@@ -26,19 +22,14 @@ performance findings, never operational rehabilitation dates.
 - Verification battery, CI order (`.github/workflows/test.yml`):
   `uv run ruff check src tests`, `uv run ruff format --check src tests`,
   `uv run mypy src scripts`, `uv run pytest -q -rs`.
-- Before writing or editing Python, run kit:code-standards; HCL/Terraform
-  standards apply once infra work starts.
 - Dated snapshots, run manifests, fail-closed licence gates at the
   export boundary — read `docs/decisions/` and the newest
   `docs/handoffs/handoff_*.md` before touching acquisition, licence, or
   owners code.
 - No project-local skills or agents until a workflow here proves
-  repeatable across several sessions; use the installed kit chain
-  (kit:build-flow -> kit:verify -> kit:finish-branch; kit:debugging
-  before fixes) and global skills meanwhile.
+  repeatable across several sessions.
 
 ## Machines
 
-Same policy as `~/.claude/CLAUDE.md`: MacBook Air (mps) is the daily
-driver; luminosity and the Windows GPU box are not part of this
-project's normal loop.
+MacBook Air (mps) is the daily driver; luminosity and the Windows GPU
+box are not part of this project's normal loop.
