@@ -29,6 +29,7 @@ for the batches not yet run, with the measurements behind it, is in
 | A4 | 2026-08-21 | Footprints outside every RDC polygon excluded | none | `decisions/2026-08-21-d3-outside-rdc-exclusion.md` |
 | A5 | 2026-08-21 | Batch D decision 17: VSI curl cache is RAM, not disk | n/a | `plans/2026-08-16-batch-d-implementation.md`, commit `b1891d7` |
 | A6 | 2026-08-23 | MINEDEX commodity codes + valid-member fraction | **new lineage** | `decisions/2026-08-23-d3-commodity-codes-and-valid-fraction.md` |
+| A7 | 2026-08-25 | E5 Huntly gate re-scoped to engine parity on the jarrah pilot cube | none | `decisions/2026-08-25-e5-engine-parity-rescope.md` |
 
 **A1 — execution host.** Batch C's measured volume re-derivation
 (597.1 GB windowed, 3.30 TB whole-tile upper bound) excluded the
@@ -96,6 +97,17 @@ superseded by the 2026-08-23 lineage
 the superseded protocol directory is kept, not deleted, and the failed
 run's outputs stay under their own date as the record that triggered
 the change.
+
+**A7 — E5 gate re-scope.** D13 E5's gate text never named what is
+compared to what; the E4/E5 draft plan read it as monitor DEA-derived
+footprint means against the jarrah Huntly reference, which measurement
+showed is geometrically unpassable (a 9-pixel plot mean against the
+411,895-pixel `a6ddd34a1d67` footprint mean at 1e-6). Re-scoped to the
+design-§10 reading: the monitor's zonal engine samples jarrah's own
+pilot composite COGs at jarrah's site points (3×3, mean over non-NaN)
+and must reproduce `series_incumbent_w1.parquet`. Tolerances, the
+validation-before-extraction ordering, and the verdict artefact as sole
+unlock are unchanged, so no protocol digest is affected.
 
 ### What was deliberately not amended
 
@@ -244,22 +256,28 @@ misread the nulls.
 | ID | Item | Blocks |
 |---|---|---|
 | ~~O1~~ | ~~Outside-RDC fraction against `n_for_ceiling`~~ | **Closed 2026-08-25: 20/1,252 = 1.60%** |
-| O2 | Batch E entry under the L4 disclosure needs an owner decision in `docs/decisions/` | All of Batch E: `eligible` is 0 until then |
-| O3 | Huntly validation verdict does not exist, and the gate as drafted cannot pass | Statewide extraction (`require_huntly_gate`) |
+| ~~O2~~ | ~~Batch E entry under the L4 disclosure needs an owner decision~~ | **Closed 2026-08-25: `decisions/2026-08-25-batch-e-forced-threshold-entry.md`** |
+| O3 | Huntly validation verdict does not exist | Statewide extraction (`require_huntly_gate`) |
 | O4 | Tolerance-gated concordance not evaluated | Nothing; deferred by choice |
 | O5 | D5 Pages gate is pre-registered as recordable-failed | Nothing; Batch G finishes privately |
-| O6 | Shared-footprint product framing (L17) undecided | Batch G G3/G4 site build |
+| ~~O6~~ | ~~Shared-footprint product framing (L17) undecided~~ | **Closed 2026-08-25: `decisions/2026-08-25-tier1-product-framing.md`** |
 | O7 | No SILO account or snapshot exists on either data root | Batch F F5 |
-| O8 | Which crosswalk artefact the 2026-08-23 register was built from | Task 0's six-count live assertion, not the eligibility split |
+| O8 | Why the eligibility replay buckets 933 never-judged sites differently from the register build | Task 0's six-count live assertion, not the eligibility split |
 
 **O8.** Replaying the eligibility join against
 `curated/crosswalk/2026-08-16` reproduces the judged population exactly
 (10,910) but shifts 933 sites between `no_usable_footprint` (31,766
 replayed vs 30,833 recorded) and `crosswalk_not_high_confidence` (7,488
 vs 8,421). Both are never-judged buckets, so the 10,372/538 eligibility
-split is unaffected. Resolve by comparing the crosswalk digest in the
-register run manifest against each dated crosswalk's SHA256SUMS. Full
-statement in `docs/reviews/2026-08-25-batch-e-findings.md`.
+split is unaffected. **Narrowed 2026-08-25:** the register run
+manifest's recorded crosswalk digest
+(`10e1bfe0…`) matches `curated/crosswalk/2026-08-16/crosswalk.parquet`
+on disk exactly, so "built from a differently dated crosswalk" is
+refuted; the live hypothesis is that the replay's
+bucketing/de-duplication semantics differ from
+`assign_trajectory_eligibility`'s. Open until the replay reproduces all
+six counts. Full statement in
+`docs/reviews/2026-08-25-batch-e-findings.md`.
 
 **O1 — closed.** Read from the 2026-08-23 `footprint_support.parquet`:
 20 of 1,252 Tier-1 footprints with usable Maus geometry are outside
@@ -267,17 +285,30 @@ every RDC polygon, **1.60%** against the 5% ceiling, so the ceiling has
 headroom. The retracted 1.1% figure used 1,753 (all Maus WA footprints)
 as its denominator; 1,252 is the correct one.
 
-**O3.** The E5 gate compares a 9-pixel plot mean against a 411,895-pixel
-footprint mean at a 1e-6 tolerance — not passable at any parameter
-setting. The re-scope to engine parity against the jarrah pilot cube is
-specified in `docs/plans/2026-08-22-batch-e-e4-e5.md` and needs its own
-decision record. Evidence in
+**O3.** The gate-as-drafted deadlock (a 9-pixel plot mean against a
+411,895-pixel footprint mean at 1e-6, not passable at any parameter
+setting) is resolved by amendment A7
+(`decisions/2026-08-25-e5-engine-parity-rescope.md`): E5 now compares
+the monitor's zonal engine against the jarrah pilot cube. O3 stays open
+because the verdict artefact under `curated/huntly-validation/<date>/`
+does not exist yet; it remains the sole unlock for statewide
+extraction. Evidence in
 `docs/reviews/2026-08-25-remainder-critical-review.md` §2.2.
 
-**O2.** `criteria_passed=false` stands, so the Batch E E4/E5 gate does
-not reopen on its own. Proceeding requires an owner decision to operate
-under the forced-144 threshold with the Spearman failures labelled,
-recorded before E4/E5 work starts.
+**O2 — closed.** Owner decision 2026-08-25
+(`decisions/2026-08-25-batch-e-forced-threshold-entry.md`): Batch E
+operates under the forced-144 threshold with the Spearman failures
+labelled, via the Task 0 forced-threshold eligibility path.
+`criteria_passed=false` stands in the manifest; every row carries
+`d3_forced_threshold=true` and the L4 disclosure travels downstream.
+
+**O6 — closed.** Owner decision 2026-08-25
+(`decisions/2026-08-25-tier1-product-framing.md`): Tier 1 stays
+site-keyed with a mandatory `shared_footprint_site_count` field in the
+Batch E partition schema; every rendered surface must state the sharing
+when the count exceeds 1. Private-only: no non-MINEDEX public lane is
+built, and the D5 Pages gate records failed exactly as pre-registered
+(O5 unchanged).
 
 **O3.** D13 E4 acceptance: `extract-trajectories` refuses statewide
 mode until a verified passing Huntly verdict exists under

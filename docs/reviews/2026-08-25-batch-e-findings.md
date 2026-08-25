@@ -31,21 +31,32 @@ Every finding carries a **Confidence** line with one of three values:
   where disagreement is legitimate and where the owner decisions sit.
 
 Three findings need an owner decision before Batch E can run: **F1**
-(forced-threshold path), **F3** (what the E5 gate compares), **F4**
+(forced-threshold path), **F6** (what the E5 gate compares), **F4**
 (what a shared-footprint trajectory is allowed to claim). The rest are
 either already fixed in the plan or are Batch F/G scheduling.
+*(Corrected 2026-08-25: an earlier wording of this list named F3 where
+it meant F6. All three decisions were taken 2026-08-25; see
+`docs/decisions/2026-08-25-batch-e-forced-threshold-entry.md`,
+`2026-08-25-e5-engine-parity-rescope.md`, and
+`2026-08-25-tier1-product-framing.md`.)*
 
 ### Caveat carried on every population figure
 
 The eligibility replays below join the 2026-08-23 register against
-`curated/crosswalk/2026-08-16`. The register itself was built against a
-crosswalk artefact whose `no_usable_footprint` and
-`crosswalk_not_high_confidence` totals differ by 933 sites from that
-join (31,766/7,488 replayed vs 30,833/8,421 recorded). **The judged
-population matches exactly at 10,910**, which is the only population the
-eligibility split depends on, so the 10,372/538 figures stand. The 933
-shift sits entirely inside the two never-judged buckets. Resolving which
-crosswalk artefact the register was built from is open item **O8** below.
+`curated/crosswalk/2026-08-16`. That replay's `no_usable_footprint` and
+`crosswalk_not_high_confidence` totals differ by 933 sites from the
+register's recorded values (31,766/7,488 replayed vs 30,833/8,421
+recorded). **The judged population matches exactly at 10,910**, which is
+the only population the eligibility split depends on, so the 10,372/538
+figures stand. The 933 shift sits entirely inside the two never-judged
+buckets. *(Corrected 2026-08-25: the replayed 31,766/7,488 figures come
+from the review session's own join, not from
+`diag_batch_e_readiness.py --check eligibility`, which reprints only the
+register's recorded values. They coincide with the register
+run-manifest's support accounting: `n_support_not_computed` = 31,766,
+and `n_support_computed` 18,398 − 10,910 judged = 7,488.)* Resolving why
+the replay buckets differently from the register build is open item
+**O8** below.
 
 ---
 
@@ -168,7 +179,7 @@ site, that loop re-reads the same pixels 25.4 times over.
 | Member px per collection-year, loop over distinct footprints | 4.03 M |
 | Member px per collection-year, loop over sites (as drafted) | 102.2 M |
 | Amplification | **25.4×** |
-| Eligible sites on a shared footprint | 10,186 of 10,372 (**98.2%**) |
+| Eligible sites on a shared footprint | 10,185 of 10,372 (**98.2%**) |
 | Sites per footprint | mean 10.5, max 324 |
 
 Against Batch C's measured windowed-read budget of **597.1 GB** for the
@@ -205,7 +216,7 @@ against D13 E4 will otherwise see an unexplained divergence.
 
 ## F4. A per-site trajectory is a shared-footprint mean for 98.2% of sites
 
-**Claim.** Under the fixed loop, 10,186 of 10,372 eligible sites receive
+**Claim.** Under the fixed loop, 10,185 of 10,372 eligible sites receive
 a trajectory that is **identical** to that of every other site on the
 same footprint. On the largest footprint, 324 MINEDEX sites share one
 series. The row is keyed `site_id` but the value is not site-specific.
@@ -259,6 +270,13 @@ row selection is the register, which is MINEDEX. Row filtering is
 explicitly prohibited as a remedy: a mixed package fails as a whole.
 
 **Confidence.** Read from decision records.
+
+*(Attribution note, 2026-08-25: D7's own ruling is the licence-conflict
+adjudication for the MINEDEX dataset — `minedex_redistribution_allowed`
+remains False because the CC-BY-4.0 grant in the bundled PDF conflicts
+with the CC-BY-NC-4.0 label on the Data WA catalogue record. The
+row-selection breadth stated above is D13 §1's operationalization of
+that ruling, not D7's own text.)*
 
 **Evidence.**
 
@@ -553,6 +571,19 @@ To resolve: read the run manifest beside
 `curated/register/2026-08-23/` and compare its recorded crosswalk digest
 against the SHA256SUMS of each dated crosswalk directory.
 
+**Progress 2026-08-25.** The first cause is refuted:
+`register.parquet.run_manifest.json` records input
+`curated/crosswalk/2026-08-16/crosswalk.parquet` with sha256
+`10e1bfe06c8f1d7628c04772ebbc751d2060aa7dceca3a0263a87cd6bf76c140`, and
+hashing the file on disk reproduces that digest exactly. The register
+was built from the same crosswalk the replay used. The live hypothesis
+is the second: the replay's bucketing/de-duplication semantics differ
+from `assign_trajectory_eligibility`'s — most likely in how sites whose
+matches are all non-high-confidence and whose footprints are unusable
+are split between the two never-judged buckets. O8 stays open until the
+replay reproduces all six counts; only then can Task 0's live-count
+assertion serve as a regression test.
+
 ---
 
 ## Recommended order
@@ -565,5 +596,7 @@ against the SHA256SUMS of each dated crosswalk directory.
 4. **O8**. Cheap, and it hardens Task 0's acceptance test.
 5. **F7** SILO registration. Lead-time item; start it in parallel.
 6. E4 build with the F3 fix already in place, then E6 sensor overlap
-   (computable from `support_inputs.parquet` with no new raster reads).
+   (computable from `support_inputs.parquet` with no new raster reads;
+   the table lives on luminosity — only its run manifest is mirrored
+   locally).
 7. Batch F, then Batch G with F5 and F8 budgeted.
