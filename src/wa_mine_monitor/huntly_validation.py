@@ -378,6 +378,7 @@ class ValidationReport:
     passed: bool
     n_compared: int
     n_sites: int
+    n_reference_rows: int
     failures: list[dict[str, object]]
     tolerances: Tolerances
 
@@ -386,6 +387,7 @@ class ValidationReport:
             "passed": self.passed,
             "n_compared": self.n_compared,
             "n_sites": self.n_sites,
+            "n_reference_rows": self.n_reference_rows,
             "n_failures": len(self.failures),
             "failures": self.failures,
             "tolerances": self.tolerances.as_dict(),
@@ -415,15 +417,44 @@ def compare(
     `value_outside_tolerance`). A row is never dropped for being
     inconvenient, and `passed` is `False` the moment any failure exists.
 
-    REFUSES (rather than reporting a failure) when
-    `require_pixel_counts=True` against a reference that carries no count
-    columns -- the comparison itself is not well-formed in that case. When
-    the reference DOES carry count columns, `require_pixel_counts=True`
-    enforces exact `n_member_pixels` / `n_valid_pixels` agreement per row:
-    a mismatch is reported as `pixel_count_mismatch` (and the value
-    comparison for that row is skipped, since a pixel-count disagreement
-    already means the two sides did not reduce the same pixels).
+    COVERAGE (the other direction): the `validate-huntly` verdict is the
+    SOLE unlock for statewide extraction
+    (`trajectory_extract.require_huntly_gate`,
+    `docs/decisions/2026-08-25-e5-engine-parity-rescope.md`), so a verdict
+    must never pass on a zero or incomplete comparison. Iterating only the
+    EXTRACTED rows cannot catch that: an empty or partially-copied
+    `--composites-dir` yields fewer (or zero) extracted rows, and a
+    for-each-extracted-row loop then sees no failures at all. `compare()`
+    therefore also walks the REFERENCE side: for every `(site_id, year)`
+    row in `reference` and every metric named in `REFERENCE_METRIC_COLUMNS`,
+    an extracted row for that `(site_id, year, metric)` triple must exist
+    -- `melt_sampled_frame` emits a row for every metric even when it is
+    not-computable, so full coverage is the correct expectation, and a
+    reference value that happens to be NaN still requires the extracted
+    row to exist (the `computability_mismatch` logic above then judges
+    it). A missing one appends `{site_id, year, metric, reason:
+    "extracted_row_missing"}` -- a failing comparison is a RESULT with a
+    manifest, never a crash, so this is a `failures` entry, not a refusal.
+    An EMPTY reference (zero rows) is different in kind: there is nothing
+    to compare against at all, so `compare()` REFUSES with
+    `HuntlyValidationError` rather than reporting a vacuously passing
+    verdict.
+
+    REFUSES (rather than reporting a failure) when `reference` has zero
+    rows, or when `require_pixel_counts=True` against a reference that
+    carries no count columns -- in both cases the comparison itself is not
+    well-formed. When the reference DOES carry count columns,
+    `require_pixel_counts=True` enforces exact `n_member_pixels` /
+    `n_valid_pixels` agreement per row: a mismatch is reported as
+    `pixel_count_mismatch` (and the value comparison for that row is
+    skipped, since a pixel-count disagreement already means the two sides
+    did not reduce the same pixels).
     """
+    if reference.empty:
+        raise HuntlyValidationError(
+            "reference cube has zero rows; a comparison against an empty reference is not "
+            "well-formed and must never produce a passing verdict"
+        )
     if tolerances.require_pixel_counts:
         absent = [c for c in _PIXEL_COUNT_COLUMNS if c not in reference.columns]
         if absent:
@@ -439,6 +470,7 @@ def compare(
     )
     failures: list[dict[str, object]] = []
     n_compared = 0
+    seen_keys: set[tuple[str, int, str]] = set()
 
     for row in extracted.to_dict("records"):
         metric = str(row["metric"])
@@ -449,6 +481,7 @@ def compare(
             continue
         n_compared += 1
         key = (str(row["site_id"]), int(row["year"]))
+        seen_keys.add((key[0], key[1], metric))
         base = {
             "site_id": row["site_id"],
             "year": int(row["year"]),
@@ -501,10 +534,25 @@ def compare(
                 }
             )
 
+    reference_keys = reference[["site_id", "year"]].drop_duplicates()
+    for reference_site_id, reference_year in reference_keys.itertuples(index=False):
+        for metric in REFERENCE_METRIC_COLUMNS:
+            if (str(reference_site_id), int(reference_year), metric) in seen_keys:
+                continue
+            failures.append(
+                {
+                    "site_id": reference_site_id,
+                    "year": int(reference_year),
+                    "metric": metric,
+                    "reason": "extracted_row_missing",
+                }
+            )
+
     return ValidationReport(
         passed=not failures,
         n_compared=n_compared,
-        n_sites=int(extracted["site_id"].nunique()),
+        n_sites=int(extracted["site_id"].nunique()) if not extracted.empty else 0,
+        n_reference_rows=len(reference),
         failures=failures,
         tolerances=tolerances,
     )

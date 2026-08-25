@@ -5928,8 +5928,20 @@ def extract_trajectories_cmd(
     maus_geom_by_id: dict[str, Any] = dict(
         zip(maus_gdf["maus_id"].astype(str), maus_gdf.geometry, strict=True)
     )
+    # A site CAN carry more than one `confidence == "high"` crosswalk row
+    # (overlapping Maus polygons) -- a bare `dict(zip(site_id, maus_id))`
+    # would silently keep whichever row happens to come LAST in `tier1_df`,
+    # which is NOT necessarily the footprint the site's D3 eligibility was
+    # judged against. `register.py`'s own eligibility tie-break (~1373:
+    # stable sort by `["site_id", "maus_id"]`, `drop_duplicates(keep=
+    # "first")` -- the lexicographically SMALLEST `maus_id` per site) is
+    # mirrored here EXACTLY, so this command never extracts a site on a
+    # footprint that did not pass its own eligibility comparison.
+    tier1_dedup = tier1_df.sort_values(
+        ["site_id", "maus_id"], na_position="last", kind="stable"
+    ).drop_duplicates(subset="site_id", keep="first")
     maus_id_by_site: dict[str, str] = dict(
-        zip(tier1_df["site_id"].astype(str), tier1_df["maus_id"].astype(str), strict=True)
+        zip(tier1_dedup["site_id"].astype(str), tier1_dedup["maus_id"].astype(str), strict=True)
     )
 
     # Sharing disclosure (decision 2026-08-25): the number of ELIGIBLE
@@ -6041,7 +6053,9 @@ def extract_trajectories_cmd(
         for year in sorted(covered_years_by_source.get(source_id, set())):
             partition = trajectory_extract.partition_dir(out_dir, collection_id, year)
             try:
-                already = trajectory_extract.verified_parts(partition)
+                already = trajectory_extract.verified_parts(
+                    partition, expected_schema=trajectories.TRAJECTORY_SCHEMA
+                )
             except trajectory_extract.TrajectoryExtractError as exc:
                 typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
                 raise typer.Exit(1) from None

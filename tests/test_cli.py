@@ -1572,6 +1572,7 @@ def _seed_d3_inputs_chain(
     *,
     build_coverage: bool = True,
     extra_register_rows: list[dict] | None = None,
+    extra_maus_specs: list[dict] | None = None,
     n_uncomputable_years: int = 0,
     n_outside_region: int = 0,
 ) -> D3Seed:
@@ -1586,6 +1587,13 @@ def _seed_d3_inputs_chain(
 
     `extra_register_rows` (Task 15) is passed straight through to `_seed_d3_
     register`.
+
+    `extra_maus_specs` are appended to the Maus extract's polygons ONLY
+    (never to the register/raster/region fixtures) -- a `_d3_footprint_
+    specs`-shaped dict whose `geometry` overlaps an EXISTING spec's site
+    point, so `build-crosswalk`'s real point-in-polygon matching produces a
+    second `confidence == "high"` row for that site (a multi-maus_id Tier 1
+    site, per the D13 E4 fix this fixture exists to exercise).
 
     `n_outside_region` (Decision 2026-08-21) shrinks the "Pilbara" RDC
     polygon to exclude the LAST `n_outside_region` footprint specs (e.g.
@@ -1626,7 +1634,7 @@ def _seed_d3_inputs_chain(
         )
         assert coverage_result.exit_code == 0, coverage_result.output
 
-    _seed_d3_maus_extract(data_root, "2026-08-13", specs)
+    _seed_d3_maus_extract(data_root, "2026-08-13", specs + (extra_maus_specs or []))
 
     footprints_result = runner.invoke(
         app, ["build-maus-footprint-areas", "--config", str(cfg_file), "--date", "2026-08-14"]
@@ -3031,3 +3039,121 @@ def test_extract_trajectories_reads_each_footprint_once_for_sites_that_share_it(
     assert counts["site-d3-00"] == 2
     assert counts["site-d3-00b"] == 2
     assert rows["d3_forced_threshold"].notna().all()
+
+
+def test_extract_trajectories_uses_eligibilitys_maus_id_for_a_multi_match_site(
+    tmp_path, monkeypatch
+):
+    """site-d3-00's point sits inside TWO overlapping Maus polygons
+    (`D3FP00`, its regular footprint, and `D3AAA00`, an extra polygon this
+    test adds) -- `build-crosswalk`'s real point-in-polygon matching (see
+    `crosswalk._containment_rows`) therefore gives it TWO `confidence ==
+    "high"` crosswalk rows, never silently reduced to one.
+
+    `register.apply_d3_threshold_to_register` (~1373) resolves that
+    ambiguity with a stable sort by `["site_id", "maus_id"]` then
+    `drop_duplicates(keep="first")` -- the LEXICOGRAPHICALLY SMALLEST
+    `maus_id` ("D3AAA00" < "D3FP00") is the footprint whose support
+    site-d3-00's D3 eligibility was actually judged against. Before the E4
+    fix, `extract_trajectories_cmd` built `maus_id_by_site` with a bare
+    `dict(zip(tier1_df["site_id"], tier1_df["maus_id"]))`: since `build_
+    crosswalk`'s matched rows for one site come out `maus_id`-sorted
+    ASCENDING (verified directly against `crosswalk.build_crosswalk`), the
+    LAST row processed for a repeated key -- and so the value a plain dict
+    keeps -- is the LARGEST `maus_id`, "D3FP00". That is the OPPOSITE of
+    eligibility's choice: the site would be extracted on a footprint that
+    never passed its own D3 eligibility comparison.
+
+    `site-d3-00b` (a second register row, same commodity/snapshot, offset
+    just far enough east to sit inside `D3FP00` but OUTSIDE the smaller,
+    west-shifted `D3AAA00`) isolates the effect: pre-fix, both sites
+    resolve to "D3FP00" and wrongly appear to share it
+    (`shared_footprint_site_count == 2`); post-fix, site-d3-00 resolves to
+    its OWN footprint "D3AAA00" and site-d3-00b keeps "D3FP00" alone --
+    neither actually shared (`shared_footprint_site_count == 1` for both),
+    matching `register.py`'s own per-site tie-break.
+    """
+    base_lon, base_lat = 116.40, -32.60
+    half = 0.0025
+    extra_maus_spec = {
+        "idx": "extra",
+        "maus_id": "D3AAA00",
+        "site_id": "site-d3-00",  # unused by `_seed_d3_maus_extract`; kept for shape parity
+        "lon": base_lon - 0.0015,
+        "lat": base_lat,
+        # West-shifted by 0.0015 deg (~14 m at this latitude) from D3FP00's
+        # own box: still covers site-d3-00's point (116.40) at its EAST
+        # edge, but its west shift pushes its own east edge (116.401) short
+        # of site-d3-00b's point (116.4020) below.
+        "geometry": box(
+            base_lon - 0.0015 - half,
+            base_lat - half,
+            base_lon - 0.0015 + half,
+            base_lat + half,
+        ),
+    }
+    extra_register_row = {
+        "site_id": "site-d3-00b",
+        "site_name": "Site 0 (second entry, distinct point)",
+        "commodity": "Au",
+        "stage": "Operating",
+        "owners_at_snapshot": "Owner 0b",
+        "snapshot_date": "2026-08-10",
+        "lon": base_lon + 0.0020,  # inside D3FP00's box, outside D3AAA00's
+        "lat": base_lat,
+        "n_tenements_intersecting": 0,
+        "inclusion_status": "operating",
+    }
+    seed, data_root = _seed_through_apply_d3_threshold(
+        tmp_path,
+        monkeypatch,
+        extra_register_rows=[extra_register_row],
+        extra_maus_specs=[extra_maus_spec],
+    )
+
+    # Ground truth: exactly what `build-crosswalk` actually matched, read
+    # straight from the curated crosswalk this run produced.
+    crosswalk_dir = _latest_curated_dated_dir(
+        data_root / "curated" / "crosswalk", label="curated/crosswalk"
+    )
+    crosswalk_df = tables.read_table(crosswalk_dir / "crosswalk.parquet")
+    site_00_high = crosswalk_df.loc[
+        (crosswalk_df["site_id"] == "site-d3-00") & (crosswalk_df["confidence"] == "high")
+    ]
+    assert sorted(site_00_high["maus_id"]) == ["D3AAA00", "D3FP00"]
+    site_00b_high = crosswalk_df.loc[
+        (crosswalk_df["site_id"] == "site-d3-00b") & (crosswalk_df["confidence"] == "high")
+    ]
+    assert list(site_00b_high["maus_id"]) == ["D3FP00"]
+
+    result = runner.invoke(
+        app,
+        [
+            "extract-trajectories",
+            "--config",
+            str(seed.cfg_file),
+            "--date",
+            "2026-08-21",
+            "--scope",
+            "sites",
+            "--site-id",
+            "site-d3-00",
+            "--site-id",
+            "site-d3-00b",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    out_dir = data_root / "curated" / "trajectories" / "2026-08-21"
+    parts = sorted(out_dir.glob("collection_id=*/year=*/part-0000.parquet"))
+    assert parts
+    rows = tables.read_table(parts[0])
+    maus_id_by_site = rows.drop_duplicates("site_id").set_index("site_id")["maus_id"]
+    # The lexicographically-first maus_id -- register.py's own tie-break --
+    # is the footprint site-d3-00 was actually judged eligible against.
+    assert maus_id_by_site["site-d3-00"] == "D3AAA00"
+    assert maus_id_by_site["site-d3-00b"] == "D3FP00"
+
+    counts = rows.drop_duplicates("site_id").set_index("site_id")["shared_footprint_site_count"]
+    assert counts["site-d3-00"] == 1
+    assert counts["site-d3-00b"] == 1

@@ -6,10 +6,13 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import pyarrow as pa
 import pytest
 
 from wa_mine_monitor import manifests, tables, trajectories, trajectory_extract
 from wa_mine_monitor.provenance import SourceAsset
+
+_OLD_SCHEMA_DROPPED_COLUMNS = ("shared_footprint_site_count", "d3_forced_threshold")
 
 
 def test_partition_dir_uses_collection_and_year_keys(tmp_path):
@@ -110,6 +113,48 @@ def test_part_altered_after_its_manifest_is_refused(tmp_path):
     trajectories.write_trajectories(_one_trajectory_row(value=0.9), path)
     with pytest.raises(trajectory_extract.TrajectoryExtractError, match="changed after"):
         trajectory_extract.verified_parts(partition)
+
+
+def _write_old_schema_verified_part(partition: Path, version: int) -> Path:
+    """Write a `part-NNNN.parquet` conforming to the schema TRAJECTORY_SCHEMA
+    had BEFORE `shared_footprint_site_count` and `d3_forced_threshold` were
+    added, with a real (correct) run manifest beside it -- reproducing a
+    partition an older build of this branch finished and digest-verifies
+    cleanly today, even though its row contract is stale."""
+    old_schema = pa.schema(
+        [f for f in trajectories.TRAJECTORY_SCHEMA if f.name not in _OLD_SCHEMA_DROPPED_COLUMNS]
+    )
+    df = _one_trajectory_row().drop(columns=list(_OLD_SCHEMA_DROPPED_COLUMNS))
+    partition.mkdir(parents=True, exist_ok=True)
+    path = partition / trajectory_extract.PART_FILENAME_TEMPLATE.format(version=version)
+    tables.write_table(df[old_schema.names], path, old_schema)
+    manifests.write_run_manifest(
+        output=path,
+        inputs=[SourceAsset(uri="test://fixture", sha256=None)],
+        config={"run": {"data_root": str(partition)}},
+        git_state={"sha": "deadbeef", "dirty": False, "diff": ""},
+    )
+    return path
+
+
+def test_verified_parts_accepts_a_part_matching_the_expected_schema(tmp_path):
+    partition = trajectory_extract.partition_dir(tmp_path, "ga_ls5t_gm_cyear_3", 2011)
+    path = _write_verified_part(partition, 0, _one_trajectory_row())
+    assert trajectory_extract.verified_parts(
+        partition, expected_schema=trajectories.TRAJECTORY_SCHEMA
+    ) == [path]
+
+
+def test_verified_parts_refuses_a_part_predating_the_current_schema(tmp_path):
+    partition = trajectory_extract.partition_dir(tmp_path, "ga_ls5t_gm_cyear_3", 2011)
+    path = _write_old_schema_verified_part(partition, 0)
+    with pytest.raises(trajectory_extract.TrajectoryExtractError) as excinfo:
+        trajectory_extract.verified_parts(partition, expected_schema=trajectories.TRAJECTORY_SCHEMA)
+    message = str(excinfo.value)
+    assert str(path) in message
+    assert "shared_footprint_site_count" in message
+    assert "d3_forced_threshold" in message
+    assert "re-extract" in message
 
 
 def test_next_part_version_is_one_past_the_highest_present(tmp_path):

@@ -24,6 +24,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from wa_mine_monitor import d3_inputs, manifests, source_catalogue, trajectories
 
@@ -109,9 +111,30 @@ def part_files(partition: Path) -> list[Path]:
     return sorted(matched, key=lambda p: p.name)
 
 
-def verified_parts(partition: Path) -> list[Path]:
+def _schema_field_mismatches(schema: pa.Schema, expected: pa.Schema) -> list[str]:
+    """Field-name/type differences between `schema` and `expected`, ignoring
+    schema-level and field-level METADATA (pandas round-trips attach its own
+    `pandas` metadata blob, which is never a contract violation)."""
+    actual_by_name = {f.name: f.type for f in schema}
+    expected_by_name = {f.name: f.type for f in expected}
+    mismatches: list[str] = []
+    for name, expected_type in expected_by_name.items():
+        if name not in actual_by_name:
+            mismatches.append(f"missing field {name!r} (expected {expected_type})")
+        elif actual_by_name[name] != expected_type:
+            mismatches.append(
+                f"field {name!r} has type {actual_by_name[name]}, expected {expected_type}"
+            )
+    for name in actual_by_name:
+        if name not in expected_by_name:
+            mismatches.append(f"unexpected field {name!r}")
+    return mismatches
+
+
+def verified_parts(partition: Path, expected_schema: pa.Schema | None = None) -> list[Path]:
     """Every part file in `partition` whose bytes still match the
-    `output.sha256` its OWN run manifest records.
+    `output.sha256` its OWN run manifest records, AND (when `expected_schema`
+    is given) whose Parquet schema still matches `expected_schema`.
 
     A part file with no manifest, an unparseable manifest, or a changed
     digest is a REFUSAL, never "not covered": treating it as absent would
@@ -119,6 +142,19 @@ def verified_parts(partition: Path) -> list[Path]:
     would never be reported. This is the artefact-level twin of
     `cli._digest_verified_manifest`, kept here (rather than imported from
     `cli`) so the module is usable without the CLI layer.
+
+    The digest check alone lets a partition written by an OLDER build --
+    before the trajectory row contract gained a column, or tightened a
+    rule -- pass unchanged, since its own manifest still matches its own
+    bytes. `expected_schema` closes that hole: each verified part's schema
+    is read from the Parquet FOOTER only (`pyarrow.parquet.read_schema`,
+    no row data touched) and compared to `expected_schema` by field name
+    and type (never by metadata -- pandas round-trips attach a `pandas`
+    metadata blob that carries no contract meaning). Any difference is a
+    REFUSAL naming the part file, the differing fields, and the remedy:
+    the partition predates the current trajectory row contract and must
+    be re-extracted under a NEW dated output directory, never finalized
+    as-is into a mixed-schema dataset.
     """
     verified: list[Path] = []
     for path in part_files(partition):
@@ -138,6 +174,15 @@ def verified_parts(partition: Path) -> list[Path]:
                 f"{str(recorded)[:12]}... -- the partition changed after its manifest "
                 "was written"
             )
+        if expected_schema is not None:
+            mismatches = _schema_field_mismatches(pq.read_schema(path), expected_schema)
+            if mismatches:
+                raise TrajectoryExtractError(
+                    f"{path} does not match the current trajectory row contract: "
+                    f"{'; '.join(mismatches)} -- this partition predates the current "
+                    "schema and must be re-extracted under a NEW dated output directory, "
+                    "never finalized as-is"
+                )
         verified.append(path)
     return verified
 

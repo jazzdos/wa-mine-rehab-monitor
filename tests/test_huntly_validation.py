@@ -306,6 +306,45 @@ def _reference(**overrides) -> pd.DataFrame:
     return pd.DataFrame([row])
 
 
+def _full_extracted(
+    *,
+    site_id: str = "H0001",
+    year: int = 2011,
+    n_member_pixels: int = 230,
+    n_valid_pixels: int = 230,
+    collection_id: str = "ga_ls5t_gm_cyear_3",
+    **metric_value_overrides: float,
+) -> pd.DataFrame:
+    """Full reference-side coverage for one (site_id, year): one row per
+    `REFERENCE_METRIC_COLUMNS` metric, matching `_reference()`'s default
+    values exactly, so `compare()`'s coverage check finds every reference
+    metric accounted for. `metric_value_overrides` overrides individual
+    metric values by name (e.g. `bare_soil=13.05`)."""
+    values: dict[str, float] = {
+        "nbr": 0.284016,
+        "ndmi": 0.059689,
+        "bare_soil": 13.0,
+        "photosynthetic_vegetation": 41.0,
+        "non_photosynthetic_vegetation": 45.0,
+    }
+    values.update(metric_value_overrides)
+    rows = [
+        {
+            "site_id": site_id,
+            "year": year,
+            "metric": metric,
+            "value": value,
+            "collection_id": collection_id,
+            "n_member_pixels": n_member_pixels,
+            "n_valid_pixels": n_valid_pixels,
+            "computable": True,
+            "not_computable_reason": None,
+        }
+        for metric, value in values.items()
+    ]
+    return pd.DataFrame(rows)
+
+
 def test_default_tolerances_are_the_d13_e5_gate():
     tol = huntly_validation.Tolerances()
     assert tol.spectral_abs == 1e-6
@@ -337,19 +376,20 @@ def test_default_tolerances_succeed_against_a_read_reference_cube_shaped_input(t
     reference = huntly_validation.read_reference_cube(path)
     assert not any(c in reference.columns for c in ("n_member_pixels", "n_valid_pixels"))
 
-    report = huntly_validation.compare(_extracted(), reference, huntly_validation.Tolerances())
+    report = huntly_validation.compare(_full_extracted(), reference, huntly_validation.Tolerances())
 
     assert report.passed is True
-    assert report.n_compared == 1
+    assert report.n_compared == 5
     assert report.failures == []
+    assert report.n_reference_rows == 1
 
 
 def test_comparison_passes_within_tolerance():
     report = huntly_validation.compare(
-        _extracted(), _reference(), huntly_validation.Tolerances(require_pixel_counts=False)
+        _full_extracted(), _reference(), huntly_validation.Tolerances(require_pixel_counts=False)
     )
     assert report.passed is True
-    assert report.n_compared == 1
+    assert report.n_compared == 5
     assert report.failures == []
 
 
@@ -368,7 +408,7 @@ def test_comparison_compares_fc_metrics_unscaled():
     # Same rasters, same units: reference bare=13.0 vs extracted 13.05 is
     # inside the 0.1 pp FC tolerance; 14.0 is not. No scaling applied.
     inside = huntly_validation.compare(
-        _extracted(metric="bare_soil", value=13.05),
+        _full_extracted(bare_soil=13.05),
         _reference(),
         huntly_validation.Tolerances(require_pixel_counts=False),
     )
@@ -410,7 +450,7 @@ def test_comparison_refuses_when_pixel_counts_are_required_but_absent():
 
 def test_comparison_passes_when_pixel_counts_are_required_and_agree():
     report = huntly_validation.compare(
-        _extracted(n_member_pixels=9, n_valid_pixels=9),
+        _full_extracted(n_member_pixels=9, n_valid_pixels=9),
         _reference(n_member_pixels=9, n_valid_pixels=9),
         huntly_validation.Tolerances(require_pixel_counts=True),
     )
@@ -465,7 +505,7 @@ def test_default_require_pixel_counts_passes_against_a_counts_bearing_read_refer
     reference = huntly_validation.read_reference_cube(path)
 
     report = huntly_validation.compare(
-        _extracted(n_member_pixels=230, n_valid_pixels=230),
+        _full_extracted(n_member_pixels=230, n_valid_pixels=230),
         reference,
         huntly_validation.Tolerances(require_pixel_counts=True),
     )
@@ -505,3 +545,72 @@ def test_default_require_pixel_counts_reports_mismatch_against_a_counts_bearing_
 
     assert report.passed is False
     assert report.failures[0]["reason"] == "pixel_count_mismatch"
+
+
+# --- Reference-side coverage (the E5 sole-unlock gate must never pass on a
+# zero or incomplete comparison: docs/decisions/2026-08-25-e5-engine-parity-
+# rescope.md) -------------------------------------------------------------
+
+
+def test_comparison_fails_every_reference_metric_against_an_empty_extracted_frame():
+    """An empty (or partially-copied) `--composites-dir` yields zero
+    extracted rows. Iterating only the extracted side would see no
+    failures at all and pass vacuously; `compare()` must instead report one
+    `extracted_row_missing` failure per reference `(site_id, year, metric)`."""
+    empty_extracted = pd.DataFrame(
+        columns=[
+            "site_id",
+            "year",
+            "metric",
+            "value",
+            "collection_id",
+            "n_member_pixels",
+            "n_valid_pixels",
+            "computable",
+            "not_computable_reason",
+        ]
+    )
+
+    report = huntly_validation.compare(
+        empty_extracted, _reference(), huntly_validation.Tolerances(require_pixel_counts=False)
+    )
+
+    assert report.passed is False
+    assert report.n_compared == 0
+    assert report.n_reference_rows == 1
+    assert len(report.failures) == len(huntly_validation.REFERENCE_METRIC_COLUMNS)
+    assert all(f["reason"] == "extracted_row_missing" for f in report.failures)
+    assert {f["metric"] for f in report.failures} == set(huntly_validation.REFERENCE_METRIC_COLUMNS)
+    assert all(f["site_id"] == "H0001" and f["year"] == 2011 for f in report.failures)
+
+
+def test_comparison_fails_only_the_uncovered_years_metrics():
+    """A reference year with no matching extracted rows at all (e.g. a
+    composite year missing from `--composites-dir`) must fail by name --
+    the already-covered year must stay clean."""
+    reference = pd.concat(
+        [_reference(), _reference(year=2012)],
+        ignore_index=True,
+    )
+
+    report = huntly_validation.compare(
+        _full_extracted(year=2011),
+        reference,
+        huntly_validation.Tolerances(require_pixel_counts=False),
+    )
+
+    assert report.passed is False
+    assert report.n_reference_rows == 2
+    assert len(report.failures) == len(huntly_validation.REFERENCE_METRIC_COLUMNS)
+    assert all(f["reason"] == "extracted_row_missing" for f in report.failures)
+    assert all(f["year"] == 2012 for f in report.failures)
+    assert {f["metric"] for f in report.failures} == set(huntly_validation.REFERENCE_METRIC_COLUMNS)
+
+
+def test_comparison_refuses_an_empty_reference():
+    with pytest.raises(huntly_validation.HuntlyValidationError, match="zero rows"):
+        huntly_validation.compare(
+            _full_extracted(),
+            pd.DataFrame(columns=["site_id", "year", "bare", "pv", "npv", "nbr", "ndmi", "ndvi"]),
+            huntly_validation.Tolerances(),
+        )
