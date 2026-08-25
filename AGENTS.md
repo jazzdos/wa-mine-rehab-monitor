@@ -23,9 +23,10 @@ performance findings, never operational rehabilitation dates.
   `uv run ruff check src tests`, `uv run ruff format --check src tests`,
   `uv run mypy src scripts`, `uv run pytest -q -rs`.
 - Dated snapshots, run manifests, fail-closed licence gates at the
-  export boundary — read `docs/decisions/` and the newest
-  `docs/handoffs/handoff_*.md` before touching acquisition, licence, or
-  owners code.
+  export boundary — read `docs/ROADMAP.md`, then `docs/decisions/` and
+  `docs/amendments-and-limitations.md`, before touching acquisition,
+  licence, or owners code. Superseded working docs live in
+  `docs/archive/`.
 - No project-local skills or agents until a workflow here proves
   repeatable across several sessions.
 

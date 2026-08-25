@@ -30,6 +30,9 @@ for the site in question, not this monitor.
 
 ## Status
 
+Current state, build sequence, and the architectural decision record
+are summarised in `docs/ROADMAP.md`.
+
 This repository is private. It stays private until the Tier 0 release
 candidate gate defined in
 `docs/plans/2026-08-15-wa-mine-rehab-monitor-design.md`, section 8, item
