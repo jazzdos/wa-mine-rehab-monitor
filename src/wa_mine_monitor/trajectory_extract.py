@@ -19,8 +19,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import date as _date
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +31,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from wa_mine_monitor import d3_inputs, manifests, source_catalogue, trajectories
+from wa_mine_monitor.provenance import SourceAsset
 
 #: `part-0000.parquet`, `part-0001.parquet`, ... Zero-padded so a plain
 #: lexicographic sort is also a chronological one.
@@ -166,7 +169,7 @@ def _sha256_file(path: Path) -> str:
 
 def part_files(partition: Path) -> list[Path]:
     """Every `part-NNNN.parquet` in `partition`, version-ordered. No
-    verification -- see `verified_parts`.
+    per-part verification -- see `verified_parts` for that.
 
     Every entry in `partition` is required to be either a matched
     `part-NNNN.parquet` file or that part's `.run_manifest.json` sidecar; any
@@ -179,21 +182,57 @@ def part_files(partition: Path) -> list[Path]:
     then finalize, unverified, inside a directory the ledger's fail-closed
     convention requires to be empty of anything the run did not check. This
     is the partition-directory twin of `existing_partitions`' stray-file and
-    stray-partition gates."""
+    stray-partition gates.
+
+    The sidecar/part correspondence is also required to be a BIJECTION: a
+    sidecar with no matching `part-NNNN.parquet` (an "orphan sidecar") is a
+    REFUSAL naming the orphan, not a silent accept. `verified_parts` already
+    refuses the opposite direction -- a part with no sidecar ("no run
+    manifest beside <path>") -- so that case is not duplicated here. The
+    orphan-sidecar direction has no such downstream check, and it is not
+    merely inert clutter: `part_files` is called from `verified_parts`
+    (which would otherwise verify only the parts that happen to have a
+    sidecar, silently ignoring the orphan), from `next_part_version` (which
+    picks one past the highest present PART version -- an orphan sidecar for
+    a version whose part is absent does not shift that choice, but leaves
+    the version `next_part_version` picks free for a new part to reuse),
+    and from `write_partition` (which writes that new part at the version
+    `next_part_version` chose and then has `manifests.write_run_manifest`
+    write its OWN sidecar beside it -- landing exactly on the orphan's
+    path and silently overwriting a stale, unverified manifest with a
+    fresh one that happens to still validate, since it was written for the
+    part now sitting there). Refusing the orphan up front, before version
+    selection or verification ever runs, is correct for all three callers:
+    the remedy is the same in every case -- the partition is inconsistent
+    and must be re-extracted under a NEW dated output directory, never
+    finalized or written into as-is."""
     partition = Path(partition)
     if not partition.is_dir():
         return []
     matched: list[Path] = []
+    sidecars: list[tuple[Path, str]] = []
     for entry in partition.iterdir():
         if _PART_FILENAME_RE.match(entry.name):
             matched.append(entry)
             continue
-        if _PART_MANIFEST_FILENAME_RE.match(entry.name):
+        manifest_match = _PART_MANIFEST_FILENAME_RE.match(entry.name)
+        if manifest_match is not None:
+            sidecars.append((entry, manifest_match.group(1)))
             continue
         raise TrajectoryExtractError(
             f"{entry} does not match the part-NNNN.parquet (or its run manifest sidecar) "
             "layout -- refusing to guess whether it is a verified part"
         )
+    matched_versions = {
+        m.group(1) for m in (_PART_FILENAME_RE.match(p.name) for p in matched) if m is not None
+    }
+    for sidecar_path, sidecar_version in sidecars:
+        if sidecar_version not in matched_versions:
+            raise TrajectoryExtractError(
+                f"{sidecar_path} is a run manifest sidecar with no corresponding "
+                f"part-{sidecar_version}.parquet -- the partition is inconsistent and must "
+                "be re-extracted under a NEW dated output directory"
+            )
     return sorted(matched, key=lambda p: p.name)
 
 
@@ -310,7 +349,57 @@ def verified_parts(partition: Path, expected_schema: pa.Schema | None = None) ->
 #: The resume-binding fields `resume_binding_mismatches` checks, in the
 #: order they are appended to its result -- kept as a tuple so the CLI's
 #: refusal message and this module's tests enumerate them identically.
-RESUME_BINDING_FIELDS: tuple[str, ...] = ("date", "scope", "site_ids", "inputs", "config", "git")
+RESUME_BINDING_FIELDS: tuple[str, ...] = (
+    "date",
+    "scope",
+    "site_ids",
+    "inputs",
+    "config",
+    "git",
+    "package_versions",
+)
+
+#: One recorded/current input asset's identity for resume-binding purposes:
+#: sha256 + collection + snapshot_date, WITHOUT `uri`. `uri` is deliberately
+#: excluded -- an absolute path legitimately differs across machines and
+#: checkouts, so it carries no provenance signal; byte identity (`sha256`)
+#: plus `collection` plus `snapshot_date` is what actually identifies "the
+#: same external asset", and is what a NEWER Maus/catalogue/register/
+#: crosswalk/footprints snapshot directory containing byte-identical bytes
+#: would otherwise slip past a bare sha256 comparison.
+_InputIdentity = tuple[str, str | None, _date | None]
+
+
+def _input_identity(asset: SourceAsset) -> _InputIdentity | None:
+    """`asset`'s resume-binding identity, or `None` when it has no sha256
+    (matching the recorded side dropping `None`-sha256 entries below)."""
+    if asset.sha256 is None:
+        return None
+    return (asset.sha256, asset.collection, asset.snapshot_date)
+
+
+def _recorded_input_identity(asset: Mapping[str, Any]) -> _InputIdentity | None:
+    """The same identity as `_input_identity`, read off a manifest's
+    already-serialized `inputs[]` entry (`snapshot_date` parsed back from
+    its canonical `YYYY-MM-DD` JSON string -- the manifest's own recorded
+    form -- rather than compared as a raw string against a `date` object)."""
+    sha256 = asset.get("sha256")
+    if not sha256:
+        return None
+    snapshot_date = asset.get("snapshot_date")
+    return (
+        sha256,
+        asset.get("collection"),
+        _date.fromisoformat(snapshot_date) if snapshot_date else None,
+    )
+
+
+def _format_input_identity(identity: _InputIdentity) -> str:
+    sha256, collection, snapshot_date = identity
+    return (
+        f"(sha256={sha256}, collection={collection}, "
+        f"snapshot_date={snapshot_date.isoformat() if snapshot_date else None})"
+    )
 
 
 def resume_binding_mismatches(
@@ -319,9 +408,10 @@ def resume_binding_mismatches(
     date: str,
     scope: str,
     site_ids: Sequence[str],
-    input_sha256s: Iterable[str | None],
+    input_assets: Iterable[SourceAsset],
     config: Mapping[str, Any],
     git_state: Mapping[str, Any],
+    package_versions: Mapping[str, str],
 ) -> list[str]:
     """The fields on which `part_manifest` -- an already digest- and
     schema-verified partition's OWN run manifest -- differs from the
@@ -333,24 +423,32 @@ def resume_binding_mismatches(
     The skip decision in the extraction loop binds only on
     `(collection_id, year)`, so a partition left by an earlier, interrupted
     run against a DIFFERENT `--site-id` scope, a different catalogue/
-    register/crosswalk/footprints/Maus snapshot, a different config, or
-    different code would otherwise be silently absorbed, and the final
-    summary would then claim the CURRENT invocation's scope/sites/inputs
-    over rows produced under the old ones. A resumed run must be the SAME
-    run, or refuse -- this is the check that enforces it.
+    register/crosswalk/footprints/Maus snapshot, a different config,
+    different code, or a drifted dependency environment would otherwise be
+    silently absorbed, and the final summary would then claim the CURRENT
+    invocation's scope/sites/inputs over rows produced under the old ones.
+    A resumed run must be the SAME run, or refuse -- this is the check that
+    enforces it.
 
-    Six fields are compared, each named in the returned list when it
+    Seven fields are compared, each named in the returned list when it
     differs:
 
     - `"date"`/`"scope"`/`"site_ids"` -- `part_manifest["resolved_args"]`
       against the CURRENT `date`, `scope` and `site_ids` (the caller's
       `extracted_sites`, compared sorted -- the same order the CLI records
       them in and writes them to the batch summary).
-    - `"inputs"` -- the recorded input assets' sha256 values (`None`
-      entries dropped, matching how the CLI builds `input_sha256s`)
-      against `input_sha256s`: the same catalogue snapshot, register,
-      crosswalk, footprint areas, Maus snapshot and frozen protocol
-      artefact, never a newer or older one silently substituted.
+    - `"inputs"` -- the recorded input assets' identities (`(sha256,
+      collection, snapshot_date)`, `None`-sha256 entries dropped, `uri`
+      deliberately excluded -- see `_InputIdentity`) against `input_assets`'
+      identities, compared as a MULTISET (duplicate sha256 values with
+      different collections/snapshot dates are not collapsed): the same
+      catalogue snapshot, register, crosswalk, footprint areas, Maus
+      snapshot and frozen protocol artefact, never a newer or older one
+      silently substituted even when its bytes happen to be
+      byte-identical to the old one (a bare sha256 SET comparison would
+      miss exactly this: a newer Maus snapshot directory containing
+      byte-identical bytes, which still changes `source_snapshot_date` on
+      every row the CLI derives from it).
     - `"config"`/`"git"` -- `part_manifest["config"]`/`["git"]` against
       `manifests.canonical_config(config)`/`manifests.canonical_git_state
       (git_state)` -- the SAME normalised form `write_run_manifest`
@@ -360,6 +458,16 @@ def resume_binding_mismatches(
       close) is invisible to `verified_parts`' digest+schema gate, but it
       changes `git.sha` (a committed change) or `git.diff` (an
       uncommitted one).
+    - `"package_versions"` -- `part_manifest["package_versions"]` against
+      `package_versions` (the CURRENT invocation's, from the same
+      `manifests.installed_package_versions()` a real
+      `write_run_manifest` call would use when none is supplied). Cheap
+      and, under a synced `uv.lock`, deterministic across a resume -- so
+      it never causes a spurious refusal, but it catches an environment
+      that drifted without any code change. A manifest recording no
+      `package_versions` at all (an older or hand-built manifest) compares
+      unequal to any non-empty current environment and so is a mismatch:
+      this check is fail-closed, never lenient about an absent field.
     """
     mismatches: list[str] = []
     resolved_args = part_manifest.get("resolved_args") or {}
@@ -369,15 +477,44 @@ def resume_binding_mismatches(
         mismatches.append("scope")
     if resolved_args.get("site_ids") != sorted(site_ids):
         mismatches.append("site_ids")
-    recorded_input_sha256s = {
-        asset.get("sha256") for asset in part_manifest.get("inputs") or [] if asset.get("sha256")
-    }
-    if recorded_input_sha256s != {sha for sha in input_sha256s if sha}:
-        mismatches.append("inputs")
+
+    recorded_inputs = Counter(
+        identity
+        for asset in part_manifest.get("inputs") or []
+        if (identity := _recorded_input_identity(asset)) is not None
+    )
+    current_inputs = Counter(
+        identity for asset in input_assets if (identity := _input_identity(asset)) is not None
+    )
+    if recorded_inputs != current_inputs:
+        missing = sorted(
+            _format_input_identity(i) for i in (recorded_inputs - current_inputs).elements()
+        )
+        extra = sorted(
+            _format_input_identity(i) for i in (current_inputs - recorded_inputs).elements()
+        )
+        detail_parts = []
+        if missing:
+            detail_parts.append(f"recorded but not in this run: [{', '.join(missing)}]")
+        if extra:
+            detail_parts.append(f"in this run but not recorded: [{', '.join(extra)}]")
+        mismatches.append(f"inputs ({'; '.join(detail_parts)})")
+
     if part_manifest.get("config") != manifests.canonical_config(config):
         mismatches.append("config")
     if part_manifest.get("git") != manifests.canonical_git_state(git_state):
         mismatches.append("git")
+
+    recorded_package_versions = part_manifest.get("package_versions") or {}
+    current_package_versions = dict(package_versions)
+    if recorded_package_versions != current_package_versions:
+        all_packages = set(recorded_package_versions) | set(current_package_versions)
+        changed_packages = sorted(
+            pkg
+            for pkg in all_packages
+            if recorded_package_versions.get(pkg) != current_package_versions.get(pkg)
+        )
+        mismatches.append(f"package_versions ({', '.join(changed_packages)})")
     return mismatches
 
 

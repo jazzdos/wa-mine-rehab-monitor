@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import re
+from datetime import date as date_cls
 from pathlib import Path
 
 import pandas as pd
@@ -114,6 +116,36 @@ def test_part_files_accepts_a_part_and_its_manifest_sidecar(tmp_path):
     partition = trajectory_extract.partition_dir(tmp_path, "ga_ls5t_gm_cyear_3", 2011)
     path = _write_verified_part(partition, 0, _one_trajectory_row())
     assert trajectory_extract.part_files(partition) == [path]
+
+
+def test_part_files_refuses_an_orphan_manifest_sidecar_with_no_part_file(tmp_path):
+    """A syntactically canonical sidecar (`part-NNNN.parquet.run_manifest.
+    json`) whose corresponding `part-NNNN.parquet` does not exist must be
+    refused, not silently accepted: the fail-closed convention requires a
+    finalized partition directory to hold nothing the run did not verify,
+    and an orphan sidecar is never verified against anything."""
+    partition = trajectory_extract.partition_dir(tmp_path, "ga_ls5t_gm_cyear_3", 2011)
+    partition.mkdir(parents=True)
+    orphan = partition / ("part-0000.parquet" + manifests.MANIFEST_SUFFIX)
+    orphan.write_text("{}", encoding="utf-8")
+    with pytest.raises(trajectory_extract.TrajectoryExtractError, match=re.escape(str(orphan))):
+        trajectory_extract.part_files(partition)
+
+
+def test_part_files_refuses_an_orphan_version_zero_sidecar_beside_a_valid_part_0001(tmp_path):
+    """An orphan version-ZERO sidecar is the version-collision case: with
+    only `part-0001` present and verified, `next_part_version` would pick
+    version 0 for the next write, `write_partition` would write a fresh
+    `part-0000.parquet`, and its own run-manifest write would then land
+    beside the stale orphan sidecar -- poisoning the freshly written part
+    with someone else's manifest. This must be refused up front, before
+    version selection ever runs."""
+    partition = trajectory_extract.partition_dir(tmp_path, "ga_ls5t_gm_cyear_3", 2011)
+    _write_verified_part(partition, 1, _one_trajectory_row())
+    orphan = partition / ("part-0000.parquet" + manifests.MANIFEST_SUFFIX)
+    orphan.write_text("{}", encoding="utf-8")
+    with pytest.raises(trajectory_extract.TrajectoryExtractError, match=re.escape(str(orphan))):
+        trajectory_extract.part_files(partition)
 
 
 def test_partition_result_adds_componentwise():
@@ -355,6 +387,10 @@ def test_verified_parts_refuses_a_part_with_a_duplicate_field_name(tmp_path):
 
 # --- resume_binding_mismatches -----------------------------------------
 
+#: Fixed stand-in for `manifests.installed_package_versions()` so these
+#: tests never depend on the real, installation-dependent environment.
+_FIXTURE_PACKAGE_VERSIONS = {"pandas": "2.2.0", "pyarrow": "16.0.0"}
+
 
 def _write_part_manifest_for_resume(
     tmp_path: Path,
@@ -363,8 +399,11 @@ def _write_part_manifest_for_resume(
     scope: str = "sites",
     site_ids: list[str] | None = None,
     input_sha256: str = "aaa",
+    input_collection: str | None = None,
+    input_snapshot_date: str | None = None,
     config: dict | None = None,
     git_state: dict | None = None,
+    package_versions: dict | None = None,
 ) -> dict:
     """Write a real run manifest (via `manifests.write_run_manifest`) for a
     throwaway output file and return it parsed from disk, exactly as
@@ -373,10 +412,22 @@ def _write_part_manifest_for_resume(
     output.write_bytes(b"resume-binding fixture -- only its sha256 matters here")
     manifest = manifests.write_run_manifest(
         output=output,
-        inputs=[SourceAsset(uri="test://fixture", sha256=input_sha256)],
+        inputs=[
+            SourceAsset(
+                uri="test://fixture",
+                sha256=input_sha256,
+                collection=input_collection,
+                snapshot_date=(
+                    date_cls.fromisoformat(input_snapshot_date) if input_snapshot_date else None
+                ),
+            )
+        ],
         config=config if config is not None else {"run": {"data_root": str(tmp_path)}},
         git_state=(
             git_state if git_state is not None else {"sha": "deadbeef", "dirty": False, "diff": ""}
+        ),
+        package_versions=(
+            package_versions if package_versions is not None else _FIXTURE_PACKAGE_VERSIONS
         ),
         resolved_args={
             "date": date,
@@ -387,19 +438,42 @@ def _write_part_manifest_for_resume(
     return json.loads(json.dumps(manifest, default=str))
 
 
+def _default_input_assets(
+    *,
+    sha256: str = "aaa",
+    collection: str | None = None,
+    snapshot_date: str | None = None,
+) -> list[SourceAsset]:
+    return [
+        SourceAsset(
+            uri="test://fixture",
+            sha256=sha256,
+            collection=collection,
+            snapshot_date=date_cls.fromisoformat(snapshot_date) if snapshot_date else None,
+        )
+    ]
+
+
 def test_resume_binding_mismatches_is_empty_when_everything_matches(tmp_path):
     config = {"run": {"data_root": str(tmp_path)}}
     git_state = {"sha": "deadbeef", "dirty": False, "diff": ""}
-    manifest = _write_part_manifest_for_resume(tmp_path, config=config, git_state=git_state)
+    manifest = _write_part_manifest_for_resume(
+        tmp_path,
+        input_collection="dea_stac",
+        input_snapshot_date="2026-08-15",
+        config=config,
+        git_state=git_state,
+    )
     assert (
         trajectory_extract.resume_binding_mismatches(
             manifest,
             date="2026-08-21",
             scope="sites",
             site_ids=["site-d3-00"],
-            input_sha256s={"aaa"},
+            input_assets=_default_input_assets(collection="dea_stac", snapshot_date="2026-08-15"),
             config=config,
             git_state=git_state,
+            package_versions=_FIXTURE_PACKAGE_VERSIONS,
         )
         == []
     )
@@ -414,9 +488,10 @@ def test_resume_binding_mismatches_flags_a_different_date(tmp_path):
         date="2026-08-22",
         scope="sites",
         site_ids=["site-d3-00"],
-        input_sha256s={"aaa"},
+        input_assets=_default_input_assets(),
         config=config,
         git_state=git_state,
+        package_versions=_FIXTURE_PACKAGE_VERSIONS,
     ) == ["date"]
 
 
@@ -429,9 +504,10 @@ def test_resume_binding_mismatches_flags_a_different_scope(tmp_path):
         date="2026-08-21",
         scope="statewide",
         site_ids=["site-d3-00"],
-        input_sha256s={"aaa"},
+        input_assets=_default_input_assets(),
         config=config,
         git_state=git_state,
+        package_versions=_FIXTURE_PACKAGE_VERSIONS,
     ) == ["scope"]
 
 
@@ -446,9 +522,10 @@ def test_resume_binding_mismatches_flags_different_site_ids(tmp_path):
         date="2026-08-21",
         scope="sites",
         site_ids=["site-d3-00", "site-d3-00b"],
-        input_sha256s={"aaa"},
+        input_assets=_default_input_assets(),
         config=config,
         git_state=git_state,
+        package_versions=_FIXTURE_PACKAGE_VERSIONS,
     ) == ["site_ids"]
 
 
@@ -458,15 +535,91 @@ def test_resume_binding_mismatches_flags_different_inputs(tmp_path):
     manifest = _write_part_manifest_for_resume(
         tmp_path, input_sha256="aaa", config=config, git_state=git_state
     )
-    assert trajectory_extract.resume_binding_mismatches(
+    mismatches = trajectory_extract.resume_binding_mismatches(
         manifest,
         date="2026-08-21",
         scope="sites",
         site_ids=["site-d3-00"],
-        input_sha256s={"bbb"},
+        input_assets=_default_input_assets(sha256="bbb"),
         config=config,
         git_state=git_state,
-    ) == ["inputs"]
+        package_versions=_FIXTURE_PACKAGE_VERSIONS,
+    )
+    assert len(mismatches) == 1
+    assert mismatches[0].startswith("inputs")
+
+
+def test_resume_binding_mismatches_flags_a_different_snapshot_date_on_a_byte_identical_input(
+    tmp_path,
+):
+    """A NEWER Maus (or catalogue/register/crosswalk/footprints) snapshot
+    directory containing byte-identical bytes must still be flagged: the
+    resume-binding check compares `(sha256, collection, snapshot_date)`,
+    not a bare sha256 set, precisely so this case is not silently
+    absorbed."""
+    config = {"run": {"data_root": str(tmp_path)}}
+    git_state = {"sha": "deadbeef", "dirty": False, "diff": ""}
+    manifest = _write_part_manifest_for_resume(
+        tmp_path,
+        input_sha256="aaa",
+        input_collection="maus_v2",
+        input_snapshot_date="2026-08-15",
+        config=config,
+        git_state=git_state,
+    )
+    mismatches = trajectory_extract.resume_binding_mismatches(
+        manifest,
+        date="2026-08-21",
+        scope="sites",
+        site_ids=["site-d3-00"],
+        input_assets=_default_input_assets(
+            sha256="aaa", collection="maus_v2", snapshot_date="2026-08-16"
+        ),
+        config=config,
+        git_state=git_state,
+        package_versions=_FIXTURE_PACKAGE_VERSIONS,
+    )
+    assert len(mismatches) == 1
+    assert mismatches[0].startswith("inputs")
+    assert "2026-08-15" in mismatches[0]
+    assert "2026-08-16" in mismatches[0]
+
+
+def test_resume_binding_mismatches_flags_a_duplicate_sha256_multiplicity_difference(tmp_path):
+    """Two recorded input assets sharing one sha256 (e.g. the same bytes
+    fetched under two different collections/snapshot dates) must not
+    collapse into a single set member -- the comparison is a MULTISET, so
+    a run recording that sha256 only ONCE is still a mismatch even though
+    the sha256 VALUE is present on both sides."""
+    output = tmp_path / "part-0000.parquet"
+    output.write_bytes(b"resume-binding fixture -- only its sha256 matters here")
+    manifest = manifests.write_run_manifest(
+        output=output,
+        inputs=[
+            SourceAsset(uri="test://fixture-a", sha256="aaa", collection="dea_stac"),
+            SourceAsset(uri="test://fixture-b", sha256="aaa", collection="maus_v2"),
+        ],
+        config={"run": {"data_root": str(tmp_path)}},
+        git_state={"sha": "deadbeef", "dirty": False, "diff": ""},
+        package_versions=_FIXTURE_PACKAGE_VERSIONS,
+        resolved_args={"date": "2026-08-21", "scope": "sites", "site_ids": ["site-d3-00"]},
+    )
+    manifest = json.loads(json.dumps(manifest, default=str))
+    mismatches = trajectory_extract.resume_binding_mismatches(
+        manifest,
+        date="2026-08-21",
+        scope="sites",
+        site_ids=["site-d3-00"],
+        # Only ONE of the two recorded (sha256, collection) identities --
+        # the multiset differs even though {"aaa"} == {"aaa"} as a bare set.
+        input_assets=[SourceAsset(uri="test://fixture-a", sha256="aaa", collection="dea_stac")],
+        config={"run": {"data_root": str(tmp_path)}},
+        git_state={"sha": "deadbeef", "dirty": False, "diff": ""},
+        package_versions=_FIXTURE_PACKAGE_VERSIONS,
+    )
+    assert len(mismatches) == 1
+    assert mismatches[0].startswith("inputs")
+    assert "maus_v2" in mismatches[0]
 
 
 def test_resume_binding_mismatches_flags_a_different_config(tmp_path):
@@ -478,9 +631,10 @@ def test_resume_binding_mismatches_flags_a_different_config(tmp_path):
         date="2026-08-21",
         scope="sites",
         site_ids=["site-d3-00"],
-        input_sha256s={"aaa"},
+        input_assets=_default_input_assets(),
         config={"run": {"data_root": str(tmp_path)}, "extra_field": "changed"},
         git_state=git_state,
+        package_versions=_FIXTURE_PACKAGE_VERSIONS,
     ) == ["config"]
 
 
@@ -493,10 +647,53 @@ def test_resume_binding_mismatches_flags_a_different_git_state(tmp_path):
         date="2026-08-21",
         scope="sites",
         site_ids=["site-d3-00"],
-        input_sha256s={"aaa"},
+        input_assets=_default_input_assets(),
         config=config,
         git_state={"sha": "cafebabe", "dirty": False, "diff": ""},
+        package_versions=_FIXTURE_PACKAGE_VERSIONS,
     ) == ["git"]
+
+
+def test_resume_binding_mismatches_flags_a_different_package_version(tmp_path):
+    config = {"run": {"data_root": str(tmp_path)}}
+    git_state = {"sha": "deadbeef", "dirty": False, "diff": ""}
+    manifest = _write_part_manifest_for_resume(tmp_path, config=config, git_state=git_state)
+    mismatches = trajectory_extract.resume_binding_mismatches(
+        manifest,
+        date="2026-08-21",
+        scope="sites",
+        site_ids=["site-d3-00"],
+        input_assets=_default_input_assets(),
+        config=config,
+        git_state=git_state,
+        package_versions={**_FIXTURE_PACKAGE_VERSIONS, "pyarrow": "17.0.0"},
+    )
+    assert len(mismatches) == 1
+    assert mismatches[0].startswith("package_versions")
+    assert "pyarrow" in mismatches[0]
+    assert "pandas" not in mismatches[0]
+
+
+def test_resume_binding_mismatches_flags_a_manifest_with_no_recorded_package_versions(tmp_path):
+    """A manifest that never recorded `package_versions` at all (an older
+    or hand-built manifest) must be treated as a mismatch, not silently
+    accepted -- the check is fail-closed about an absent field, never
+    lenient."""
+    config = {"run": {"data_root": str(tmp_path)}}
+    git_state = {"sha": "deadbeef", "dirty": False, "diff": ""}
+    manifest = _write_part_manifest_for_resume(tmp_path, config=config, git_state=git_state)
+    del manifest["package_versions"]
+    mismatches = trajectory_extract.resume_binding_mismatches(
+        manifest,
+        date="2026-08-21",
+        scope="sites",
+        site_ids=["site-d3-00"],
+        input_assets=_default_input_assets(),
+        config=config,
+        git_state=git_state,
+        package_versions=_FIXTURE_PACKAGE_VERSIONS,
+    )
+    assert mismatches == ["package_versions (pandas, pyarrow)"]
 
 
 def test_next_part_version_is_one_past_the_highest_present(tmp_path):

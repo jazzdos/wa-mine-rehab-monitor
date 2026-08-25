@@ -407,7 +407,7 @@ def _manifest_path(output: Path) -> Path:
     return Path(str(output) + MANIFEST_SUFFIX)
 
 
-def _installed_package_versions() -> dict[str, str]:
+def installed_package_versions() -> dict[str, str]:
     """Snapshot of every installed distribution's version, sorted by name.
 
     Captures the full runtime environment (not just this package), since a
@@ -564,7 +564,7 @@ def preflight_manifest_conflict(
                 package_versions=(
                     dict(package_versions)
                     if package_versions is not None
-                    else _installed_package_versions()
+                    else installed_package_versions()
                 ),
             ),
             sort_keys=True,
@@ -622,7 +622,7 @@ def write_run_manifest(
     ts_str = ts.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
     resolved_versions = (
-        dict(package_versions) if package_versions is not None else _installed_package_versions()
+        dict(package_versions) if package_versions is not None else installed_package_versions()
     )
 
     data_root = _extract_data_root(config)

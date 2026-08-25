@@ -6074,7 +6074,12 @@ def extract_trajectories_cmd(
             redistribute_public=False,
         ),
     ]
-    input_sha256s = {asset.sha256 for asset in input_assets if asset.sha256 is not None}
+    # Snapshotted ONCE for this invocation and reused for both the
+    # resume-binding check below and every `write_run_manifest` call this
+    # command makes -- never re-derived independently, so a partition
+    # written earlier in THIS SAME run is never compared against a
+    # different package snapshot than the one it was written with.
+    package_versions = manifests.installed_package_versions()
 
     # GATE 5 -- refuse a re-run against an already-finished batch summary.
     # PARTITIONS are deliberately not covered by this check -- resuming
@@ -6174,9 +6179,10 @@ def extract_trajectories_cmd(
                         date=date,
                         scope=scope,
                         site_ids=extracted_sites,
-                        input_sha256s=input_sha256s,
+                        input_assets=input_assets,
                         config=resolved_config,
                         git_state=git_state,
+                        package_versions=package_versions,
                     )
                     if mismatches:
                         typer.echo(
@@ -6316,6 +6322,7 @@ def extract_trajectories_cmd(
             inputs=input_assets,
             config=resolved_config,
             git_state=git_state,
+            package_versions=package_versions,
             resolved_args={
                 "date": date,
                 "scope": scope,
@@ -6345,6 +6352,7 @@ def extract_trajectories_cmd(
         inputs=input_assets,
         config=resolved_config,
         git_state=git_state,
+        package_versions=package_versions,
         resolved_args={"date": date, "scope": scope, **total.as_dict()},
     )
     typer.echo(
