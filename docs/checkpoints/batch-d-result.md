@@ -1,6 +1,6 @@
 # Batch D Result — D3 Protocol, Simulation, and Threshold
 
-**Status:** 2026-08-21 live run FAILED (commodity rules never matched); protocol re-frozen 2026-08-23 per decision doc — rerun _pending_
+**Status:** CLOSED 2026-08-25 — 2026-08-23 rerun stands as the final Batch D record: forced-144 fallback, `criteria_passed=false`, per the pre-registered no-passing-support behaviour (design doc §8 D3: "If nothing through 144 passes, use 144 and label the failed criteria — never relaxed after seeing results"). Binding limitation and closure diagnostics below.
 
 ## Result parameters
 
@@ -52,4 +52,65 @@ Decision: `docs/decisions/2026-08-23-d3-commodity-codes-and-valid-fraction.md` (
 - **Run timing:** freeze 2026-08-24 01:27; first build-d3-inputs attempt failed at 01:27 (stale `register/2026-08-21` moved aside), relaunched 01:28; build done 13:04, derive done 13:16, apply done 13:16 (log timestamps +10:00; `--read-workers 32`, tmux `wmm-d3`, logs `/mnt/data/wa-mine-monitor/reports/{freeze-d3-protocol,build-d3-inputs,derive-d3-threshold,apply-d3-threshold,d3-chain}-2026-08-23.log`)
 - **Copied to lux:** 2026-08-24, to `~/data/wa-mine-monitor/curated/{d3-protocol,d3-threshold,register,d3-inputs}/2026-08-23` (d3-inputs without `support_inputs.parquet`, which stays on luminosity)
 
-Batch E E4/E5 gate: reopen only if `criteria_passed=true`.
+## Closure 2026-08-25 — forced-144 accepted as the pre-registered outcome
+
+Owner decision (2026-08-25): accept the forced-144 result as final for
+Batch D. No protocol amendment; the D13/design-doc freeze ("never relaxed
+after seeing results") is honoured. The diagnostics below characterise the
+failure and are recorded as a disclosed limitation, not as grounds for
+change.
+
+### Diagnostic 1 — larger supports (196/256/324/400 px)
+
+Re-simulation of the 171 selected footprints in the 6 strata behind the
+10 `dea_gm_ls8cls9c` NBR/NDMI cells failing spearman_median at 144 px
+(script run 2026-08-24, log `reports/diag-supports-2026-08-24.log` on
+luminosity; output `curated/d3-inputs/2026-08-23/diag_support_spearman_196_400.parquet`,
+copied to lux; 118,600 rows, exit=0). Cells still below 0.95: 5/10 at
+196 px, 2/10 at 256 px, 1/10 at 324 px, 1/10 at 400 px. The residual cell
+(other_wa:gold:intermediate NDMI) rises only 0.923 → 0.945 across the
+grid, so no plausible support extension passes; extension to ≥324 px
+would also drop 3 of 17 adequate strata below min_footprints=10
+(pilbara:gold compact/intermediate, other_wa:iron_ore:intermediate).
+
+### Diagnostic 2 — flat-series mechanism
+
+Per-site Spearman at 144 px correlates with full-footprint series spread
+(r = 0.62 vs log range over the 281 failing-cell site×metric series).
+Sites whose entire 12-year NBR/NDMI range is below the protocol's own
+0.03 p90 error tolerance fail 96% of the time; range > 0.10 fails 26%.
+The failure mechanism is spectrally flat sites whose year ranking is
+sub-tolerance noise, not subsampling distorting real chronologies; it
+spans gold, nickel, and iron_ore (excluding any one commodity does not
+cure it). A site-level flatness exclusion was dry-run and rejected: at
+the only internally justified floor (range > 1.0× tolerance) 5 cells
+still fail; higher floors pass only non-monotonically and on cell
+medians over 1–2 sites.
+
+### Binding limitation (disclosed)
+
+At the fallback threshold n_star = 144 px, spearman_median < 0.95 in 25
+criterion cells (all spearman; concentrated in `dea_gm_ls8cls9c`
+NBR/NDMI over gold/nickel/iron_ore strata). Geomedian SWIR-index rank
+stability for spectrally flat footprints is not attainable at any tested
+or diagnostically probed support (9–400 px). Any Batch E use of the
+register must carry this disclosure; absolute-error and computability
+criteria are unaffected (p90 and computable_fraction pass everywhere at
+144 px).
+
+### Flagged for later review (not adopted)
+
+Tolerance-gated concordance: replace Spearman with a Kendall-style
+statistic counting a year-pair discordant only when the full-value gap
+exceeds the metric's p90 tolerance (anchored at 1×, no free constant).
+Targets the flat-series mechanism directly and uses all sites. Not
+evaluable from saved outputs (per-replicate reduced series were not
+persisted); validation needs a ~2 h re-simulation of the failing-cell
+sites at 144 px, and adoption would be a diagnostic-informed D13
+amendment plus re-freeze and full rerun. Deliberately deferred.
+
+Batch E E4/E5 gate: `criteria_passed=false` stands, so the gate does not
+reopen automatically. Proceeding to Batch E now requires its own owner
+decision to operate under the disclosed limitation above (forced-144
+threshold, spearman failures labelled), recorded in `docs/decisions/`
+before E4/E5 work starts.
