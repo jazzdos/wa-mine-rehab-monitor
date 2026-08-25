@@ -2485,6 +2485,15 @@ def test_extract_trajectories_writes_collection_year_partitions(tmp_path, monkey
     assert set(frame.columns) == set(trajectories.TRAJECTORY_SCHEMA.names)
     assert (frame["site_id"] == "site-d3-00").all()
     assert (frame["computable"] | frame["not_computable_reason"].notna()).all()
+    assert frame["d3_forced_threshold"].notna().all()
+    assert frame["d3_forced_threshold"].dtype == bool
+    # No other eligible site shares site-d3-00's footprint in this seed.
+    assert (frame["shared_footprint_site_count"] == 1).all()
+    # This fixture's FC bands are deliberately constant across years (see
+    # `_seed_through_apply_d3_threshold`'s docstring), so `criteria_passed`
+    # is always False and the forced-144 path is the only way it reaches
+    # `eligible` rows -- every row here is forced, never passing-criteria.
+    assert frame["d3_forced_threshold"].eq(True).all()
     assert (out_dir / "extraction_summary.json").exists()
     assert (out_dir / ("extraction_summary.json" + manifests.MANIFEST_SUFFIX)).exists()
 
@@ -2653,15 +2662,54 @@ def _write_huntly_reference(path: Path, *, site_id: str = "H0001", year: int, nb
     pq.write_table(table, path)
 
 
+def _write_huntly_reference_with_counts(
+    path: Path,
+    *,
+    site_id: str = "H0001",
+    year: int,
+    nbr: float,
+    n_member_pixels: int = 9,
+    n_valid_pixels: int = 9,
+) -> None:
+    """Like `_write_huntly_reference`, but ALSO carries `n_member_pixels`/
+    `n_valid_pixels` -- the shape a counts-bearing jarrah reference is
+    expected to take, and the only shape that can satisfy
+    `--require-pixel-counts` (the CLI default) against `_write_huntly_pilot_cube`'s
+    interior site, whose 3x3 window is 9 member / 9 valid pixels."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    schema = huntly_validation.HUNTLY_REFERENCE_SCHEMA.append(
+        pa.field("n_member_pixels", pa.int64(), nullable=False)
+    ).append(pa.field("n_valid_pixels", pa.int64(), nullable=False))
+    table = pa.Table.from_pylist(
+        [
+            {
+                "site_id": site_id,
+                "year": year,
+                "bare": 10.0,
+                "pv": 40.0,
+                "npv": 50.0,
+                "nbr": nbr,
+                "ndmi": 0.3,
+                "ndvi": 0.2,
+                "n_member_pixels": n_member_pixels,
+                "n_valid_pixels": n_valid_pixels,
+            }
+        ],
+        schema=schema,
+    )
+    pq.write_table(table, path)
+
+
 def test_validate_huntly_writes_a_passing_verdict(tmp_path, monkeypatch):
     """Sample an agreeing pilot cube and confirm the verdict artefact +
     manifest land where `require_huntly_gate` reads them.
 
-    `--no-require-pixel-counts`: `read_reference_cube` always selects
-    exactly `HUNTLY_REFERENCE_SCHEMA`'s columns, which carries no pixel
-    count fields -- a reference this command can ever read never carries
-    counts, so the passing path can only be reached with the requirement
-    off (test (b) below confirms the on-by-default refusal this implies).
+    Uses a counts-bearing reference under the DEFAULT `--require-pixel-counts`
+    flag: `read_reference_cube` now keeps `n_member_pixels`/`n_valid_pixels`
+    as optional passthrough columns when the file carries them, so the
+    honest, on-by-default gate is exercised here rather than waived (test
+    (b) below still pins the refusal against a COUNTLESS reference by
+    default).
     """
     _init_git_repo(tmp_path)
     monkeypatch.setattr("wa_mine_monitor.cli._REPO_ROOT", tmp_path)
@@ -2671,7 +2719,9 @@ def test_validate_huntly_writes_a_passing_verdict(tmp_path, monkeypatch):
     site_meta_path = tmp_path / "site_meta.parquet"
     _write_huntly_site_meta(site_meta_path)
     reference_path = tmp_path / "reference.parquet"
-    _write_huntly_reference(reference_path, year=2011, nbr=0.5)
+    _write_huntly_reference_with_counts(
+        reference_path, year=2011, nbr=0.5, n_member_pixels=9, n_valid_pixels=9
+    )
 
     result = runner.invoke(
         app,
@@ -2687,7 +2737,6 @@ def test_validate_huntly_writes_a_passing_verdict(tmp_path, monkeypatch):
             str(composites_dir),
             "--site-meta",
             str(site_meta_path),
-            "--no-require-pixel-counts",
         ],
     )
     assert result.exit_code == 0, result.output
@@ -2974,3 +3023,11 @@ def test_extract_trajectories_reads_each_footprint_once_for_sites_that_share_it(
     a = rows[rows["site_id"] == "site-d3-00"].set_index("metric")["value"]
     b = rows[rows["site_id"] == "site-d3-00b"].set_index("metric")["value"]
     assert a.equals(b)  # identical, not merely close
+
+    # Sharing disclosure (decision 2026-08-25): site-d3-00/00b sit on the
+    # SAME maus_id footprint (site-d3-00b's lon/lat is site-d3-00's), so
+    # both carry shared_footprint_site_count == 2.
+    counts = rows.drop_duplicates("site_id").set_index("site_id")["shared_footprint_site_count"]
+    assert counts["site-d3-00"] == 2
+    assert counts["site-d3-00b"] == 2
+    assert rows["d3_forced_threshold"].notna().all()

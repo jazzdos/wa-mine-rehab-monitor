@@ -32,10 +32,14 @@ def test_geomedian_nbr_ndmi_formula_fixture():
 
 
 def test_geomedian_null_pixels_reduce_valid_count_not_value():
-    rows = sm.geomedian_site_year_metrics(_gm([0.5, np.nan], [0.1, 0.1], [0.3, 0.3]))
+    # 20 members, 1 invalid: 19 valid meets the ceil(0.95 * 20) == 19 floor.
+    nir = [0.5] * 19 + [np.nan]
+    swir1 = [0.1] * 20
+    swir2 = [0.3] * 20
+    rows = sm.geomedian_site_year_metrics(_gm(nir, swir1, swir2))
     nbr = next(r for r in rows if r.metric == "nbr")
-    assert nbr.n_member_pixels == 2
-    assert nbr.n_valid_pixels == 1
+    assert nbr.n_member_pixels == 20
+    assert nbr.n_valid_pixels == 19
     assert nbr.value == pytest.approx(0.25)
 
 
@@ -93,16 +97,71 @@ def test_fc_metrics_map_assets_to_metric_names_without_clipping():
 
 
 def test_fc_null_pixel_excluded_from_all_three_metrics():
-    rows = sm.fc_site_year_metrics(_fc([10.0, np.nan], [50.0, 60.0], [40.0, 40.0]))
-    assert all(r.n_member_pixels == 2 and r.n_valid_pixels == 1 for r in rows)
-    pv = next(r for r in rows if r.metric == "photosynthetic_vegetation")
-    assert pv.value == pytest.approx(50.0)
+    # 20 members, 1 invalid: 19 valid meets the ceil(0.95 * 20) == 19 floor.
+    bs = [10.0] * 19 + [np.nan]
+    pv = [50.0] * 19 + [60.0]
+    npv = [40.0] * 20
+    rows = sm.fc_site_year_metrics(_fc(bs, pv, npv))
+    assert all(r.n_member_pixels == 20 and r.n_valid_pixels == 19 for r in rows)
+    pv_row = next(r for r in rows if r.metric == "photosynthetic_vegetation")
+    assert pv_row.value == pytest.approx(50.0)
 
 
 def test_fc_all_null_is_not_computable():
     rows = sm.fc_site_year_metrics(_fc([np.nan], [np.nan], [np.nan]))
     assert {r.not_computable_reason for r in rows} == {"zero_valid_pixels"}
     assert all(r.value is None and r.value_out_of_documented_range is None for r in rows)
+
+
+def test_geomedian_below_valid_fraction_floor_is_not_computable_with_true_count():
+    # 20 members, ceil(0.95 * 20) == 19; 18 valid is one short of the floor.
+    nir = [0.5] * 18 + [np.nan] * 2
+    swir1 = [0.1] * 20
+    swir2 = [0.3] * 20
+    rows = sm.geomedian_site_year_metrics(_gm(nir, swir1, swir2))
+    for r in rows:
+        assert r.computable is False
+        assert r.value is None
+        assert r.not_computable_reason == "insufficient_valid_fraction"
+        assert r.n_valid_pixels == 18
+        assert r.n_member_pixels == 20
+
+
+def test_geomedian_at_valid_fraction_ceiling_boundary_stays_computable():
+    # 20 members, ceil(0.95 * 20) == 19; exactly 19 valid meets the floor.
+    nir = [0.5] * 19 + [np.nan]
+    swir1 = [0.1] * 20
+    swir2 = [0.3] * 20
+    rows = sm.geomedian_site_year_metrics(_gm(nir, swir1, swir2))
+    for r in rows:
+        assert r.computable is True
+        assert r.not_computable_reason is None
+        assert r.n_valid_pixels == 19
+        assert r.n_member_pixels == 20
+
+
+def test_fc_below_valid_fraction_floor_is_not_computable_with_true_count():
+    bs = [10.0] * 18 + [np.nan] * 2
+    pv = [50.0] * 20
+    npv = [40.0] * 20
+    rows = sm.fc_site_year_metrics(_fc(bs, pv, npv))
+    for r in rows:
+        assert r.computable is False
+        assert r.value is None
+        assert r.not_computable_reason == "insufficient_valid_fraction"
+        assert r.n_valid_pixels == 18
+        assert r.value_out_of_documented_range is None
+
+
+def test_fc_at_valid_fraction_ceiling_boundary_stays_computable():
+    bs = [10.0] * 19 + [np.nan]
+    pv = [50.0] * 20
+    npv = [40.0] * 20
+    rows = sm.fc_site_year_metrics(_fc(bs, pv, npv))
+    for r in rows:
+        assert r.computable is True
+        assert r.not_computable_reason is None
+        assert r.n_valid_pixels == 19
 
 
 def test_fc_unrelated_extra_band_does_not_corrupt_valid_mask():

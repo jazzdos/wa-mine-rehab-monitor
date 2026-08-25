@@ -2791,14 +2791,20 @@ def export_release_cmd(
     source_schema = pq.read_schema(curated_path)
     output_schema = pa.schema([field for field in source_schema if field.name in published.columns])
 
+    # The licence obligation is asymmetric: released data must NEVER exist on
+    # disk without its attribution (source link, licence link, modification
+    # statement) beside it, while attribution without data is merely inert.
+    # `ATTRIBUTION.txt` is therefore written FIRST, so a failed parquet write
+    # never strands a CC-BY-SA-derived file unattributed -- do not reorder
+    # this to "parquet then attribution" as a simplification.
     output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "ATTRIBUTION.txt").write_text(attribution, encoding="utf-8")
     _write_table_or_refuse(
         published,
         output_path,
         output_schema,
         payload={"curated_path": str(curated_path)},
     )
-    (output_dir / "ATTRIBUTION.txt").write_text(attribution, encoding="utf-8")
 
     try:
         manifests.write_run_manifest(
@@ -5668,6 +5674,21 @@ def extract_trajectories_cmd(
             )
         )
         raise typer.Exit(1)
+    if "d3_forced_threshold" not in register_df.columns:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        "latest curated register predates the d3_forced_threshold column -- "
+                        "run apply-d3-threshold to re-write it"
+                    ),
+                    "register_path": str(register_path),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
 
     # GATE 3 -- eligibility: only `trajectory_status == "eligible"` sites
     # may be extracted; an explicitly requested site that is not eligible
@@ -5694,6 +5715,15 @@ def extract_trajectories_cmd(
         extracted_sites = sorted(set(requested))
     else:
         extracted_sites = eligible
+
+    # `d3_forced_threshold` (decision 2026-08-23) is per-site and lives on
+    # the register itself -- computed here, from the FULL eligible
+    # register, not from `extracted_sites`.
+    d3_forced_threshold_by_site = (
+        register_df.loc[register_df["site_id"].isin(eligible)]
+        .set_index("site_id")["d3_forced_threshold"]
+        .to_dict()
+    )
 
     # GATE 4 -- crosswalk, footprint areas, Maus snapshot, DEA catalogue,
     # frozen protocol: same digest-verification discipline as
@@ -5902,6 +5932,38 @@ def extract_trajectories_cmd(
         zip(tier1_df["site_id"].astype(str), tier1_df["maus_id"].astype(str), strict=True)
     )
 
+    # Sharing disclosure (decision 2026-08-25): the number of ELIGIBLE
+    # sites on each `maus_id`, computed from the FULL eligible register
+    # (`eligible`, from GATE 3's `select_eligible_sites`) -- never from
+    # `extracted_sites`, or a `--site-id` run would understate how many
+    # eligible sites share a footprint. Reuses `maus_id_by_site` (built
+    # above) with a guarded lookup: a stale crosswalk vs. register can
+    # leave an eligible site out of the Tier 1 crosswalk population, and
+    # that must surface as the same JSON refusal as below, not a bare
+    # KeyError.
+    eligible_maus_ids: list[str] = []
+    for site in eligible:
+        maus_id = maus_id_by_site.get(site)
+        if maus_id is None:
+            typer.echo(
+                json.dumps(
+                    {
+                        "refusal": (
+                            f"eligible site {site!r} is not in the Tier 1 crosswalk "
+                            f"population ({crosswalk_path}) -- an eligible site must have a "
+                            "high-confidence Maus match"
+                        )
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            raise typer.Exit(1)
+        eligible_maus_ids.append(maus_id)
+    shared_footprint_site_count_by_maus = (
+        pd.Series(eligible_maus_ids).value_counts().astype("int64").to_dict()
+    )
+
     sites_by_maus_id: dict[str, list[str]] = {}
     for site in extracted_sites:
         maus_id = maus_id_by_site.get(site)
@@ -6005,6 +6067,7 @@ def extract_trajectories_cmd(
                     "geomad_count": None,
                     "effective_pixel_support_px": effective_support.get(maus_id),
                     "transition_adjacent": bool(transition_flags.get(year, False)),
+                    "shared_footprint_site_count": shared_footprint_site_count_by_maus[maus_id],
                     "source_snapshot_date": maus_snapshot_dir.name,
                     "geometry_wkb": geometry_wkb,
                 }
@@ -6015,7 +6078,11 @@ def extract_trajectories_cmd(
                             _not_computable_metric_rows(
                                 kind=kind,
                                 reason="item_missing",
-                                ctx_kwargs={**ctx_kwargs, "site_id": site},
+                                ctx_kwargs={
+                                    **ctx_kwargs,
+                                    "site_id": site,
+                                    "d3_forced_threshold": bool(d3_forced_threshold_by_site[site]),
+                                },
                                 item_id="",
                             )
                         )
@@ -6045,7 +6112,11 @@ def extract_trajectories_cmd(
                             _not_computable_metric_rows(
                                 kind=kind,
                                 reason="read_failed",
-                                ctx_kwargs={**ctx_kwargs, "site_id": site},
+                                ctx_kwargs={
+                                    **ctx_kwargs,
+                                    "site_id": site,
+                                    "d3_forced_threshold": bool(d3_forced_threshold_by_site[site]),
+                                },
                                 item_id=item_id,
                             )
                         )
@@ -6060,7 +6131,12 @@ def extract_trajectories_cmd(
                 # footprint: the values ARE identical and must not be
                 # recomputed into a near-identical float.
                 for site in footprint_sites:
-                    ctx = trajectories.RowContext(item_id=item_id, site_id=site, **ctx_kwargs)
+                    ctx = trajectories.RowContext(
+                        item_id=item_id,
+                        site_id=site,
+                        d3_forced_threshold=bool(d3_forced_threshold_by_site[site]),
+                        **ctx_kwargs,
+                    )
                     partition_rows.extend(trajectories.rows_from_metrics(metric_rows, ctx))
 
             if not partition_rows:

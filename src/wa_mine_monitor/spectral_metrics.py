@@ -2,7 +2,12 @@
 
 Reuses the frozen D3 formulas in `d3_inputs`; adds the E3 contract that a
 metric is either a value with its pixel counts or an explicit
-not_computable_reason. Nothing here fabricates a zero.
+not_computable_reason. Nothing here fabricates a zero. Per decision
+2026-08-23, a metric is computable only when at least
+`d3_protocol.REQUIRED_ADEQUACY["min_valid_member_fraction"]` (0.95) of its
+member pixels are valid; below that floor but above zero valid pixels, the
+row is not_computable with reason "insufficient_valid_fraction" and still
+records the true `n_valid_pixels`.
 """
 
 from __future__ import annotations
@@ -12,17 +17,25 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from wa_mine_monitor import d3_inputs, dea_raster
+from wa_mine_monitor import d3_inputs, d3_protocol, dea_raster
 
 GEOMEDIAN_BANDS: tuple[str, ...] = tuple(
     sorted({b for pair in d3_inputs.GEOMEDIAN_METRIC_BANDS.values() for b in pair})
 )
 FC_ASSETS: tuple[str, ...] = tuple(sorted(d3_inputs.FC_METRIC_ASSETS.values()))
 
+#: Frozen floor (decision 2026-08-23): a site-year-collection is computable
+#: only when at least this fraction of its member pixels are valid. Read
+#: from `d3_protocol.REQUIRED_ADEQUACY` -- the single source, never a
+#: second literal -- so this module and the D3 threshold search can never
+#: drift apart on the value.
+MIN_VALID_MEMBER_FRACTION: float = d3_protocol.REQUIRED_ADEQUACY["min_valid_member_fraction"]
+
 #: Closed vocabulary for `not_computable_reason`.
 NOT_COMPUTABLE_REASONS: tuple[str, ...] = (
     "zero_member_pixels",
     "zero_valid_pixels",
+    "insufficient_valid_fraction",
     "read_failed",
     "item_missing",
 )
@@ -52,8 +65,8 @@ def _require_keys(arrays: Mapping[str, np.ndarray], required: tuple[str, ...]) -
         raise SpectralMetricsError(f"band arrays differ in shape: {sorted(lengths)}")
 
 
-def _not_computable(metric: str, n_member: int, reason: str) -> MetricRow:
-    return MetricRow(metric, None, n_member, 0, False, reason)
+def _not_computable(metric: str, n_member: int, reason: str, n_valid: int = 0) -> MetricRow:
+    return MetricRow(metric, None, n_member, n_valid, False, reason)
 
 
 def geomedian_site_year_metrics(bands: Mapping[str, np.ndarray]) -> list[MetricRow]:
@@ -67,6 +80,10 @@ def geomedian_site_year_metrics(bands: Mapping[str, np.ndarray]) -> list[MetricR
     n_valid = int(valid.sum())
     if n_valid == 0:
         return [_not_computable(m, n_member, "zero_valid_pixels") for m in metrics]
+    if not d3_inputs._mask_computable(valid, MIN_VALID_MEMBER_FRACTION):
+        return [
+            _not_computable(m, n_member, "insufficient_valid_fraction", n_valid) for m in metrics
+        ]
     values = d3_inputs.geomedian_metrics({k: bands[k][valid] for k in GEOMEDIAN_BANDS})
     return [MetricRow(m, values[m], n_member, n_valid, True, None) for m in metrics]
 
@@ -83,6 +100,11 @@ def fc_site_year_metrics(values: Mapping[str, np.ndarray]) -> list[MetricRow]:
     n_valid = int(valid.sum())
     if n_valid == 0:
         return [_not_computable(m, n_member, "zero_valid_pixels") for m in metric_to_asset]
+    if not d3_inputs._mask_computable(valid, MIN_VALID_MEMBER_FRACTION):
+        return [
+            _not_computable(m, n_member, "insufficient_valid_fraction", n_valid)
+            for m in metric_to_asset
+        ]
     masked = {k: values[k][valid] for k in FC_ASSETS}
     means = d3_inputs.fc_metrics(masked)
     return [

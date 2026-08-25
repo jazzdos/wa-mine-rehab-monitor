@@ -105,6 +105,44 @@ def test_read_reference_cube_refuses_a_table_missing_a_metric_column(tmp_path):
         huntly_validation.read_reference_cube(path)
 
 
+def _write_reference_with_counts(path, rows: list[dict]) -> None:
+    """Like `_write_reference`, but for a reference table that ALSO carries
+    `n_member_pixels`/`n_valid_pixels` -- the shape a counts-bearing jarrah
+    reference is expected to take once one exists."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    schema = huntly_validation.HUNTLY_REFERENCE_SCHEMA.append(
+        pa.field("n_member_pixels", pa.int64(), nullable=False)
+    ).append(pa.field("n_valid_pixels", pa.int64(), nullable=False))
+    table = pa.Table.from_pylist(rows, schema=schema)
+    pq.write_table(table, path)
+
+
+def test_read_reference_cube_keeps_pixel_counts_when_the_file_carries_them(tmp_path):
+    path = tmp_path / "series_with_counts.parquet"
+    _write_reference_with_counts(
+        path,
+        [
+            {
+                "site_id": "H0001",
+                "year": 2011,
+                "bare": 13.0,
+                "pv": 41.0,
+                "npv": 45.0,
+                "nbr": 0.284016,
+                "ndmi": 0.059689,
+                "ndvi": 0.477765,
+                "n_member_pixels": 9,
+                "n_valid_pixels": 8,
+            }
+        ],
+    )
+    frame = huntly_validation.read_reference_cube(path)
+    assert frame.loc[0, "n_member_pixels"] == 9
+    assert frame.loc[0, "n_valid_pixels"] == 8
+    assert frame["n_member_pixels"].dtype == np.int64
+    assert frame["n_valid_pixels"].dtype == np.int64
+
+
 def test_reference_metric_names_map_onto_the_monitor_vocabulary():
     assert huntly_validation.REFERENCE_METRIC_COLUMNS == {
         "nbr": "nbr",
@@ -400,3 +438,70 @@ def test_comparison_fails_when_pixel_counts_disagree():
         "extracted": 9,
         "reference": 1,
     }
+
+
+def test_default_require_pixel_counts_passes_against_a_counts_bearing_read_reference(tmp_path):
+    """`require_pixel_counts=True` (the CLI default) must be reachable
+    through `read_reference_cube` itself once the reference file carries
+    counts -- not just against a hand-built in-memory DataFrame."""
+    path = tmp_path / "series_with_counts.parquet"
+    _write_reference_with_counts(
+        path,
+        [
+            {
+                "site_id": "H0001",
+                "year": 2011,
+                "bare": 13.0,
+                "pv": 41.0,
+                "npv": 45.0,
+                "nbr": 0.284016,
+                "ndmi": 0.059689,
+                "ndvi": 0.477765,
+                "n_member_pixels": 230,
+                "n_valid_pixels": 230,
+            }
+        ],
+    )
+    reference = huntly_validation.read_reference_cube(path)
+
+    report = huntly_validation.compare(
+        _extracted(n_member_pixels=230, n_valid_pixels=230),
+        reference,
+        huntly_validation.Tolerances(require_pixel_counts=True),
+    )
+
+    assert report.passed is True
+    assert report.failures == []
+
+
+def test_default_require_pixel_counts_reports_mismatch_against_a_counts_bearing_read_reference(
+    tmp_path,
+):
+    path = tmp_path / "series_with_counts.parquet"
+    _write_reference_with_counts(
+        path,
+        [
+            {
+                "site_id": "H0001",
+                "year": 2011,
+                "bare": 13.0,
+                "pv": 41.0,
+                "npv": 45.0,
+                "nbr": 0.284016,
+                "ndmi": 0.059689,
+                "ndvi": 0.477765,
+                "n_member_pixels": 999,
+                "n_valid_pixels": 1,
+            }
+        ],
+    )
+    reference = huntly_validation.read_reference_cube(path)
+
+    report = huntly_validation.compare(
+        _extracted(n_member_pixels=9, n_valid_pixels=9),
+        reference,
+        huntly_validation.Tolerances(require_pixel_counts=True),
+    )
+
+    assert report.passed is False
+    assert report.failures[0]["reason"] == "pixel_count_mismatch"

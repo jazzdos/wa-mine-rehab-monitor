@@ -28,6 +28,8 @@ def test_schema_has_exactly_the_e3_fields_in_order():
         "not_computable_reason",
         "value_out_of_documented_range",
         "transition_adjacent",
+        "shared_footprint_site_count",
+        "d3_forced_threshold",
         "source_snapshot_date",
         "geometry",
     ]
@@ -45,6 +47,8 @@ def test_schema_nullability_matches_e3():
         "n_member_pixels",
         "computable",
         "transition_adjacent",
+        "shared_footprint_site_count",
+        "d3_forced_threshold",
         "source_snapshot_date",
         "geometry",
     ):
@@ -65,6 +69,8 @@ def test_schema_nullability_matches_e3():
     assert f["geomad_count"].type == pa.int64()
     assert f["computable"].type == pa.bool_()
     assert f["geometry"].type == pa.binary()  # WKB, EPSG:3577
+    assert f["shared_footprint_site_count"].type == pa.int64()
+    assert f["d3_forced_threshold"].type == pa.bool_()
 
 
 def test_metric_vocabulary_is_closed_and_matches_spectral_metrics():
@@ -97,6 +103,8 @@ def _row(**over):
         "not_computable_reason": None,
         "value_out_of_documented_range": None,
         "transition_adjacent": False,
+        "shared_footprint_site_count": 1,
+        "d3_forced_threshold": False,
         "source_snapshot_date": "2026-08-16",
         "geometry": box(0, 0, 30, 30).wkb,
     }
@@ -190,6 +198,8 @@ def test_rows_from_metrics_fans_metric_rows_into_schema_rows():
         geomad_count=12,
         effective_pixel_support_px=230,
         transition_adjacent=False,
+        shared_footprint_site_count=1,
+        d3_forced_threshold=False,
         source_snapshot_date="2026-08-16",
         geometry_wkb=box(0, 0, 30, 30).wkb,
     )
@@ -214,6 +224,8 @@ def test_rows_from_metrics_nulls_geomad_count_for_fc_context():
         geomad_count=None,
         effective_pixel_support_px=230,
         transition_adjacent=False,
+        shared_footprint_site_count=3,
+        d3_forced_threshold=True,
         source_snapshot_date="2026-08-16",
         geometry_wkb=box(0, 0, 30, 30).wkb,
     )
@@ -222,3 +234,10 @@ def test_rows_from_metrics_nulls_geomad_count_for_fc_context():
     )
     assert rows[0]["geomad_count"] is None
     assert rows[0]["value_out_of_documented_range"] == 0
+    assert rows[0]["shared_footprint_site_count"] == 3
+    assert rows[0]["d3_forced_threshold"] is True
+
+
+def test_validate_refuses_shared_footprint_site_count_below_one():
+    with pytest.raises(tj.TrajectoryError, match="shared_footprint_site_count"):
+        tj.validate_trajectories(pd.DataFrame([_row(shared_footprint_site_count=0)]))

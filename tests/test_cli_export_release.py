@@ -226,3 +226,41 @@ def test_export_release_refuses_restricted_rows(tmp_path, monkeypatch) -> None:
     assert "refusal" in result.output
     out = tmp_path / "data" / "releases" / "2026-08-25" / "footprint-areas"
     assert not out.exists()
+
+
+def test_export_release_never_leaves_parquet_without_attribution(tmp_path, monkeypatch) -> None:
+    """CC-BY-SA obligation: a released parquet may never exist on disk
+    without its `ATTRIBUTION.txt` beside it -- attribution without data is
+    merely inert. Forces the parquet write (`_write_table_or_refuse`) to
+    fail and asserts the command refuses (exit 1) with NO parquet file
+    present; `ATTRIBUTION.txt` having already landed is fine, since it
+    carries no licensed data on its own.
+    """
+    _init_git_repo(tmp_path)
+    monkeypatch.setattr("wa_mine_monitor.cli._REPO_ROOT", tmp_path)
+    cfg_file = _write_monitor_config(tmp_path)
+    data_root = tmp_path / "data"
+    _seed_curated_footprint_areas(tmp_path, cfg_file, date="2026-08-25")
+
+    def _boom(*args, **kwargs):
+        raise ValueError("simulated parquet write failure")
+
+    monkeypatch.setattr("wa_mine_monitor.cli._write_table_or_refuse", _boom)
+
+    result = runner.invoke(
+        app,
+        [
+            "export-release",
+            "--package",
+            "footprint-areas",
+            "--date",
+            "2026-08-25",
+            "--config",
+            str(cfg_file),
+        ],
+    )
+    assert result.exit_code != 0
+
+    out = data_root / "releases" / "2026-08-25" / "footprint-areas"
+    assert not (out / "footprint_areas.parquet").exists()
+    assert (out / "ATTRIBUTION.txt").exists()

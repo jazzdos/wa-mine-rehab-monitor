@@ -83,7 +83,17 @@ class HuntlyValidationError(ValueError):
 
 def read_reference_cube(path: Path) -> pd.DataFrame:
     """Read the jarrah per-site-year series table, refusing any table that
-    does not carry every declared column."""
+    does not carry every declared column.
+
+    `n_member_pixels` / `n_valid_pixels` are OPTIONAL passthrough columns:
+    when the file carries them (a future counts-bearing jarrah reference),
+    both survive into the returned frame, cast to `int64`, so `compare`'s
+    `require_pixel_counts=True` gate -- the D13 E5 default -- has something
+    to compare against. When the file does not carry them (today's
+    `HUNTLY_REFERENCE_SCHEMA`-shaped reference), neither column appears in
+    the returned frame at all, and `compare(require_pixel_counts=True)`
+    correctly refuses rather than silently waiving the tolerance.
+    """
     resolved = Path(path)
     if not resolved.exists():
         raise HuntlyValidationError(f"reference cube {resolved} does not exist")
@@ -97,9 +107,12 @@ def read_reference_cube(path: Path) -> pd.DataFrame:
             f"reference cube {resolved} is missing column(s) {missing}; expected "
             f"{HUNTLY_REFERENCE_SCHEMA.names}"
         )
-    frame = table.select(HUNTLY_REFERENCE_SCHEMA.names).to_pandas()
+    present_count_columns = [c for c in _PIXEL_COUNT_COLUMNS if c in table.column_names]
+    frame = table.select([*HUNTLY_REFERENCE_SCHEMA.names, *present_count_columns]).to_pandas()
     frame["site_id"] = frame["site_id"].astype(str)
     frame["year"] = frame["year"].astype("int64")
+    for column in present_count_columns:
+        frame[column] = frame[column].astype("int64")
     return frame
 
 

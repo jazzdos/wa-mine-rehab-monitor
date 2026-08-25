@@ -4,6 +4,20 @@ One row per (site, year, metric, collection) -- sensor overlaps are
 preserved as separate rows, never collapsed. Geometry is Maus-derived and
 carried as WKB in EPSG:3577; the whole table is package-bound to
 CC-BY-SA-4.0 and private pending Batch G export adjudication.
+
+`n_valid_pixels` IS the quantity the 2026-08-23 decision
+(`docs/decisions/2026-08-23-d3-commodity-codes-and-valid-fraction.md`)
+names `valid_support_px`: the mask-based valid member count for one
+footprint-year-collection, from `geomedian_valid_mask`/`fc_valid_mask`.
+It is not duplicated under a second column name.
+
+`shared_footprint_site_count` and `d3_forced_threshold` implement the
+2026-08-25 Tier 1 product framing decision
+(`docs/decisions/2026-08-25-tier1-product-framing.md`): every row
+carries the number of eligible sites sharing its `maus_id` footprint
+(>= 1, since the row's own site is always one of them) and whether the
+site's D3 eligibility came from the forced threshold, so that any
+downstream presentation can disclose sharing without a second lookup.
 """
 
 from __future__ import annotations
@@ -44,6 +58,8 @@ TRAJECTORY_SCHEMA = pa.schema(
         pa.field("not_computable_reason", pa.string(), nullable=True),
         pa.field("value_out_of_documented_range", pa.int64(), nullable=True),
         pa.field("transition_adjacent", pa.bool_(), nullable=False),
+        pa.field("shared_footprint_site_count", pa.int64(), nullable=False),
+        pa.field("d3_forced_threshold", pa.bool_(), nullable=False),
         pa.field("source_snapshot_date", pa.string(), nullable=False),
         pa.field("geometry", pa.binary(), nullable=False),
     ]
@@ -89,6 +105,8 @@ def validate_trajectories(df: pd.DataFrame) -> None:
         raise TrajectoryError("geomad_count must be null for FC metrics (never fabricated)")
     if df.duplicated(list(_KEY)).any():
         raise TrajectoryError(f"duplicate rows on {_KEY}")
+    if (df["shared_footprint_site_count"] < 1).any():
+        raise TrajectoryError("shared_footprint_site_count must be >= 1 on every row")
 
 
 def write_trajectories(df: pd.DataFrame, path: Path) -> None:
@@ -123,6 +141,8 @@ class RowContext:
     geomad_count: int | None
     effective_pixel_support_px: int | None
     transition_adjacent: bool
+    shared_footprint_site_count: int
+    d3_forced_threshold: bool
     source_snapshot_date: str
     geometry_wkb: bytes
 
@@ -149,6 +169,8 @@ def rows_from_metrics(
             "not_computable_reason": m.not_computable_reason,
             "value_out_of_documented_range": m.value_out_of_documented_range,
             "transition_adjacent": ctx.transition_adjacent,
+            "shared_footprint_site_count": ctx.shared_footprint_site_count,
+            "d3_forced_threshold": ctx.d3_forced_threshold,
             "source_snapshot_date": ctx.source_snapshot_date,
             "geometry": ctx.geometry_wkb,
         }

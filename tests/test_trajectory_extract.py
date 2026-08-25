@@ -75,6 +75,8 @@ def _one_trajectory_row(**overrides) -> pd.DataFrame:
         "not_computable_reason": None,
         "value_out_of_documented_range": None,
         "transition_adjacent": False,
+        "shared_footprint_site_count": 1,
+        "d3_forced_threshold": False,
         "source_snapshot_date": "2026-08-13",
         "geometry": b"\x00\x01",
     }
