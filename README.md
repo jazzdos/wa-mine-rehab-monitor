@@ -9,8 +9,10 @@ Australia's Fractional Cover and SWIR-based indices.
 For each MINEDEX site that falls inside this project's monitoring frame,
 the monitor extracts a per-site optical time series (DEA Fractional Cover
 bare/pv/npv and SWIR-based indices) and derives a descriptive spectral
-chronology from it. The output is a set of per-site pages and a statewide
-register, not a compliance report.
+chronology from it. The output is a statewide register and versioned
+GeoParquet data releases, consumed through a private QGIS project — not
+a public website and not a compliance report (amendment A8,
+`docs/decisions/2026-08-25-public-web-page-descope.md`).
 
 ## Claim boundary
 

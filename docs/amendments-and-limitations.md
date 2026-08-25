@@ -30,6 +30,7 @@ for the batches not yet run, with the measurements behind it, is in
 | A5 | 2026-08-21 | Batch D decision 17: VSI curl cache is RAM, not disk | n/a | `plans/2026-08-16-batch-d-implementation.md`, commit `b1891d7` |
 | A6 | 2026-08-23 | MINEDEX commodity codes + valid-member fraction | **new lineage** | `decisions/2026-08-23-d3-commodity-codes-and-valid-fraction.md` |
 | A7 | 2026-08-25 | E5 Huntly gate re-scoped to engine parity on the jarrah pilot cube | none | `decisions/2026-08-25-e5-engine-parity-rescope.md` |
+| A8 | 2026-08-25 | Public web page withdrawn; output re-scoped to GeoParquet + private QGIS project | none | `decisions/2026-08-25-public-web-page-descope.md` |
 
 **A1 — execution host.** Batch C's measured volume re-derivation
 (597.1 GB windowed, 3.30 TB whole-tile upper bound) excluded the
@@ -108,6 +109,20 @@ pilot composite COGs at jarrah's site points (3×3, mean over non-NaN)
 and must reproduce `series_incumbent_w1.parquet`. Tolerances, the
 validation-before-extraction ordering, and the verdict artefact as sole
 unlock are unchanged, so no protocol digest is affected.
+
+**A8 — public web page withdrawn.** The design §1 fixed output decision
+("static site + map + GeoParquet") is amended by owner decision: the
+output is versioned GeoParquet releases plus a private QGIS project
+over the curated artefacts. A scope withdrawal, not a gate waiver — the
+D5 Pages gate is recorded as never evaluated because its deliverable no
+longer exists, and D13 §2's no-waiver rule is untouched. Batch G's
+rendering tasks (site cards, tables, MapLibre/PMTiles) are withdrawn;
+versioned releases and export gating are retained, and
+`export_gate.export_public` is promoted from deferred (L11) to a
+Batch G task as an `export-release` command. The L17 sharing disclosure
+attaches to the `shared_footprint_site_count` schema field, data
+dictionary, and QGIS styling instead of rendered pages. The Tier 0
+public-RC lane (repository flip) is unaffected. Closes O5.
 
 ### What was deliberately not amended
 
@@ -259,7 +274,7 @@ misread the nulls.
 | ~~O2~~ | ~~Batch E entry under the L4 disclosure needs an owner decision~~ | **Closed 2026-08-25: `decisions/2026-08-25-batch-e-forced-threshold-entry.md`** |
 | O3 | Huntly validation verdict does not exist | Statewide extraction (`require_huntly_gate`) |
 | O4 | Tolerance-gated concordance not evaluated | Nothing; deferred by choice |
-| O5 | D5 Pages gate is pre-registered as recordable-failed | Nothing; Batch G finishes privately |
+| ~~O5~~ | ~~D5 Pages gate is pre-registered as recordable-failed~~ | **Closed 2026-08-25: `decisions/2026-08-25-public-web-page-descope.md`** |
 | ~~O6~~ | ~~Shared-footprint product framing (L17) undecided~~ | **Closed 2026-08-25: `decisions/2026-08-25-tier1-product-framing.md`** |
 | O7 | No SILO account or snapshot exists on either data root | Batch F F5 |
 | O8 | Why the eligibility replay buckets 933 never-judged sites differently from the register build | Task 0's six-count live assertion, not the eligibility split |
@@ -317,7 +332,11 @@ one — the zonal engine reproduces the known Huntly trajectories within
 declared tolerance before it touches statewide data. E1–E3 have landed;
 E4/E5 is a draft plan.
 
-**O5.** D13 §2 pre-registers this: Batch G may finish its private
-implementation with the D5 Pages gate recorded as failed, and that
-failure must not be waived or treated as a Batch G failure, because
-D5 independently gates Pages and the sequence has to be preserved.
+**O5 — closed.** Owner decision 2026-08-25
+(`decisions/2026-08-25-public-web-page-descope.md`): the public web
+page is withdrawn from scope, so the D5 Pages gate is recorded as never
+evaluated rather than failed. D13 §2's pre-registration (a failed gate
+is never waived or bypassed) is untouched because no gate outcome is
+being altered — the deliverable behind the gate no longer exists.
+Batch G's remaining scope is versioned releases, the export-release
+gate wiring, and the private QGIS project (amendment A8).
