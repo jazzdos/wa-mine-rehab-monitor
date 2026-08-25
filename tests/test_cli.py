@@ -2544,6 +2544,63 @@ def test_extract_trajectories_skips_already_verified_partitions(tmp_path, monkey
     assert all(p.name == "part-0000.parquet" for p in parts)
 
 
+def test_extract_trajectories_refuses_resume_with_a_different_site_scope(tmp_path, monkeypatch):
+    """A partition written under one `--site-id` scope must never be
+    silently absorbed by a resume under a DIFFERENT scope: the skip
+    decision in `verified_parts` binds only on digest+schema, never on
+    scope, so the resume-binding gate is what must catch this."""
+    extra_row = {
+        "site_id": "site-d3-00b",
+        "site_name": "Site 0 (second entry)",
+        "commodity": "Au",
+        "stage": "Operating",
+        "owners_at_snapshot": "Owner 0b",
+        "snapshot_date": "2026-08-10",
+        "lon": 116.40,
+        "lat": -32.60,
+        "n_tenements_intersecting": 0,
+        "inclusion_status": "operating",
+    }
+    seed, data_root = _seed_through_apply_d3_threshold(
+        tmp_path, monkeypatch, extra_register_rows=[extra_row]
+    )
+    argv_base = [
+        "extract-trajectories",
+        "--config",
+        str(seed.cfg_file),
+        "--date",
+        "2026-08-21",
+        "--scope",
+        "sites",
+    ]
+    first = runner.invoke(app, [*argv_base, "--site-id", "site-d3-00"])
+    assert first.exit_code == 0, first.output
+
+    # Simulate an INTERRUPTED first run, exactly as
+    # `test_extract_trajectories_skips_already_verified_partitions` does:
+    # the partitions completed (each digest- and schema-verified by its own
+    # manifest) but the run never reached the batch summary.
+    out_dir = data_root / "curated" / "trajectories" / "2026-08-21"
+    summary_path = out_dir / "extraction_summary.json"
+    summary_path.unlink()
+    Path(str(summary_path) + manifests.MANIFEST_SUFFIX).unlink()
+
+    parts_before = sorted(out_dir.rglob("part-*.parquet"))
+    assert parts_before
+
+    # Resume with a DIFFERENT --site-id scope: every already-verified
+    # partition was written for `site_ids == ["site-d3-00"]`, not
+    # `["site-d3-00", "site-d3-00b"]`.
+    second = runner.invoke(app, [*argv_base, "--site-id", "site-d3-00", "--site-id", "site-d3-00b"])
+    assert second.exit_code == 1, second.output
+    payload = json.loads(second.output)
+    assert payload["differing_fields"] == ["site_ids"]
+    assert "site_ids" in payload["refusal"]
+    assert payload["partition"] in {str(p.parent) for p in parts_before}
+    # Nothing was rewritten -- still only the version-0 part per partition.
+    assert sorted(out_dir.rglob("part-*.parquet")) == parts_before
+
+
 def test_extract_trajectories_refuses_a_stray_partition_outside_the_catalogue(
     tmp_path, monkeypatch
 ):

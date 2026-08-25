@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from wa_mine_monitor import manifests, tables, trajectories, trajectory_extract
@@ -63,12 +64,56 @@ def test_existing_partitions_refuses_a_non_canonical_year_directory_name(tmp_pat
         trajectory_extract.existing_partitions(tmp_path)
 
 
+def test_existing_partitions_refuses_a_unicode_digit_year_directory(tmp_path):
+    """`year=2٠١١` mixes an ASCII leading digit with Arabic-Indic digits,
+    which Python's `\\d` (and `int()`) both accept as equal to ASCII
+    '2011'. The partition-directory regex must use `[0-9]` so this is
+    refused as malformed rather than silently parsed to the integer 2011
+    -- an unverified Unicode-named directory sitting inside a dataset the
+    verification loop believes it fully checked would defeat the
+    stray-partition gate this module exists to enforce."""
+    collection_dir = tmp_path / "collection_id=ga_ls5t_gm_cyear_3"
+    collection_dir.mkdir(parents=True)
+    (collection_dir / "year=2٠١١").mkdir()
+    with pytest.raises(trajectory_extract.TrajectoryExtractError, match="year=2"):
+        trajectory_extract.existing_partitions(tmp_path)
+
+
 def test_existing_partitions_refuses_a_stray_file_inside_a_collection_directory(tmp_path):
     collection_dir = tmp_path / "collection_id=ga_ls5t_gm_cyear_3"
     collection_dir.mkdir(parents=True)
     (collection_dir / "stray.txt").write_text("", encoding="utf-8")
     with pytest.raises(trajectory_extract.TrajectoryExtractError, match="stray.txt"):
         trajectory_extract.existing_partitions(tmp_path)
+
+
+def test_part_files_refuses_a_unicode_digit_part_filename(tmp_path):
+    """`part-٠٠١١.parquet` mixes Arabic-Indic digits into the part-filename
+    slot. `_PART_FILENAME_RE` is ASCII-digit-only (`[0-9]`, not `\\d`), so
+    this file matches neither `_PART_FILENAME_RE` nor
+    `_PART_MANIFEST_FILENAME_RE` and must be refused -- silently skipping it
+    would let it finalize, unverified, inside a partition directory the
+    ledger's fail-closed convention requires to hold nothing the run did not
+    check."""
+    partition = trajectory_extract.partition_dir(tmp_path, "ga_ls5t_gm_cyear_3", 2011)
+    partition.mkdir(parents=True)
+    (partition / "part-٠٠١١.parquet").write_bytes(b"")
+    with pytest.raises(trajectory_extract.TrajectoryExtractError, match="part-٠٠١١.parquet"):
+        trajectory_extract.part_files(partition)
+
+
+def test_part_files_refuses_a_stray_file_inside_a_partition_directory(tmp_path):
+    partition = trajectory_extract.partition_dir(tmp_path, "ga_ls5t_gm_cyear_3", 2011)
+    partition.mkdir(parents=True)
+    (partition / "stray.txt").write_text("", encoding="utf-8")
+    with pytest.raises(trajectory_extract.TrajectoryExtractError, match="stray.txt"):
+        trajectory_extract.part_files(partition)
+
+
+def test_part_files_accepts_a_part_and_its_manifest_sidecar(tmp_path):
+    partition = trajectory_extract.partition_dir(tmp_path, "ga_ls5t_gm_cyear_3", 2011)
+    path = _write_verified_part(partition, 0, _one_trajectory_row())
+    assert trajectory_extract.part_files(partition) == [path]
 
 
 def test_partition_result_adds_componentwise():
@@ -257,6 +302,201 @@ def test_verified_parts_refuses_a_part_that_relaxes_a_non_null_field(tmp_path):
     assert "site_id" in message
     assert "nullable" in message
     assert "re-extract" in message
+
+
+def _write_duplicate_field_part(partition: Path, version: int) -> Path:
+    """Write a `part-NNNN.parquet` whose Parquet schema carries the field
+    `site_id` TWICE -- legal in Parquet, and something a foreign tool could
+    write, but never something `write_trajectories`/`tables.write_table`
+    produce themselves. Built via `Table.append_column`, the one pyarrow
+    entry point that tolerates the resulting duplicate name (`pa.table({...})`
+    and a `dict`-keyed schema both collapse duplicates first), with a
+    manifest that correctly digests the resulting bytes -- reproducing a
+    part that would pass the digest gate cleanly while the dict-keyed
+    schema comparison in `_schema_field_mismatches` silently collapses the
+    duplicate to one entry and reports no mismatch at all."""
+    df = _one_trajectory_row()
+    ordered = df.loc[:, trajectories.TRAJECTORY_SCHEMA.names]
+    table = pa.Table.from_pandas(
+        ordered, schema=trajectories.TRAJECTORY_SCHEMA, preserve_index=False
+    )
+    # `append_column` is pyarrow's one entry point that tolerates a
+    # resulting duplicate name -- `pa.table({...})` and a dict-keyed
+    # schema both collapse duplicates before they ever reach a schema.
+    # Pass the ORIGINAL field (not just a bare name) so the appended
+    # column's nullability matches TRAJECTORY_SCHEMA's `site_id` exactly
+    # -- otherwise a relaxed-nullability mismatch would mask the
+    # duplicate-name bug this test exists to catch.
+    table = table.append_column(
+        trajectories.TRAJECTORY_SCHEMA.field("site_id"), table.column("site_id")
+    )
+    partition.mkdir(parents=True, exist_ok=True)
+    path = partition / trajectory_extract.PART_FILENAME_TEMPLATE.format(version=version)
+    pq.write_table(table, path)
+    manifests.write_run_manifest(
+        output=path,
+        inputs=[SourceAsset(uri="test://fixture", sha256=None)],
+        config={"run": {"data_root": str(partition)}},
+        git_state={"sha": "deadbeef", "dirty": False, "diff": ""},
+    )
+    return path
+
+
+def test_verified_parts_refuses_a_part_with_a_duplicate_field_name(tmp_path):
+    partition = trajectory_extract.partition_dir(tmp_path, "ga_ls5t_gm_cyear_3", 2011)
+    path = _write_duplicate_field_part(partition, 0)
+    with pytest.raises(trajectory_extract.TrajectoryExtractError) as excinfo:
+        trajectory_extract.verified_parts(partition, expected_schema=trajectories.TRAJECTORY_SCHEMA)
+    message = str(excinfo.value)
+    assert str(path) in message
+    assert "site_id" in message
+    assert "2" in message
+
+
+# --- resume_binding_mismatches -----------------------------------------
+
+
+def _write_part_manifest_for_resume(
+    tmp_path: Path,
+    *,
+    date: str = "2026-08-21",
+    scope: str = "sites",
+    site_ids: list[str] | None = None,
+    input_sha256: str = "aaa",
+    config: dict | None = None,
+    git_state: dict | None = None,
+) -> dict:
+    """Write a real run manifest (via `manifests.write_run_manifest`) for a
+    throwaway output file and return it parsed from disk, exactly as
+    `resume_binding_mismatches` receives one read off a real partition."""
+    output = tmp_path / "part-0000.parquet"
+    output.write_bytes(b"resume-binding fixture -- only its sha256 matters here")
+    manifest = manifests.write_run_manifest(
+        output=output,
+        inputs=[SourceAsset(uri="test://fixture", sha256=input_sha256)],
+        config=config if config is not None else {"run": {"data_root": str(tmp_path)}},
+        git_state=(
+            git_state if git_state is not None else {"sha": "deadbeef", "dirty": False, "diff": ""}
+        ),
+        resolved_args={
+            "date": date,
+            "scope": scope,
+            "site_ids": site_ids if site_ids is not None else ["site-d3-00"],
+        },
+    )
+    return json.loads(json.dumps(manifest, default=str))
+
+
+def test_resume_binding_mismatches_is_empty_when_everything_matches(tmp_path):
+    config = {"run": {"data_root": str(tmp_path)}}
+    git_state = {"sha": "deadbeef", "dirty": False, "diff": ""}
+    manifest = _write_part_manifest_for_resume(tmp_path, config=config, git_state=git_state)
+    assert (
+        trajectory_extract.resume_binding_mismatches(
+            manifest,
+            date="2026-08-21",
+            scope="sites",
+            site_ids=["site-d3-00"],
+            input_sha256s={"aaa"},
+            config=config,
+            git_state=git_state,
+        )
+        == []
+    )
+
+
+def test_resume_binding_mismatches_flags_a_different_date(tmp_path):
+    config = {"run": {"data_root": str(tmp_path)}}
+    git_state = {"sha": "deadbeef", "dirty": False, "diff": ""}
+    manifest = _write_part_manifest_for_resume(tmp_path, config=config, git_state=git_state)
+    assert trajectory_extract.resume_binding_mismatches(
+        manifest,
+        date="2026-08-22",
+        scope="sites",
+        site_ids=["site-d3-00"],
+        input_sha256s={"aaa"},
+        config=config,
+        git_state=git_state,
+    ) == ["date"]
+
+
+def test_resume_binding_mismatches_flags_a_different_scope(tmp_path):
+    config = {"run": {"data_root": str(tmp_path)}}
+    git_state = {"sha": "deadbeef", "dirty": False, "diff": ""}
+    manifest = _write_part_manifest_for_resume(tmp_path, config=config, git_state=git_state)
+    assert trajectory_extract.resume_binding_mismatches(
+        manifest,
+        date="2026-08-21",
+        scope="statewide",
+        site_ids=["site-d3-00"],
+        input_sha256s={"aaa"},
+        config=config,
+        git_state=git_state,
+    ) == ["scope"]
+
+
+def test_resume_binding_mismatches_flags_different_site_ids(tmp_path):
+    config = {"run": {"data_root": str(tmp_path)}}
+    git_state = {"sha": "deadbeef", "dirty": False, "diff": ""}
+    manifest = _write_part_manifest_for_resume(
+        tmp_path, site_ids=["site-d3-00"], config=config, git_state=git_state
+    )
+    assert trajectory_extract.resume_binding_mismatches(
+        manifest,
+        date="2026-08-21",
+        scope="sites",
+        site_ids=["site-d3-00", "site-d3-00b"],
+        input_sha256s={"aaa"},
+        config=config,
+        git_state=git_state,
+    ) == ["site_ids"]
+
+
+def test_resume_binding_mismatches_flags_different_inputs(tmp_path):
+    config = {"run": {"data_root": str(tmp_path)}}
+    git_state = {"sha": "deadbeef", "dirty": False, "diff": ""}
+    manifest = _write_part_manifest_for_resume(
+        tmp_path, input_sha256="aaa", config=config, git_state=git_state
+    )
+    assert trajectory_extract.resume_binding_mismatches(
+        manifest,
+        date="2026-08-21",
+        scope="sites",
+        site_ids=["site-d3-00"],
+        input_sha256s={"bbb"},
+        config=config,
+        git_state=git_state,
+    ) == ["inputs"]
+
+
+def test_resume_binding_mismatches_flags_a_different_config(tmp_path):
+    config = {"run": {"data_root": str(tmp_path)}}
+    git_state = {"sha": "deadbeef", "dirty": False, "diff": ""}
+    manifest = _write_part_manifest_for_resume(tmp_path, config=config, git_state=git_state)
+    assert trajectory_extract.resume_binding_mismatches(
+        manifest,
+        date="2026-08-21",
+        scope="sites",
+        site_ids=["site-d3-00"],
+        input_sha256s={"aaa"},
+        config={"run": {"data_root": str(tmp_path)}, "extra_field": "changed"},
+        git_state=git_state,
+    ) == ["config"]
+
+
+def test_resume_binding_mismatches_flags_a_different_git_state(tmp_path):
+    config = {"run": {"data_root": str(tmp_path)}}
+    git_state = {"sha": "deadbeef", "dirty": False, "diff": ""}
+    manifest = _write_part_manifest_for_resume(tmp_path, config=config, git_state=git_state)
+    assert trajectory_extract.resume_binding_mismatches(
+        manifest,
+        date="2026-08-21",
+        scope="sites",
+        site_ids=["site-d3-00"],
+        input_sha256s={"aaa"},
+        config=config,
+        git_state={"sha": "cafebabe", "dirty": False, "diff": ""},
+    ) == ["git"]
 
 
 def test_next_part_version_is_one_past_the_highest_present(tmp_path):

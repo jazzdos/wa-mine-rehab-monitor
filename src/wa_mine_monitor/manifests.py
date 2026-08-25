@@ -489,6 +489,43 @@ def _preflight_known_fields(
     }
 
 
+def canonical_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """The normalised form of `config` that `write_run_manifest` records
+    under a manifest's `"config"` key: `data_root` replaced with its
+    symbolic marker, then secret-redacted and string-scrubbed (the same
+    order `_preflight_known_fields` applies), then round-tripped through
+    JSON exactly as a written-and-reread manifest's `config` field is.
+
+    Exposed so a caller deciding whether a NEW invocation's config matches
+    one already recorded in an on-disk manifest (e.g. whether an
+    interrupted run may be resumed) compares like with like -- a raw
+    config compared directly against a manifest's SCRUBBED one would
+    differ even for byte-identical provenance, purely from the scrub/
+    relativize transform having been applied to only one side.
+    """
+    return json.loads(
+        json.dumps(
+            scrub_string_leaves(redact_secrets(_relativize_config_data_root(config))),
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    )
+
+
+def canonical_git_state(git_state: Mapping[str, Any]) -> dict[str, Any]:
+    """The normalised form of `git_state` that `write_run_manifest` records
+    under a manifest's `"git"` key. See `canonical_config`."""
+    return json.loads(
+        json.dumps(
+            _scrub_git_state(git_state),
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    )
+
+
 def preflight_manifest_conflict(
     output: Path,
     *,

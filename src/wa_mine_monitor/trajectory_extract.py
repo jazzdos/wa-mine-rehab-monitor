@@ -19,9 +19,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import pyarrow as pa
@@ -32,7 +33,19 @@ from wa_mine_monitor import d3_inputs, manifests, source_catalogue, trajectories
 #: `part-0000.parquet`, `part-0001.parquet`, ... Zero-padded so a plain
 #: lexicographic sort is also a chronological one.
 PART_FILENAME_TEMPLATE = "part-{version:04d}.parquet"
-_PART_FILENAME_RE = re.compile(r"^part-(\d{4})\.parquet$")
+_PART_FILENAME_RE = re.compile(r"^part-([0-9]{4})\.parquet$")
+
+#: The only other entry a partition directory may legitimately hold: a part
+#: file's own run manifest sidecar (`manifests.write_run_manifest` writes
+#: `<part path><MANIFEST_SUFFIX>` beside it). Built from `_PART_FILENAME_RE`'s
+#: source plus `manifests.MANIFEST_SUFFIX` (escaped) rather than a
+#: separately hand-written pattern, so the two cannot drift apart, and
+#: ASCII-digit-only for the same reason `_PART_FILENAME_RE` is: `\d` also
+#: accepts Unicode digits Python's `int()` treats as equal to their ASCII
+#: counterparts.
+_PART_MANIFEST_FILENAME_RE = re.compile(
+    r"^part-([0-9]{4})\.parquet" + re.escape(manifests.MANIFEST_SUFFIX) + r"$"
+)
 
 #: Where E5 writes its verdict, and the only thing that unlocks statewide
 #: extraction.
@@ -96,7 +109,7 @@ def partition_dir(root: Path, collection_id: str, year: int) -> Path:
 #: The reverse of `partition_dir`'s two path segments. Kept next to
 #: `partition_dir` so the two cannot drift apart.
 _COLLECTION_ID_DIR_RE = re.compile(r"^collection_id=(.+)$")
-_YEAR_DIR_RE = re.compile(r"^year=(0|[1-9]\d*)$")
+_YEAR_DIR_RE = re.compile(r"^year=(0|[1-9][0-9]*)$")
 
 
 def existing_partitions(out_dir: Path) -> list[tuple[str, int]]:
@@ -153,11 +166,34 @@ def _sha256_file(path: Path) -> str:
 
 def part_files(partition: Path) -> list[Path]:
     """Every `part-NNNN.parquet` in `partition`, version-ordered. No
-    verification -- see `verified_parts`."""
+    verification -- see `verified_parts`.
+
+    Every entry in `partition` is required to be either a matched
+    `part-NNNN.parquet` file or that part's `.run_manifest.json` sidecar; any
+    other entry (a stray file, a directory, or a part-shaped name that only
+    matches under Unicode-digit folding) is a REFUSAL naming the entry, never
+    a silent skip. Tightening `_PART_FILENAME_RE` to ASCII digits means a
+    part file named with Unicode digits (which old `\\d`-based matching
+    would have accepted) no longer matches -- without this gate such a file
+    would simply vanish from `part_files`' and `verified_parts`' view and
+    then finalize, unverified, inside a directory the ledger's fail-closed
+    convention requires to be empty of anything the run did not check. This
+    is the partition-directory twin of `existing_partitions`' stray-file and
+    stray-partition gates."""
     partition = Path(partition)
     if not partition.is_dir():
         return []
-    matched = [p for p in partition.iterdir() if _PART_FILENAME_RE.match(p.name)]
+    matched: list[Path] = []
+    for entry in partition.iterdir():
+        if _PART_FILENAME_RE.match(entry.name):
+            matched.append(entry)
+            continue
+        if _PART_MANIFEST_FILENAME_RE.match(entry.name):
+            continue
+        raise TrajectoryExtractError(
+            f"{entry} does not match the part-NNNN.parquet (or its run manifest sidecar) "
+            "layout -- refusing to guess whether it is a verified part"
+        )
     return sorted(matched, key=lambda p: p.name)
 
 
@@ -171,7 +207,24 @@ def _schema_field_mismatches(schema: pa.Schema, expected: pa.Schema) -> list[str
     row contract (`TRAJECTORY_SCHEMA` marks key fields non-nullable), not
     schema metadata: a part whose names and types match but that relaxes a
     non-nullable field to nullable could carry null keys or missing
-    geometry and must be refused, not silently accepted."""
+    geometry and must be refused, not silently accepted.
+
+    Duplicate field names in `schema` are checked FIRST, before either
+    schema is collapsed into a name-keyed dict: Parquet permits two
+    fields sharing one name (a foreign writer could produce this), and a
+    dict keyed by field name silently collapses such a duplicate down to
+    one entry, reporting no mismatch at all even though the resulting
+    dataset is ambiguous to read. Each duplicated name is named in the
+    mismatch list along with its repeat count."""
+    if len(schema.names) != len(set(schema.names)):
+        counts: dict[str, int] = {}
+        for name in schema.names:
+            counts[name] = counts.get(name, 0) + 1
+        return [
+            f"field {name!r} appears {count} times (duplicate field names)"
+            for name, count in counts.items()
+            if count > 1
+        ]
     actual_by_name = {f.name: f for f in schema}
     expected_by_name = {f.name: f for f in expected}
     mismatches: list[str] = []
@@ -252,6 +305,80 @@ def verified_parts(partition: Path, expected_schema: pa.Schema | None = None) ->
                 )
         verified.append(path)
     return verified
+
+
+#: The resume-binding fields `resume_binding_mismatches` checks, in the
+#: order they are appended to its result -- kept as a tuple so the CLI's
+#: refusal message and this module's tests enumerate them identically.
+RESUME_BINDING_FIELDS: tuple[str, ...] = ("date", "scope", "site_ids", "inputs", "config", "git")
+
+
+def resume_binding_mismatches(
+    part_manifest: Mapping[str, Any],
+    *,
+    date: str,
+    scope: str,
+    site_ids: Sequence[str],
+    input_sha256s: Iterable[str | None],
+    config: Mapping[str, Any],
+    git_state: Mapping[str, Any],
+) -> list[str]:
+    """The fields on which `part_manifest` -- an already digest- and
+    schema-verified partition's OWN run manifest -- differs from the
+    CURRENT invocation, or an empty list when none do.
+
+    `verified_parts` only proves a partition's bytes still match its own
+    manifest and that its schema still matches the current row contract --
+    neither says anything about whether THIS run is the one that wrote it.
+    The skip decision in the extraction loop binds only on
+    `(collection_id, year)`, so a partition left by an earlier, interrupted
+    run against a DIFFERENT `--site-id` scope, a different catalogue/
+    register/crosswalk/footprints/Maus snapshot, a different config, or
+    different code would otherwise be silently absorbed, and the final
+    summary would then claim the CURRENT invocation's scope/sites/inputs
+    over rows produced under the old ones. A resumed run must be the SAME
+    run, or refuse -- this is the check that enforces it.
+
+    Six fields are compared, each named in the returned list when it
+    differs:
+
+    - `"date"`/`"scope"`/`"site_ids"` -- `part_manifest["resolved_args"]`
+      against the CURRENT `date`, `scope` and `site_ids` (the caller's
+      `extracted_sites`, compared sorted -- the same order the CLI records
+      them in and writes them to the batch summary).
+    - `"inputs"` -- the recorded input assets' sha256 values (`None`
+      entries dropped, matching how the CLI builds `input_sha256s`)
+      against `input_sha256s`: the same catalogue snapshot, register,
+      crosswalk, footprint areas, Maus snapshot and frozen protocol
+      artefact, never a newer or older one silently substituted.
+    - `"config"`/`"git"` -- `part_manifest["config"]`/`["git"]` against
+      `manifests.canonical_config(config)`/`manifests.canonical_git_state
+      (git_state)` -- the SAME normalised form `write_run_manifest`
+      recorded, so a raw config/git_state is never compared against a
+      scrubbed one. `git` is what catches different CODE: a rule change
+      with an unchanged row schema (the defect this function exists to
+      close) is invisible to `verified_parts`' digest+schema gate, but it
+      changes `git.sha` (a committed change) or `git.diff` (an
+      uncommitted one).
+    """
+    mismatches: list[str] = []
+    resolved_args = part_manifest.get("resolved_args") or {}
+    if resolved_args.get("date") != date:
+        mismatches.append("date")
+    if resolved_args.get("scope") != scope:
+        mismatches.append("scope")
+    if resolved_args.get("site_ids") != sorted(site_ids):
+        mismatches.append("site_ids")
+    recorded_input_sha256s = {
+        asset.get("sha256") for asset in part_manifest.get("inputs") or [] if asset.get("sha256")
+    }
+    if recorded_input_sha256s != {sha for sha in input_sha256s if sha}:
+        mismatches.append("inputs")
+    if part_manifest.get("config") != manifests.canonical_config(config):
+        mismatches.append("config")
+    if part_manifest.get("git") != manifests.canonical_git_state(git_state):
+        mismatches.append("git")
+    return mismatches
 
 
 def next_part_version(partition: Path) -> int:

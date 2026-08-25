@@ -6019,6 +6019,63 @@ def extract_trajectories_cmd(
         )
         raise typer.Exit(1)
 
+    # Hoisted above the partition loop (rather than built afterwards, as a
+    # single block reused only at the end): the resume-binding check below,
+    # inside the loop, needs this run's input sha256 set to compare against
+    # an already-verified partition's OWN recorded inputs, before deciding
+    # whether that partition may be skipped.
+    input_assets = [
+        SourceAsset(
+            uri=str(register_path),
+            sha256=register_manifest["output"]["sha256"],
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(register_dir.name),
+            licence=licence.SOURCES["dmirs_001_minedex"].licence_id,
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(crosswalk_path),
+            sha256=crosswalk_manifest["output"]["sha256"],
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(crosswalk_dir.name),
+            licence=None,
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(footprints_path),
+            sha256=footprints_manifest["output"]["sha256"],
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(footprints_dir.name),
+            licence="CC-BY-SA-4.0",
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(maus_path),
+            sha256=maus_gpkg_sha256,
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(maus_snapshot_dir.name),
+            licence=maus_licence_id,
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(catalogue_dir / snapshots.SHA256SUMS_FILENAME),
+            sha256=sha256_file(catalogue_dir / snapshots.SHA256SUMS_FILENAME),
+            collection="dea_stac",
+            snapshot_date=dt_date.fromisoformat(catalogue_dir.name),
+            licence="CC-BY-4.0",
+            redistribute_public=True,
+        ),
+        SourceAsset(
+            uri=str(protocol_artifact_path),
+            sha256=sha256_file(protocol_artifact_path),
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(protocol_dir.name),
+            licence=None,
+            redistribute_public=False,
+        ),
+    ]
+    input_sha256s = {asset.sha256 for asset in input_assets if asset.sha256 is not None}
+
     # GATE 5 -- refuse a re-run against an already-finished batch summary.
     # PARTITIONS are deliberately not covered by this check -- resuming
     # into an existing dated directory is the point of E4.
@@ -6098,6 +6155,51 @@ def extract_trajectories_cmd(
                 typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
                 raise typer.Exit(1) from None
             if already:
+                # GATE 7 -- a partition digest+schema verifies clean does
+                # NOT mean it was written by THIS run: the skip decision
+                # above binds only on (collection_id, year). A partition
+                # left by an earlier, interrupted run against a DIFFERENT
+                # `--site-id` scope, a different catalogue/register/
+                # crosswalk/footprints/Maus snapshot, a different config, or
+                # different code must never be silently absorbed -- the
+                # final summary would then claim THIS invocation's
+                # scope/sites/inputs over rows produced under the old ones.
+                # A resumed run must be the SAME run, or refuse.
+                for part_path in already:
+                    part_manifest = json.loads(
+                        Path(str(part_path) + manifests.MANIFEST_SUFFIX).read_text(encoding="utf-8")
+                    )
+                    mismatches = trajectory_extract.resume_binding_mismatches(
+                        part_manifest,
+                        date=date,
+                        scope=scope,
+                        site_ids=extracted_sites,
+                        input_sha256s=input_sha256s,
+                        config=resolved_config,
+                        git_state=git_state,
+                    )
+                    if mismatches:
+                        typer.echo(
+                            json.dumps(
+                                {
+                                    "refusal": (
+                                        f"{partition} (collection_id={collection_id}, "
+                                        f"year={year}) was written by a DIFFERENT run -- "
+                                        f"its {', '.join(mismatches)} differ(s) from this "
+                                        "invocation. A resumed run must be the SAME run "
+                                        "(same scope, sites, inputs, config and code) or "
+                                        "refuse; re-extract under a NEW dated output "
+                                        "directory."
+                                    ),
+                                    "partition": str(partition),
+                                    "part_path": str(part_path),
+                                    "differing_fields": mismatches,
+                                },
+                                indent=2,
+                                sort_keys=True,
+                            )
+                        )
+                        raise typer.Exit(1) from None
                 total = total + trajectory_extract.PartitionResult(existing=1)
                 continue
 
@@ -6198,58 +6300,8 @@ def extract_trajectories_cmd(
 
     # Nothing is written until EVERY partition's rows are in hand: a
     # partial failure above exits before this point, so a batch summary can
-    # never describe a half-finished extraction.
-    input_assets = [
-        SourceAsset(
-            uri=str(register_path),
-            sha256=register_manifest["output"]["sha256"],
-            collection=None,
-            snapshot_date=dt_date.fromisoformat(register_dir.name),
-            licence=licence.SOURCES["dmirs_001_minedex"].licence_id,
-            redistribute_public=False,
-        ),
-        SourceAsset(
-            uri=str(crosswalk_path),
-            sha256=crosswalk_manifest["output"]["sha256"],
-            collection=None,
-            snapshot_date=dt_date.fromisoformat(crosswalk_dir.name),
-            licence=None,
-            redistribute_public=False,
-        ),
-        SourceAsset(
-            uri=str(footprints_path),
-            sha256=footprints_manifest["output"]["sha256"],
-            collection=None,
-            snapshot_date=dt_date.fromisoformat(footprints_dir.name),
-            licence="CC-BY-SA-4.0",
-            redistribute_public=False,
-        ),
-        SourceAsset(
-            uri=str(maus_path),
-            sha256=maus_gpkg_sha256,
-            collection=None,
-            snapshot_date=dt_date.fromisoformat(maus_snapshot_dir.name),
-            licence=maus_licence_id,
-            redistribute_public=False,
-        ),
-        SourceAsset(
-            uri=str(catalogue_dir / snapshots.SHA256SUMS_FILENAME),
-            sha256=sha256_file(catalogue_dir / snapshots.SHA256SUMS_FILENAME),
-            collection="dea_stac",
-            snapshot_date=dt_date.fromisoformat(catalogue_dir.name),
-            licence="CC-BY-4.0",
-            redistribute_public=True,
-        ),
-        SourceAsset(
-            uri=str(protocol_artifact_path),
-            sha256=sha256_file(protocol_artifact_path),
-            collection=None,
-            snapshot_date=dt_date.fromisoformat(protocol_dir.name),
-            licence=None,
-            redistribute_public=False,
-        ),
-    ]
-
+    # never describe a half-finished extraction. `input_assets` itself was
+    # built earlier, above the partition loop -- see the comment there.
     written: list[dict[str, object]] = []
     for (collection_id, year), partition_rows in sorted(rows_by_partition.items()):
         partition = trajectory_extract.partition_dir(out_dir, collection_id, year)
@@ -6270,6 +6322,7 @@ def extract_trajectories_cmd(
                 "collection_id": collection_id,
                 "year": year,
                 "n_sites": len(extracted_sites),
+                "site_ids": extracted_sites,
                 **result.as_dict(),
             },
         )
