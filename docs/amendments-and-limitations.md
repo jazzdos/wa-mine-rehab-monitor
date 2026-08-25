@@ -250,6 +250,16 @@ misread the nulls.
 | O5 | D5 Pages gate is pre-registered as recordable-failed | Nothing; Batch G finishes privately |
 | O6 | Shared-footprint product framing (L17) undecided | Batch G G3/G4 site build |
 | O7 | No SILO account or snapshot exists on either data root | Batch F F5 |
+| O8 | Which crosswalk artefact the 2026-08-23 register was built from | Task 0's six-count live assertion, not the eligibility split |
+
+**O8.** Replaying the eligibility join against
+`curated/crosswalk/2026-08-16` reproduces the judged population exactly
+(10,910) but shifts 933 sites between `no_usable_footprint` (31,766
+replayed vs 30,833 recorded) and `crosswalk_not_high_confidence` (7,488
+vs 8,421). Both are never-judged buckets, so the 10,372/538 eligibility
+split is unaffected. Resolve by comparing the crosswalk digest in the
+register run manifest against each dated crosswalk's SHA256SUMS. Full
+statement in `docs/reviews/2026-08-25-batch-e-findings.md`.
 
 **O1 — closed.** Read from the 2026-08-23 `footprint_support.parquet`:
 20 of 1,252 Tier-1 footprints with usable Maus geometry are outside

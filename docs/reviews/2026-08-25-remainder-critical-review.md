@@ -3,6 +3,15 @@
 Date: 2026-08-25. Written against commit `ea9c2cd` (Batch D closed,
 forced-144, `criteria_passed=false`).
 
+**For review in a fresh session, read
+`docs/reviews/2026-08-25-batch-e-findings.md` instead.** It breaks this
+narrative into ten self-contained findings (F1–F10), each carrying its
+own sources, reproduction command, consequence and the decision it
+needs, with no dependence on the conversation that produced them. Every
+measured figure regenerates from
+`scripts/diag_batch_e_readiness.py`. This document remains the narrative
+version, with the ranking and the recommended order.
+
 **Read:** design doc §1–§10, the Tier 0 / Batch B / Batch C / Batch D
 checkpoints, all seven decisions, D13 §2 and §5–§8 (Batches E, F, G and
 the Tier 0 public-RC lane), and the Batch E plans (`2026-08-18`,
