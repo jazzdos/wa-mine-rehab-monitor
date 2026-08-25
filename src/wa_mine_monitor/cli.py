@@ -6044,6 +6044,44 @@ def extract_trajectories_cmd(
         covered_years_by_source.setdefault(source_id, set()).add(year)
     transition_flags = trajectory_extract.transition_adjacent_years(covered_years_by_source)
 
+    # GATE 6 -- refuse a dated directory carrying a partition this run's
+    # catalogue snapshot does not cover. The loop below only visits
+    # (collection, year) pairs `covered_years_by_source` derives from the
+    # CURRENT catalogue, digest- and schema-verifying each; a partition
+    # left on disk from an earlier run against a DIFFERENT catalogue
+    # snapshot (or otherwise outside that set) would never be visited,
+    # never checked, yet would still sit inside the directory the
+    # completion summary finalizes. A finalized dataset directory must
+    # contain nothing this run did not verify.
+    try:
+        on_disk = trajectory_extract.existing_partitions(out_dir)
+    except trajectory_extract.TrajectoryExtractError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    expected_partitions = {
+        (trajectory_extract.collection_id_for_source(source_id), year)
+        for source_id in d3_inputs.D3_COLLECTION_KIND
+        for year in covered_years_by_source.get(source_id, set())
+    }
+    stray_partitions = sorted(set(on_disk) - expected_partitions)
+    if stray_partitions:
+        stray_names = [f"collection_id={cid}/year={yr}" for cid, yr in stray_partitions]
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"{out_dir} contains partition(s) {stray_names} that this run's "
+                        "catalogue snapshot does not cover, so they cannot be digest- or "
+                        "schema-verified -- re-extract under a NEW dated output directory, "
+                        "or restore the catalogue snapshot this directory was built from"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+
     rows_by_partition: dict[tuple[str, int], list[dict[str, object]]] = {}
     total = trajectory_extract.PartitionResult()
 

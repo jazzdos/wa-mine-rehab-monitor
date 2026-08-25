@@ -20,6 +20,57 @@ def test_partition_dir_uses_collection_and_year_keys(tmp_path):
     assert path == tmp_path / "collection_id=ga_ls5t_gm_cyear_3" / "year=2011"
 
 
+def test_existing_partitions_is_empty_when_out_dir_is_absent(tmp_path):
+    assert trajectory_extract.existing_partitions(tmp_path / "does-not-exist") == []
+
+
+def test_existing_partitions_parses_real_partition_layouts(tmp_path):
+    trajectory_extract.partition_dir(tmp_path, "ga_ls5t_gm_cyear_3", 2011).mkdir(parents=True)
+    trajectory_extract.partition_dir(tmp_path, "ga_ls5t_gm_cyear_3", 2012).mkdir(parents=True)
+    trajectory_extract.partition_dir(tmp_path, "ga_ls_fc_pc_cyear_3", 2011).mkdir(parents=True)
+    assert sorted(trajectory_extract.existing_partitions(tmp_path)) == [
+        ("ga_ls5t_gm_cyear_3", 2011),
+        ("ga_ls5t_gm_cyear_3", 2012),
+        ("ga_ls_fc_pc_cyear_3", 2011),
+    ]
+
+
+def test_existing_partitions_ignores_top_level_summary_and_manifest_files(tmp_path):
+    trajectory_extract.partition_dir(tmp_path, "ga_ls5t_gm_cyear_3", 2011).mkdir(parents=True)
+    (tmp_path / "extraction_summary.json").write_text("{}", encoding="utf-8")
+    (tmp_path / ("extraction_summary.json" + manifests.MANIFEST_SUFFIX)).write_text(
+        "{}", encoding="utf-8"
+    )
+    assert trajectory_extract.existing_partitions(tmp_path) == [("ga_ls5t_gm_cyear_3", 2011)]
+
+
+def test_existing_partitions_refuses_a_malformed_collection_directory(tmp_path):
+    (tmp_path / "not-a-collection-dir").mkdir()
+    with pytest.raises(trajectory_extract.TrajectoryExtractError, match="not-a-collection-dir"):
+        trajectory_extract.existing_partitions(tmp_path)
+
+
+def test_existing_partitions_refuses_a_malformed_year_directory(tmp_path):
+    (tmp_path / "collection_id=ga_ls5t_gm_cyear_3" / "not-a-year-dir").mkdir(parents=True)
+    with pytest.raises(trajectory_extract.TrajectoryExtractError, match="not-a-year-dir"):
+        trajectory_extract.existing_partitions(tmp_path)
+
+
+def test_existing_partitions_refuses_a_non_canonical_year_directory_name(tmp_path):
+    trajectory_extract.partition_dir(tmp_path, "ga_ls5t_gm_cyear_3", 2011).mkdir(parents=True)
+    (tmp_path / "collection_id=ga_ls5t_gm_cyear_3" / "year=02011").mkdir()
+    with pytest.raises(trajectory_extract.TrajectoryExtractError, match="year=02011"):
+        trajectory_extract.existing_partitions(tmp_path)
+
+
+def test_existing_partitions_refuses_a_stray_file_inside_a_collection_directory(tmp_path):
+    collection_dir = tmp_path / "collection_id=ga_ls5t_gm_cyear_3"
+    collection_dir.mkdir(parents=True)
+    (collection_dir / "stray.txt").write_text("", encoding="utf-8")
+    with pytest.raises(trajectory_extract.TrajectoryExtractError, match="stray.txt"):
+        trajectory_extract.existing_partitions(tmp_path)
+
+
 def test_partition_result_adds_componentwise():
     a = trajectory_extract.PartitionResult(
         existing=1, inserted=10, refused_empty=0, not_computable=2
@@ -154,6 +205,57 @@ def test_verified_parts_refuses_a_part_predating_the_current_schema(tmp_path):
     assert str(path) in message
     assert "shared_footprint_site_count" in message
     assert "d3_forced_threshold" in message
+    assert "re-extract" in message
+
+
+def _write_relaxed_nullable_part(partition: Path, version: int, field_name: str) -> Path:
+    """Write a `part-NNNN.parquet` whose schema matches `TRAJECTORY_SCHEMA`
+    field-for-field in name and type, except that `field_name` (a non-null
+    field in `TRAJECTORY_SCHEMA`) is relaxed to nullable -- reproducing a
+    legacy part that would pass a name/type-only schema gate while
+    violating the declared trajectory row contract's nullability. Row
+    values are the same valid, non-null values `_one_trajectory_row`
+    writes, with a real (correct) run manifest beside it."""
+    relaxed_schema = pa.schema(
+        [
+            f.with_nullable(True) if f.name == field_name else f
+            for f in trajectories.TRAJECTORY_SCHEMA
+        ]
+    )
+    df = _one_trajectory_row()
+    partition.mkdir(parents=True, exist_ok=True)
+    path = partition / trajectory_extract.PART_FILENAME_TEMPLATE.format(version=version)
+    tables.write_table(df[relaxed_schema.names], path, relaxed_schema)
+    manifests.write_run_manifest(
+        output=path,
+        inputs=[SourceAsset(uri="test://fixture", sha256=None)],
+        config={"run": {"data_root": str(partition)}},
+        git_state={"sha": "deadbeef", "dirty": False, "diff": ""},
+    )
+    return path
+
+
+def test_verified_parts_accepts_a_part_with_round_tripped_nullability(tmp_path):
+    """A part written straight through `TRAJECTORY_SCHEMA` must round-trip
+    its nullability through Parquet's footer unchanged -- this pins that
+    assumption so a future pyarrow/format change that broke it would fail
+    loudly here rather than silently weakening the nullability gate below."""
+    partition = trajectory_extract.partition_dir(tmp_path, "ga_ls5t_gm_cyear_3", 2011)
+    path = _write_verified_part(partition, 0, _one_trajectory_row())
+    assert trajectory_extract.verified_parts(
+        partition, expected_schema=trajectories.TRAJECTORY_SCHEMA
+    ) == [path]
+
+
+def test_verified_parts_refuses_a_part_that_relaxes_a_non_null_field(tmp_path):
+    partition = trajectory_extract.partition_dir(tmp_path, "ga_ls5t_gm_cyear_3", 2011)
+    path = _write_relaxed_nullable_part(partition, 0, "site_id")
+    with pytest.raises(trajectory_extract.TrajectoryExtractError) as excinfo:
+        trajectory_extract.verified_parts(partition, expected_schema=trajectories.TRAJECTORY_SCHEMA)
+    message = str(excinfo.value)
+    assert str(path) in message
+    assert "site_id" in message
+    assert "nullable" in message
     assert "re-extract" in message
 
 

@@ -2544,6 +2544,49 @@ def test_extract_trajectories_skips_already_verified_partitions(tmp_path, monkey
     assert all(p.name == "part-0000.parquet" for p in parts)
 
 
+def test_extract_trajectories_refuses_a_stray_partition_outside_the_catalogue(
+    tmp_path, monkeypatch
+):
+    seed, data_root = _seed_through_apply_d3_threshold(tmp_path, monkeypatch)
+    argv = [
+        "extract-trajectories",
+        "--config",
+        str(seed.cfg_file),
+        "--scope",
+        "sites",
+        "--site-id",
+        "site-d3-00",
+    ]
+    first = runner.invoke(app, [*argv, "--date", "2026-08-21"])
+    assert first.exit_code == 0, first.output
+
+    # Simulate the same interrupted-first-run resume scenario as
+    # `test_extract_trajectories_skips_already_verified_partitions`, but
+    # this time the dated directory ALSO carries a partition for a
+    # (collection, year) that this run's catalogue snapshot does not
+    # cover -- e.g. left behind by an earlier run against a different
+    # catalogue snapshot. It must never be silently finalized: the
+    # partition loop only visits (collection, year) pairs the CURRENT
+    # catalogue derives, so an out-of-set partition would otherwise never
+    # be digest- or schema-checked yet still end up inside the finalized
+    # dataset.
+    out_dir = data_root / "curated" / "trajectories" / "2026-08-21"
+    summary_path = out_dir / "extraction_summary.json"
+    summary_path.unlink()
+    Path(str(summary_path) + manifests.MANIFEST_SUFFIX).unlink()
+
+    collection_dir = next(out_dir.glob("collection_id=*"))
+    stray_partition = collection_dir / "year=1900"
+    stray_partition.mkdir()
+    (stray_partition / "part-0000.parquet").write_bytes(b"not a real parquet file")
+
+    second = runner.invoke(app, [*argv, "--date", "2026-08-21"])
+    assert second.exit_code == 1, second.output
+    refusal = json.loads(second.output)["refusal"]
+    assert collection_dir.name.split("=", 1)[1] in refusal
+    assert "1900" in refusal
+
+
 def test_extract_trajectories_refuses_an_ineligible_site(tmp_path, monkeypatch):
     seed, _data_root = _seed_through_apply_d3_threshold(tmp_path, monkeypatch)
     result = runner.invoke(

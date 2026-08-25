@@ -93,6 +93,56 @@ def partition_dir(root: Path, collection_id: str, year: int) -> Path:
     return Path(root) / f"collection_id={collection_id}" / f"year={int(year)}"
 
 
+#: The reverse of `partition_dir`'s two path segments. Kept next to
+#: `partition_dir` so the two cannot drift apart.
+_COLLECTION_ID_DIR_RE = re.compile(r"^collection_id=(.+)$")
+_YEAR_DIR_RE = re.compile(r"^year=(0|[1-9]\d*)$")
+
+
+def existing_partitions(out_dir: Path) -> list[tuple[str, int]]:
+    """Every `(collection_id, year)` partition already on disk under
+    `out_dir`, parsed from the `collection_id=<id>/year=<year>` layout
+    `partition_dir` writes.
+
+    `out_dir` also holds top-level, non-partition files -- `extraction_
+    summary.json` and its run manifest -- written directly in `out_dir`,
+    never inside a `collection_id=.../year=...` subdirectory. Those, and
+    any other top-level FILE, are ignored here: only directories are
+    partition-shaped at all.
+
+    A top-level DIRECTORY not named `collection_id=<value>`, or an entry
+    inside one that is not a directory named `year=<int>`, is refused
+    rather than silently skipped: this function is the only thing standing
+    between an unrecognised directory and a caller that assumes every
+    existing partition it does not see is simply absent from the run. A
+    directory this function cannot parse must be surfaced, never guessed
+    past.
+    """
+    out_dir = Path(out_dir)
+    if not out_dir.is_dir():
+        return []
+    partitions: list[tuple[str, int]] = []
+    for collection_entry in sorted(out_dir.iterdir()):
+        if collection_entry.is_file():
+            continue
+        collection_match = _COLLECTION_ID_DIR_RE.match(collection_entry.name)
+        if collection_match is None:
+            raise TrajectoryExtractError(
+                f"{collection_entry} does not match the collection_id=<value>/year=<int> "
+                "partition layout -- refusing to guess whether it is a partition"
+            )
+        collection_id = collection_match.group(1)
+        for year_entry in sorted(collection_entry.iterdir()):
+            year_match = _YEAR_DIR_RE.match(year_entry.name) if year_entry.is_dir() else None
+            if year_match is None:
+                raise TrajectoryExtractError(
+                    f"{year_entry} does not match the collection_id=<value>/year=<int> "
+                    "partition layout -- refusing to guess whether it is a partition"
+                )
+            partitions.append((collection_id, int(year_match.group(1))))
+    return partitions
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -112,19 +162,32 @@ def part_files(partition: Path) -> list[Path]:
 
 
 def _schema_field_mismatches(schema: pa.Schema, expected: pa.Schema) -> list[str]:
-    """Field-name/type differences between `schema` and `expected`, ignoring
-    schema-level and field-level METADATA (pandas round-trips attach its own
-    `pandas` metadata blob, which is never a contract violation)."""
-    actual_by_name = {f.name: f.type for f in schema}
-    expected_by_name = {f.name: f.type for f in expected}
+    """Field-name/type/nullability differences between `schema` and
+    `expected`, ignoring schema-level and field-level METADATA (pandas
+    round-trips attach its own `pandas` metadata blob, which is never a
+    contract violation).
+
+    Nullability is checked because it is part of the declared trajectory
+    row contract (`TRAJECTORY_SCHEMA` marks key fields non-nullable), not
+    schema metadata: a part whose names and types match but that relaxes a
+    non-nullable field to nullable could carry null keys or missing
+    geometry and must be refused, not silently accepted."""
+    actual_by_name = {f.name: f for f in schema}
+    expected_by_name = {f.name: f for f in expected}
     mismatches: list[str] = []
-    for name, expected_type in expected_by_name.items():
+    for name, expected_field in expected_by_name.items():
         if name not in actual_by_name:
-            mismatches.append(f"missing field {name!r} (expected {expected_type})")
-        elif actual_by_name[name] != expected_type:
+            mismatches.append(f"missing field {name!r} (expected {expected_field.type})")
+            continue
+        actual_field = actual_by_name[name]
+        if actual_field.type != expected_field.type:
             mismatches.append(
-                f"field {name!r} has type {actual_by_name[name]}, expected {expected_type}"
+                f"field {name!r} has type {actual_field.type}, expected {expected_field.type}"
             )
+        if actual_field.nullable != expected_field.nullable:
+            actual_desc = "nullable" if actual_field.nullable else "non-nullable"
+            expected_desc = "nullable" if expected_field.nullable else "non-nullable"
+            mismatches.append(f"field {name!r} is {actual_desc}, expected {expected_desc}")
     for name in actual_by_name:
         if name not in expected_by_name:
             mismatches.append(f"unexpected field {name!r}")
@@ -148,9 +211,13 @@ def verified_parts(partition: Path, expected_schema: pa.Schema | None = None) ->
     rule -- pass unchanged, since its own manifest still matches its own
     bytes. `expected_schema` closes that hole: each verified part's schema
     is read from the Parquet FOOTER only (`pyarrow.parquet.read_schema`,
-    no row data touched) and compared to `expected_schema` by field name
-    and type (never by metadata -- pandas round-trips attach a `pandas`
-    metadata blob that carries no contract meaning). Any difference is a
+    no row data touched) and compared to `expected_schema` by field name,
+    type, AND nullability (never by metadata -- pandas round-trips attach
+    a `pandas` metadata blob that carries no contract meaning).
+    Nullability is included because it is part of the declared trajectory
+    row contract, not incidental metadata: a part whose names and types
+    match but that relaxed a non-nullable field (a key column, or
+    `geometry`) to nullable would otherwise pass unchanged. Any difference is a
     REFUSAL naming the part file, the differing fields, and the remedy:
     the partition predates the current trajectory row contract and must
     be re-extracted under a NEW dated output directory, never finalized
