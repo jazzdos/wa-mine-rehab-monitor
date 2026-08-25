@@ -6,20 +6,12 @@ nothing lands in a public artefact unless `redistribute_public = true`,
 enforced *in code* at the export boundary, not by care. `export_public` is
 that code, for a pandas frame.
 
-**What actually enforces the gate today, stated exactly, because an overclaim
-here is worse than an underclaim.** `export_public` has NO caller anywhere in
-this tree -- grep for `export_public` and `has_geometry` outside this module
-returns nothing. There is no `dbt/` directory, no `scripts/` content beyond a
-`.gitkeep`, and no other export path in this repo yet. So today this module
-enforces NOTHING: it is a correct, tested DEFINITION and gate function sitting
-unwired, and until a CLI export path (`export-release`, per the design doc §7)
-calls `export_public` on the frame it writes, nothing stops a restricted row
-or a geometry column from reaching a public artefact by any other route.
-Saying "the property holds" here would be false of this tree, and a licence
-gate that misdescribes its own coverage is the failure shape CLAUDE.md names
-four times over. Wire this module into the first `pub_*`-equivalent emitter
-built in Batch G (`export-release`) and delete this paragraph once that call
-exists.
+**What actually enforces the gate today, stated exactly.** Enforcement
+happens in the `export-release` CLI command (`cli.py`): it is the sole
+caller of `export_public`, calling it on every frame it writes before that
+frame reaches `<data_root>/releases/`. The share-alike-scalar caveat below
+still holds -- this module enforces the geometry drop and the row gate, not
+a `share_alike`-aware carve-out rule.
 
 Two independent restrictions are enforced, because two different licences
 bite in two different ways:
@@ -130,10 +122,21 @@ REDISTRIBUTE_COLUMN = "redistribute_public"
 #: only mechanism that can.
 GEOMETRY_NAME_TOKENS: tuple[str, ...] = ("geom", "wkt", "wkb", "easting", "northing")
 
+#: Column NAMES that are a coordinate by themselves. Exact match on the
+#: lower-cased name -- NOT substring tokens like the set above, because
+#: "lat" is a substring of "cumulative" and "dilation", and a licence gate
+#: that silently drops an ordinary measured column is the quietly-lossy
+#: failure this module's docstring names. `REGISTER_SCHEMA` declares
+#: `lon`/`lat` (register.py); a point coordinate is geometry however it is
+#: spelled, same reasoning as `easting`/`northing` above.
+COORDINATE_COLUMN_NAMES: frozenset[str] = frozenset({"lon", "lat", "longitude", "latitude"})
+
 
 def _has_geometry_name(column: str) -> bool:
     """True when the column's name marks it as geometry-bearing."""
     lowered = column.lower()
+    if lowered in COORDINATE_COLUMN_NAMES:
+        return True
     return any(token in lowered for token in GEOMETRY_NAME_TOKENS)
 
 

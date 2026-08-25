@@ -26,8 +26,10 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pyogrio
 import rasterio  # type: ignore[import-untyped]
+import shapely
 import typer
 import yaml
 from pydantic import ValidationError
@@ -40,12 +42,18 @@ from wa_mine_monitor import (
     dea_coverage,
     dea_raster,
     dea_volume,
+    export_gate,
+    huntly_validation,
     licence,
     manifests,
     maus_footprints,
     pixel_support,
     register,
+    release,
     snapshots,
+    spectral_metrics,
+    trajectories,
+    trajectory_extract,
 )
 from wa_mine_monitor.config import ProjectConfig, load_config
 from wa_mine_monitor.http import (
@@ -282,6 +290,41 @@ OptionalDateOption = typer.Option(
     callback=_validate_optional_snapshot_date,
 )
 
+#: `apply-d3-threshold`'s Batch E Task 0 forced-144 entry flag (default off,
+#: `docs/decisions/2026-08-25-batch-e-forced-threshold-entry.md`) -- a module-
+#: level singleton, the same B008 discipline `ConfigOption`/`DateOption`/
+#: `OptionalDateOption` apply, rather than a `typer.Option(...)` call inline
+#: in the function signature's defaults.
+ForcedThresholdOption = typer.Option(
+    False,
+    "--forced-threshold/--no-forced-threshold",
+    help=(
+        "Batch E Task 0 forced-144 entry path (docs/decisions/"
+        "2026-08-25-batch-e-forced-threshold-entry.md): when the threshold "
+        "artefact's criteria_passed is False, judge eligibility at the "
+        "pre-registered forced-144 fallback instead of stamping every judged "
+        "site threshold_not_computed. NEVER flips criteria_passed. Requires "
+        "--decision-record."
+    ),
+)
+
+#: `apply-d3-threshold`'s `--decision-record` companion to `--forced-
+#: threshold` -- required (and checked to name an existing file) only when
+#: `--forced-threshold` is passed; its path is recorded verbatim in the run
+#: manifest alongside `forced_threshold` so the disclosure and its authority
+#: travel together.
+DecisionRecordOption = typer.Option(
+    None,
+    "--decision-record",
+    help=(
+        "Path to the owner decision record authorising --forced-threshold. "
+        "Required when --forced-threshold is passed; must name an existing "
+        "file. Recorded verbatim in the run manifest alongside "
+        "forced_threshold, so the disclosure and its authority travel "
+        "together."
+    ),
+)
+
 #: Required `--source-gpkg` option for `fetch-maus-extract`: the LOCAL global
 #: Maus v2 GeoPackage this command reads, read-only -- never downloaded by
 #: this project. `exists=True, dir_okay=False, readable=True` rejects a
@@ -325,6 +368,21 @@ ReadWorkersOption = typer.Option(
     "--read-workers",
     min=1,
     help="Concurrent raster reads per footprint (round-trip-latency bound; wall-clock only, outputs identical).",
+)
+
+ScopeOption = typer.Option(
+    "sites",
+    "--scope",
+    help=(
+        "'sites' extracts only the --site-id values given (they must be D3-eligible); "
+        "'statewide' extracts every eligible site and is REFUSED until validate-huntly "
+        "has written a passing verdict."
+    ),
+)
+SiteIdOption = typer.Option(
+    None,
+    "--site-id",
+    help="Repeatable. Required for --scope sites; rejected for --scope statewide.",
 )
 
 
@@ -2614,6 +2672,172 @@ def build_maus_footprint_areas_cmd(config: Path = ConfigOption, date: str = Date
     )
 
 
+@app.command("export-release")
+def export_release_cmd(
+    package: str = typer.Option(
+        ..., "--package", help="Key into release.PACKAGES naming the release package to build."
+    ),
+    config: Path = ConfigOption,
+    date: str = DateOption,
+) -> None:
+    """Publish `--package` as a licence-gated public release, for `--date`.
+
+    The first production caller of `export_gate.export_public`
+    (`export_gate.py`'s own docstring names this as the caller that must
+    exist before its enforcement claim is true). `--package` must be a key
+    of `release.PACKAGES` -- the closed registry of things this project
+    releases -- or the run refuses before touching `config`; an unregistered
+    package name is a typo, never a request to release something ad hoc.
+
+    Mirrors `build-maus-footprint-areas`'s discipline exactly: config load,
+    git state, a refuse-before-read guard on the OUTPUT directory
+    (`<data_root>/releases/<date>/<package>/`, checked via
+    `_refuse_if_curated_output_already_exists` before the curated input is
+    even opened, so a re-run against an already-published `--date` never
+    re-reads or re-hashes anything), then the curated input is read through
+    `_digest_verified_manifest` -- the same digest-verification `derive-dea-
+    volume` applies to its own curated inputs -- so a curated artefact
+    hand-edited or partially rebuilt since it was written never reaches a
+    public release.
+
+    `release.prepare_for_export` attaches the row-level `redistribute_public`
+    gate from `licence.SOURCES[spec.source_id]` (the one licence-fact
+    registry this project maintains; see `licence.py`), and
+    `export_gate.export_public` then enforces it: a `PermissionError` --
+    raised on ANY row whose gate is not exactly `True`, never a partial
+    filter -- becomes a JSON refusal and exit 1 here, the same translation
+    every other domain exception in this module receives. Row filtering is
+    prohibited by design (D13 Batch G): a package that mixes redistributable
+    and restricted rows fails as a whole, because a silently filtered
+    release reconciles against nothing and hides that a restricted source
+    reached the boundary.
+
+    On success, writes three files under
+    `<data_root>/releases/<date>/<package>/`: the published parquet (the
+    curated artefact's own declared schema, minus whatever
+    `export_public` dropped), `ATTRIBUTION.txt` (byte-exact
+    `release.attribution_block(spec)` -- the CC-BY-SA obligations shipped
+    WITH the package, not only recorded in the manifest), and an immutable
+    run manifest with one `SourceAsset` input (the curated artefact actually
+    read) and `resolved_args` carrying the package name, the release and
+    curated dates, `output_licence`, `output_share_alike`, the attribution
+    block, and the `dropped_columns` list `export_public` recorded on
+    `DataFrame.attrs["export_public"]` -- so a reader of the manifest alone
+    can see exactly what left the curated frame at this boundary.
+    """
+    resolved: ProjectConfig = _load_config_or_exit(config)
+    resolved_config = resolved.model_dump(mode="json")
+    git_state = _collect_git_state_disclosing_gaps(_REPO_ROOT)
+    data_root = resolved.run.data_root
+
+    spec = release.PACKAGES.get(package)
+    if spec is None:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"unknown release package {package!r} -- must be one of "
+                        f"{sorted(release.PACKAGES)}"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+
+    output_dir = data_root / "releases" / date / package
+    output_path = output_dir / spec.filename
+    # Refuse-before-read: the OUTPUT directory is checked before the curated
+    # input is opened at all, the same ordering `build_maus_footprint_areas_
+    # cmd` applies to ITS output -- a re-run against an already-published
+    # `--date` must not re-hash a curated artefact it is about to refuse to
+    # overwrite anyway.
+    _refuse_if_curated_output_already_exists(
+        output_path, config=resolved_config, git_state=git_state
+    )
+
+    curated_path = data_root / "curated" / spec.curated_dir / date / spec.filename
+    curated_manifest = _digest_verified_manifest(curated_path)
+    curated_sha256 = curated_manifest["output"]["sha256"]
+
+    frame = read_table(curated_path)
+    prepared = release.prepare_for_export(frame, spec)
+    try:
+        published = export_gate.export_public(prepared)
+    except PermissionError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    dropped_columns = published.attrs["export_public"]["dropped_columns"]
+    attribution = release.attribution_block(spec)
+    source = licence.SOURCES[spec.source_id]
+
+    input_assets = [
+        SourceAsset(
+            uri=str(curated_path),
+            sha256=curated_sha256,
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(date),
+            licence=source.licence_id,
+            redistribute_public=source.redistribute_public,
+        ),
+    ]
+
+    # The published parquet is declared against the CURATED artefact's own
+    # schema, filtered to the columns `export_public` actually kept -- never
+    # inferred from `published`'s rows, the same declared-schema discipline
+    # `write_table` enforces everywhere else in this module.
+    source_schema = pq.read_schema(curated_path)
+    output_schema = pa.schema([field for field in source_schema if field.name in published.columns])
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _write_table_or_refuse(
+        published,
+        output_path,
+        output_schema,
+        payload={"curated_path": str(curated_path)},
+    )
+    (output_dir / "ATTRIBUTION.txt").write_text(attribution, encoding="utf-8")
+
+    try:
+        manifests.write_run_manifest(
+            output=output_path,
+            inputs=input_assets,
+            config=resolved_config,
+            git_state=git_state,
+            resolved_args={
+                "package": package,
+                "date": date,
+                "curated_date": date,
+                "output_licence": spec.output_licence,
+                "output_share_alike": spec.share_alike,
+                "attribution_block": attribution,
+                "dropped_columns": dropped_columns,
+            },
+        )
+    except FileExistsError as exc:
+        # Same residual-race translation `build_maus_footprint_areas_cmd`
+        # applies at its own manifest write.
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    typer.echo(
+        json.dumps(
+            {
+                "output_path": str(output_path),
+                "package": package,
+                "n_rows": len(published),
+                "dropped_columns": dropped_columns,
+                "manifest_path": str(output_path) + manifests.MANIFEST_SUFFIX,
+            },
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+    )
+
+
 @app.command("build-dea-coverage")
 def build_dea_coverage(
     config: Path = ConfigOption,
@@ -3507,6 +3731,114 @@ def _run_reads_in_serial_order[T](jobs: Sequence[Callable[[], T]], *, workers: i
     return results
 
 
+def _footprint_pixel_support(
+    items_by_source: Mapping[str, Sequence[Mapping[str, Any]]],
+    footprint_geometry: Mapping[str, Any],
+) -> tuple[
+    dict[str, int],
+    dict[str, tuple[d3_inputs.Member, ...]],
+    dict[str, set[str]],
+    dict[str, str],
+]:
+    """Decision 7: pixel support per footprint against each intersecting
+    tile's ACTUAL grid, read from a catalogue item asset.
+
+    Shared by `build_d3_inputs_cmd` (which computes it over every Tier 1
+    footprint, to select and stratify) and `extract_trajectories_cmd` (which
+    computes it only over the footprints the extraction touches) -- lifted
+    here rather than left inline so a trajectory row's `effective_pixel_
+    support_px` and D3's own simulated support are computed by the exact
+    same code, never two paths that could quietly diverge.
+
+    First discovers one tile grid per (collection, tile) by opening ONE
+    band asset per tile (whichever item's assets resolve first for that
+    tile), then, for every `footprint_geometry` entry, intersects it against
+    every tile whose bounds it could plausibly overlap and unions the
+    member pixel indices across tiles.
+
+    Returns `(effective_support, footprint_members, footprint_tiles,
+    support_not_computed_reason)`: the first three keyed by `maus_id`, over
+    only the footprints with non-empty support; the fourth also keyed by
+    `maus_id`, naming why a `footprint_geometry` entry produced none (the
+    caller is responsible for merging this into its own broader disclosure
+    dict, since a footprint dropped upstream -- missing geometry, outside
+    every RDC region -- never reaches this function at all).
+
+    Refuses (structured JSON, exit 1) on a raster asset that fails to open
+    during tile-grid discovery, or on a `pixel_support.PixelSupportError`.
+    """
+    tile_grids: dict[str, pixel_support.GridSpec] = {}
+    tile_bounds: dict[str, tuple[float, float, float, float]] = {}
+    for source_id, items in items_by_source.items():
+        kind = d3_inputs.D3_COLLECTION_KIND.get(source_id)
+        if kind is None:
+            continue
+        for item in items:
+            properties = item.get("properties") or {}
+            tile_id = str(properties.get("odc:region_code") or "")
+            if not tile_id or tile_id in tile_grids:
+                continue
+            try:
+                hrefs = d3_inputs.resolve_band_hrefs(item, kind=kind)
+            except d3_inputs.D3InputsError:
+                continue
+            href = next(iter(hrefs.values()))
+            stamp = str(properties.get("datetime") or "")
+            item_year = int(stamp[:4]) if len(stamp) >= 4 and stamp[:4].isdigit() else None
+            try:
+                with rasterio.open(href) as dataset:
+                    tile_grids[tile_id] = d3_inputs.grid_spec_from_dataset(dataset, tile_id=tile_id)
+                    bounds = dataset.bounds
+                    tile_bounds[tile_id] = (bounds.left, bounds.bottom, bounds.right, bounds.top)
+            except (rasterio.errors.RasterioError, OSError) as exc:
+                typer.echo(
+                    json.dumps(
+                        {
+                            "refusal": (
+                                "failed to open raster asset during tile-grid discovery "
+                                f"for (source_id={source_id!r}, tile_id={tile_id!r}, "
+                                f"year={item_year!r}, href={href!r}): {exc}"
+                            )
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+                raise typer.Exit(1) from None
+
+    effective_support: dict[str, int] = {}
+    footprint_members: dict[str, tuple[d3_inputs.Member, ...]] = {}
+    footprint_tiles: dict[str, set[str]] = {}
+    support_not_computed_reason: dict[str, str] = {}
+    try:
+        for maus_id, geometry in footprint_geometry.items():
+            minx, miny, maxx, maxy = geometry.bounds
+            member_set: set[d3_inputs.Member] = set()
+            touched_set: set[str] = set()
+            for tile_id, grid in tile_grids.items():
+                tminx, tminy, tmaxx, tmaxy = tile_bounds[tile_id]
+                if maxx < tminx or minx > tmaxx or maxy < tminy or miny > tmaxy:
+                    continue
+                support = pixel_support.build_pixel_support(geometry, crosswalk.TARGET_CRS, grid)
+                if support is None or support.effective_pixel_support_px == 0:
+                    continue
+                touched_set.add(tile_id)
+                member_set.update((tile_id, r, c) for r, c in support.member_indices)
+            if member_set:
+                footprint_members[maus_id] = tuple(sorted(member_set))
+                footprint_tiles[maus_id] = touched_set
+                effective_support[maus_id] = len(member_set)
+            else:
+                support_not_computed_reason[maus_id] = (
+                    "no pixel centre of any intersecting tile is covered by this footprint"
+                )
+    except pixel_support.PixelSupportError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    return effective_support, footprint_members, footprint_tiles, support_not_computed_reason
+
+
 @app.command("build-d3-inputs")
 def build_d3_inputs_cmd(
     config: Path = ConfigOption,
@@ -3951,74 +4283,14 @@ def build_d3_inputs_cmd(
         raise typer.Exit(1) from None
 
     # --- Support (decision 7): pixel support per footprint against each
-    # intersecting tile's ACTUAL grid, read from a catalogue item asset. ---
-    tile_grids: dict[str, pixel_support.GridSpec] = {}
-    tile_bounds: dict[str, tuple[float, float, float, float]] = {}
-    for source_id, items in items_by_source.items():
-        kind = d3_inputs.D3_COLLECTION_KIND.get(source_id)
-        if kind is None:
-            continue
-        for item in items:
-            properties = item.get("properties") or {}
-            tile_id = str(properties.get("odc:region_code") or "")
-            if not tile_id or tile_id in tile_grids:
-                continue
-            try:
-                hrefs = d3_inputs.resolve_band_hrefs(item, kind=kind)
-            except d3_inputs.D3InputsError:
-                continue
-            href = next(iter(hrefs.values()))
-            stamp = str(properties.get("datetime") or "")
-            item_year = int(stamp[:4]) if len(stamp) >= 4 and stamp[:4].isdigit() else None
-            try:
-                with rasterio.open(href) as dataset:
-                    tile_grids[tile_id] = d3_inputs.grid_spec_from_dataset(dataset, tile_id=tile_id)
-                    bounds = dataset.bounds
-                    tile_bounds[tile_id] = (bounds.left, bounds.bottom, bounds.right, bounds.top)
-            except (rasterio.errors.RasterioError, OSError) as exc:
-                typer.echo(
-                    json.dumps(
-                        {
-                            "refusal": (
-                                "failed to open raster asset during tile-grid discovery "
-                                f"for (source_id={source_id!r}, tile_id={tile_id!r}, "
-                                f"year={item_year!r}, href={href!r}): {exc}"
-                            )
-                        },
-                        indent=2,
-                        sort_keys=True,
-                    )
-                )
-                raise typer.Exit(1) from None
-
-    effective_support: dict[str, int] = {}
-    footprint_members: dict[str, tuple[d3_inputs.Member, ...]] = {}
-    footprint_tiles: dict[str, set[str]] = {}
-    try:
-        for maus_id, geometry in footprint_geometry.items():
-            minx, miny, maxx, maxy = geometry.bounds
-            member_set: set[d3_inputs.Member] = set()
-            touched_set: set[str] = set()
-            for tile_id, grid in tile_grids.items():
-                tminx, tminy, tmaxx, tmaxy = tile_bounds[tile_id]
-                if maxx < tminx or minx > tmaxx or maxy < tminy or miny > tmaxy:
-                    continue
-                support = pixel_support.build_pixel_support(geometry, crosswalk.TARGET_CRS, grid)
-                if support is None or support.effective_pixel_support_px == 0:
-                    continue
-                touched_set.add(tile_id)
-                member_set.update((tile_id, r, c) for r, c in support.member_indices)
-            if member_set:
-                footprint_members[maus_id] = tuple(sorted(member_set))
-                footprint_tiles[maus_id] = touched_set
-                effective_support[maus_id] = len(member_set)
-            else:
-                support_not_computed_reason[maus_id] = (
-                    "no pixel centre of any intersecting tile is covered by this footprint"
-                )
-    except pixel_support.PixelSupportError as exc:
-        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
-        raise typer.Exit(1) from None
+    # intersecting tile's ACTUAL grid, read from a catalogue item asset
+    # (`_footprint_pixel_support`, shared with `extract_trajectories_cmd` so
+    # a trajectory row's `effective_pixel_support_px` is the SAME number D3
+    # thresholded on). ---
+    effective_support, footprint_members, footprint_tiles, footprint_support_reasons = (
+        _footprint_pixel_support(items_by_source, footprint_geometry)
+    )
+    support_not_computed_reason.update(footprint_support_reasons)
 
     # --- Item selection rule (frozen in procedures.item_selection). ---
     touched_tile_ids = sorted({t for tiles in footprint_tiles.values() for t in tiles})
@@ -4864,12 +5136,27 @@ def derive_d3_threshold_cmd(
 
 
 @app.command("apply-d3-threshold")
-def apply_d3_threshold_cmd(config: Path = ConfigOption, date: str = DateOption) -> None:
+def apply_d3_threshold_cmd(
+    config: Path = ConfigOption,
+    date: str = DateOption,
+    forced_threshold: bool = ForcedThresholdOption,
+    decision_record: Path | None = DecisionRecordOption,
+) -> None:
     """Apply the derived D3 reduced-support threshold to the latest register
     (D13 D5): every register row gets exactly one `trajectory_status`
     (`register._TRAJECTORY_STATUSES`) plus `effective_pixel_support_px`/
-    `d3_threshold_px`/`d3_eligible` (`register.assign_trajectory_
-    eligibility`).
+    `d3_threshold_px`/`d3_eligible`/`d3_forced_threshold` (`register.assign_
+    trajectory_eligibility`).
+
+    `--forced-threshold` (default off, Batch E Task 0) judges eligibility
+    at the pre-registered forced-144 fallback even when the threshold
+    artefact's `criteria_passed` is `False`, rather than stamping every
+    judged site `threshold_not_computed`. It is refused unless
+    `--decision-record` names an existing file; that path, and
+    `forced_threshold` itself, are recorded verbatim in the run manifest
+    alongside the unchanged `criteria_passed` -- this command NEVER flips
+    `criteria_passed`, under `--forced-threshold` or otherwise: it stays
+    the frozen record of the D3 outcome.
 
     Gates, all digest-verified before anything downstream reads them: (1)
     the latest curated register -- must be DEA-enriched (`register.
@@ -4896,6 +5183,23 @@ def apply_d3_threshold_cmd(config: Path = ConfigOption, date: str = DateOption) 
     digest, `criteria_passed`, and (copied verbatim from the threshold
     artefact) its `failed_criteria` disclosure.
     """
+    if forced_threshold and (decision_record is None or not decision_record.is_file()):
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        "--forced-threshold requires --decision-record naming an existing "
+                        "file -- the disclosure and its authority travel together (Batch E "
+                        "Task 0, docs/decisions/2026-08-25-batch-e-forced-threshold-entry.md)"
+                    ),
+                    "decision_record": str(decision_record) if decision_record else None,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+
     resolved: ProjectConfig = _load_config_or_exit(config)
     resolved_config = resolved.model_dump(mode="json")
     git_state = _collect_git_state_disclosing_gaps(_REPO_ROOT)
@@ -5090,8 +5394,9 @@ def apply_d3_threshold_cmd(config: Path = ConfigOption, date: str = DateOption) 
             register_df,
             crosswalk_df,
             footprint_support_df,
-            n_star=n_star,
+            n_star=applied_threshold_px,
             criteria_passed=criteria_passed,
+            forced_threshold=forced_threshold,
         )
     except ValueError as exc:
         typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
@@ -5190,6 +5495,8 @@ def apply_d3_threshold_cmd(config: Path = ConfigOption, date: str = DateOption) 
                 "n_star": n_star,
                 "d3_threshold_px": applied_threshold_px,
                 "criteria_passed": criteria_passed,
+                "forced_threshold": forced_threshold,
+                "decision_record": str(decision_record) if decision_record else None,
                 "failed_criteria": failed_criteria,
                 "n_by_status": n_by_status,
                 "n_support_computed": n_support_computed,
@@ -5217,6 +5524,864 @@ def apply_d3_threshold_cmd(config: Path = ConfigOption, date: str = DateOption) 
             indent=2,
             sort_keys=True,
             default=str,
+        )
+    )
+
+
+def _not_computable_metric_rows(
+    *, kind: str, reason: str, ctx_kwargs: Mapping[str, Any], item_id: str
+) -> list[dict[str, object]]:
+    """One not-computable row per metric of `kind`, carrying `reason`.
+
+    `n_member_pixels` is the footprint's effective pixel support (a real
+    measured number -- the read failed, the footprint did not) and
+    `n_valid_pixels` is NULL, because nothing was read to count. Used for
+    `read_failed` and `item_missing`, the two reasons that arise outside
+    `spectral_metrics` (which owns `zero_member_pixels`/
+    `zero_valid_pixels`).
+    """
+    metrics = (
+        list(d3_inputs.GEOMEDIAN_METRIC_BANDS)
+        if kind == "geomedian"
+        else list(d3_inputs.FC_METRIC_ASSETS)
+    )
+    support = ctx_kwargs.get("effective_pixel_support_px") or 0
+    ctx = trajectories.RowContext(item_id=item_id, **dict(ctx_kwargs))
+    metric_rows = [
+        spectral_metrics.MetricRow(
+            metric=metric,
+            value=None,
+            n_member_pixels=int(support),
+            n_valid_pixels=0,
+            computable=False,
+            not_computable_reason=reason,
+        )
+        for metric in metrics
+    ]
+    rows = trajectories.rows_from_metrics(metric_rows, ctx)
+    for row in rows:
+        row["n_valid_pixels"] = None
+    return rows
+
+
+@app.command("extract-trajectories")
+def extract_trajectories_cmd(
+    config: Path = ConfigOption,
+    date: str = DateOption,
+    scope: str = ScopeOption,
+    site_id: list[str] | None = SiteIdOption,
+) -> None:
+    """Extract the Tier 1 trajectory table (D13 E4) into resumable
+    `collection_id/year` Parquet partitions under
+    `curated/trajectories/<date>/`.
+
+    Input is the LATEST curated register, which must be the eligible
+    register `apply-d3-threshold` writes (`register.
+    ELIGIBLE_REGISTER_SCHEMA`): only `trajectory_status == "eligible"`
+    rows are extracted, per D13 E4 acceptance. Every other artefact this
+    reads -- the DEA catalogue snapshot, the crosswalk, the Maus
+    footprints, the Maus snapshot -- is digest-verified through the same
+    gates `build-d3-inputs` applies, and the raster reads go through the
+    SAME `_read_footprint_year_bands` the D3 threshold was measured with,
+    so a trajectory value and a D3 simulation value can never diverge
+    through a second code path.
+
+    Resumability: a partition already carrying a digest-verified
+    `part-NNNN.parquet` is SKIPPED (counted as `existing`), never
+    re-read. A re-run over a covered partition writes the next version
+    beside it rather than mutating it -- partitions are immutable.
+
+    Every metric row is written: a row either carries a value, or carries
+    `computable=False` with a `not_computable_reason` from
+    `spectral_metrics.NOT_COMPUTABLE_REASONS`. A raster read that fails is
+    `read_failed`; a (collection, tile, year) with no catalogue item is
+    `item_missing`. Nothing is dropped and nothing is zero-filled.
+
+    `--scope statewide` is refused until `validate-huntly` has written a
+    passing, digest-verified verdict
+    (`trajectory_extract.require_huntly_gate`).
+    """
+    resolved: ProjectConfig = _load_config_or_exit(config)
+    resolved_config = resolved.model_dump(mode="json")
+    git_state = _collect_git_state_disclosing_gaps(_REPO_ROOT)
+    data_root = resolved.run.data_root
+
+    # GATE 1 -- scope validation, before ANY I/O.
+    if scope not in ("sites", "statewide"):
+        typer.echo(
+            json.dumps(
+                {"refusal": f"--scope must be 'sites' or 'statewide', got {scope!r}"},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    if scope == "sites" and not site_id:
+        typer.echo(
+            json.dumps(
+                {"refusal": "--scope sites requires at least one --site-id"},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    if scope == "statewide" and site_id:
+        typer.echo(
+            json.dumps(
+                {"refusal": "--site-id is not accepted with --scope statewide"},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    if scope == "statewide":
+        try:
+            trajectory_extract.require_huntly_gate(data_root)
+        except trajectory_extract.TrajectoryExtractError as exc:
+            typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+            raise typer.Exit(1) from None
+
+    # GATE 2 -- latest curated register: digest-verified, and must be the
+    # D3-eligibility-annotated register apply-d3-threshold writes.
+    try:
+        register_dir = _latest_curated_dated_dir(
+            data_root / "curated" / "register", label="curated/register"
+        )
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    register_path = register_dir / "register.parquet"
+    register_manifest = _digest_verified_manifest(register_path)
+    register_df = read_table(register_path)
+    if "trajectory_status" not in register_df.columns:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        "latest curated register is not D3-eligibility-annotated -- run "
+                        "apply-d3-threshold first"
+                    ),
+                    "register_path": str(register_path),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+
+    # GATE 3 -- eligibility: only `trajectory_status == "eligible"` sites
+    # may be extracted; an explicitly requested site that is not eligible
+    # is refused by name rather than silently dropped.
+    eligible = trajectory_extract.select_eligible_sites(register_df)
+    if scope == "sites":
+        requested = list(site_id or [])
+        ineligible = sorted(set(requested) - set(eligible))
+        if ineligible:
+            typer.echo(
+                json.dumps(
+                    {
+                        "refusal": (
+                            f"--site-id value(s) {ineligible} are not D3-eligible in the "
+                            f"latest curated register ({register_path})"
+                        ),
+                        "ineligible_site_ids": ineligible,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            raise typer.Exit(1)
+        extracted_sites = sorted(set(requested))
+    else:
+        extracted_sites = eligible
+
+    # GATE 4 -- crosswalk, footprint areas, Maus snapshot, DEA catalogue,
+    # frozen protocol: same digest-verification discipline as
+    # `build_d3_inputs_cmd`'s gates 1/3/4/6, minus the region gate (this
+    # command never stratifies) and minus the `--protocol-config` drift
+    # check (this command takes no `--protocol-config`; it only needs the
+    # frozen digest itself, for provenance).
+    d3_protocol_root = data_root / "curated" / "d3-protocol"
+    dated_protocol_dirs = (
+        sorted(d3_protocol_root.glob("????-??-??")) if d3_protocol_root.exists() else []
+    )
+    if not dated_protocol_dirs:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"no frozen D3 protocol under {d3_protocol_root} -- run "
+                        "freeze-d3-protocol first"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    if len(dated_protocol_dirs) > 1:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"curated/d3-protocol has {len(dated_protocol_dirs)} dated "
+                        f"directories {[d.name for d in dated_protocol_dirs]} -- single "
+                        "lineage violated: a frozen protocol may never be superseded "
+                        "silently. Move all but one dated directory aside."
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    protocol_dir = dated_protocol_dirs[0]
+    protocol_artifact_path = protocol_dir / "protocol.json"
+    _digest_verified_manifest(protocol_artifact_path)
+    frozen_digest = json.loads(protocol_artifact_path.read_text(encoding="utf-8"))[
+        "protocol_digest"
+    ]
+
+    try:
+        crosswalk_dir = _latest_curated_dated_dir(
+            data_root / "curated" / "crosswalk", label="curated/crosswalk"
+        )
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    crosswalk_path = crosswalk_dir / "crosswalk.parquet"
+    crosswalk_manifest = _digest_verified_manifest(crosswalk_path)
+    crosswalk_df = read_table(crosswalk_path)
+    tier1_df = crosswalk.tier1_population(crosswalk_df)
+
+    try:
+        footprints_dir = _latest_curated_dated_dir(
+            data_root / "curated" / "maus_footprint_areas",
+            label="curated/maus_footprint_areas",
+        )
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    footprints_path = footprints_dir / "footprint_areas.parquet"
+    footprints_manifest = _digest_verified_manifest(footprints_path)
+
+    maus_licence_id = licence.SOURCES["maus_v2"].licence_id
+    crosswalk_maus_input = next(
+        (
+            asset
+            for asset in crosswalk_manifest.get("inputs", [])
+            if asset.get("licence") == maus_licence_id
+        ),
+        None,
+    )
+    if crosswalk_maus_input is None:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"{crosswalk_path}'s manifest carries no Maus input (licence "
+                        f"{maus_licence_id!r}) -- cannot verify it was built from the "
+                        "same Maus snapshot as the footprint artefact"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    crosswalk_maus_sha256 = crosswalk_maus_input["sha256"]
+    try:
+        footprints_maus_sha256 = footprints_manifest["resolved_args"]["maus_gpkg_sha256"]
+    except KeyError:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"{footprints_path}'s manifest does not record "
+                        "resolved_args.maus_gpkg_sha256"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+    if crosswalk_maus_sha256 != footprints_maus_sha256:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"crosswalk ({crosswalk_path}) and footprint-areas "
+                        f"({footprints_path}) were built from DIFFERENT Maus GeoPackage "
+                        f"snapshots -- crosswalk records {crosswalk_maus_sha256[:12]}..., "
+                        f"footprints records {footprints_maus_sha256[:12]}.... maus_id is "
+                        "derived from clipped geometry, so a join on maus_id alone cannot "
+                        "detect this; refusing rather than silently mixing two snapshots' "
+                        "geometry."
+                    ),
+                    "crosswalk_maus_gpkg_sha256": crosswalk_maus_sha256,
+                    "footprints_maus_gpkg_sha256": footprints_maus_sha256,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+
+    try:
+        maus_snapshot_dir = register.latest_snapshot(data_root, "maus_v2")
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    _verify_snapshot_or_refuse(
+        maus_snapshot_dir, source_id="maus_v2", required_files=("wa_extract.gpkg",)
+    )
+    maus_path = maus_snapshot_dir / "wa_extract.gpkg"
+    maus_gpkg_sha256 = sha256_file(maus_path)
+    if maus_gpkg_sha256 != crosswalk_maus_sha256:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"latest maus_v2 raw snapshot ({maus_path}) hashes "
+                        f"{maus_gpkg_sha256[:12]}..., but the crosswalk's manifest records "
+                        f"Maus sha256 {crosswalk_maus_sha256[:12]}... -- the latest raw Maus "
+                        "snapshot is not the one the crosswalk was built from"
+                    ),
+                    "maus_gpkg_sha256": maus_gpkg_sha256,
+                    "crosswalk_maus_gpkg_sha256": crosswalk_maus_sha256,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    try:
+        maus_source_gdf = gpd.read_file(maus_path)
+        maus_gdf = maus_source_gdf[["maus_id", "geometry"]].to_crs(crosswalk.TARGET_CRS)
+    except (pyogrio.errors.DataSourceError, OSError) as exc:
+        typer.echo(
+            json.dumps({"refusal": str(exc), "maus_gpkg": str(maus_path)}, indent=2, sort_keys=True)
+        )
+        raise typer.Exit(1) from None
+    except KeyError as exc:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": f"wa_extract.gpkg is missing the expected column {exc}",
+                    "maus_gpkg": str(maus_path),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+
+    # The DEA STAC catalogue: unlike `build_d3_inputs_cmd` (which pins the
+    # exact snapshot the DEA-ENRICHED register was built from, via that
+    # register's own manifest), this command's "latest curated register" is
+    # the ELIGIBLE register apply-d3-threshold writes, whose manifest never
+    # carries a `catalogue_date` (D13 D5's resolved_args are threshold/
+    # eligibility fields, not a catalogue pointer). The latest RAW dea_stac
+    # snapshot -- the same lookup already used for maus_v2 above -- is the
+    # equivalent, equally-verified substitute.
+    try:
+        catalogue_dir = register.latest_snapshot(data_root, "dea_stac")
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    _verify_snapshot_or_refuse(
+        catalogue_dir, source_id="dea_stac", required_files=("catalogue_summary.json",)
+    )
+    items_by_source = _load_dea_items(catalogue_dir)
+
+    maus_geom_by_id: dict[str, Any] = dict(
+        zip(maus_gdf["maus_id"].astype(str), maus_gdf.geometry, strict=True)
+    )
+    maus_id_by_site: dict[str, str] = dict(
+        zip(tier1_df["site_id"].astype(str), tier1_df["maus_id"].astype(str), strict=True)
+    )
+
+    sites_by_maus_id: dict[str, list[str]] = {}
+    for site in extracted_sites:
+        maus_id = maus_id_by_site.get(site)
+        if maus_id is None:
+            typer.echo(
+                json.dumps(
+                    {
+                        "refusal": (
+                            f"eligible site {site!r} is not in the Tier 1 crosswalk "
+                            f"population ({crosswalk_path}) -- an eligible site must have a "
+                            "high-confidence Maus match"
+                        )
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            raise typer.Exit(1)
+        sites_by_maus_id.setdefault(maus_id, []).append(site)
+    for sites in sites_by_maus_id.values():
+        sites.sort()
+
+    footprint_geometry: dict[str, Any] = {
+        maus_id: maus_geom_by_id[maus_id]
+        for maus_id in sites_by_maus_id
+        if maus_id in maus_geom_by_id
+    }
+    missing_geometry = sorted(set(sites_by_maus_id) - set(footprint_geometry))
+    if missing_geometry:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"maus_id(s) {missing_geometry} (from eligible sites) are absent "
+                        f"from the latest Maus snapshot ({maus_path})"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+
+    # GATE 5 -- refuse a re-run against an already-finished batch summary.
+    # PARTITIONS are deliberately not covered by this check -- resuming
+    # into an existing dated directory is the point of E4.
+    out_dir = data_root / "curated" / "trajectories" / date
+    _refuse_if_curated_output_already_exists(
+        out_dir / "extraction_summary.json", config=resolved_config, git_state=git_state
+    )
+
+    # Tile grids and per-footprint pixel support: identical to
+    # build-d3-inputs' decision-7 block, so a trajectory row's
+    # `effective_pixel_support_px` is the SAME number D3 thresholded on.
+    effective_support, footprint_members, footprint_tiles, _unused_reasons = (
+        _footprint_pixel_support(items_by_source, footprint_geometry)
+    )
+    touched_tile_ids = sorted({t for tiles in footprint_tiles.values() for t in tiles})
+    try:
+        item_index = d3_inputs.select_catalogue_items(items_by_source, touched_tile_ids)
+    except d3_inputs.D3InputsError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    covered_years_by_source: dict[str, set[int]] = {}
+    for source_id, tile_id, year in item_index:
+        covered_years_by_source.setdefault(source_id, set()).add(year)
+    transition_flags = trajectory_extract.transition_adjacent_years(covered_years_by_source)
+
+    rows_by_partition: dict[tuple[str, int], list[dict[str, object]]] = {}
+    total = trajectory_extract.PartitionResult()
+
+    for source_id, kind in d3_inputs.D3_COLLECTION_KIND.items():
+        collection_id = trajectory_extract.collection_id_for_source(source_id)
+        sensor = trajectory_extract.sensor_for_source(source_id)
+        for year in sorted(covered_years_by_source.get(source_id, set())):
+            partition = trajectory_extract.partition_dir(out_dir, collection_id, year)
+            try:
+                already = trajectory_extract.verified_parts(partition)
+            except trajectory_extract.TrajectoryExtractError as exc:
+                typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+                raise typer.Exit(1) from None
+            if already:
+                total = total + trajectory_extract.PartitionResult(existing=1)
+                continue
+
+            partition_rows: list[dict[str, object]] = []
+            # ONE read per FOOTPRINT, then fan out to the sites that map to
+            # it. A trajectory value is a function of `maus_id`, never of
+            # `site_id`: looping per-site would re-read the same pixels
+            # once per site sharing a footprint, for byte-identical values.
+            for maus_id, footprint_sites in sorted(sites_by_maus_id.items()):
+                members = footprint_members.get(maus_id, ())
+                touched = sorted(footprint_tiles.get(maus_id, ()))
+                geometry_wkb = shapely.to_wkb(footprint_geometry[maus_id])
+                ctx_kwargs = {
+                    "maus_id": maus_id,
+                    "year": year,
+                    "sensor": sensor,
+                    "collection_id": collection_id,
+                    "product_version": None,
+                    "geomad_count": None,
+                    "effective_pixel_support_px": effective_support.get(maus_id),
+                    "transition_adjacent": bool(transition_flags.get(year, False)),
+                    "source_snapshot_date": maus_snapshot_dir.name,
+                    "geometry_wkb": geometry_wkb,
+                }
+                missing_tiles = [t for t in touched if (source_id, t, year) not in item_index]
+                if not touched or missing_tiles:
+                    for site in footprint_sites:
+                        partition_rows.extend(
+                            _not_computable_metric_rows(
+                                kind=kind,
+                                reason="item_missing",
+                                ctx_kwargs={**ctx_kwargs, "site_id": site},
+                                item_id="",
+                            )
+                        )
+                    continue
+                item = item_index[(source_id, touched[0], year)]
+                properties = item.get("properties") or {}
+                ctx_kwargs["product_version"] = properties.get("odc:dataset_version")
+                item_id = str(item.get("id") or "")
+                try:
+                    raw_bands, _extraction_rows = _read_footprint_year_bands(
+                        source_id=source_id,
+                        kind=kind,
+                        year=year,
+                        touched_tiles=touched,
+                        members=members,
+                        item_index=item_index,
+                        phase="e4",
+                    )
+                except (rasterio.errors.RasterioError, OSError, d3_inputs.D3InputsError):
+                    # A read failure is DISCLOSED per metric, never a zero
+                    # and never a dropped row (D13 E1 acceptance). It is
+                    # disclosed for EVERY site on the footprint -- one
+                    # failed read is one failed read, but it denies all of
+                    # them a value and each must say so on its own row.
+                    for site in footprint_sites:
+                        partition_rows.extend(
+                            _not_computable_metric_rows(
+                                kind=kind,
+                                reason="read_failed",
+                                ctx_kwargs={**ctx_kwargs, "site_id": site},
+                                item_id=item_id,
+                            )
+                        )
+                    continue
+                decoded = _decode_d3_bands(raw_bands, kind=kind)
+                metric_rows = (
+                    spectral_metrics.geomedian_site_year_metrics(decoded)
+                    if kind == "geomedian"
+                    else spectral_metrics.fc_site_year_metrics(decoded)
+                )
+                # Same `metric_rows` object for every site on this
+                # footprint: the values ARE identical and must not be
+                # recomputed into a near-identical float.
+                for site in footprint_sites:
+                    ctx = trajectories.RowContext(item_id=item_id, site_id=site, **ctx_kwargs)
+                    partition_rows.extend(trajectories.rows_from_metrics(metric_rows, ctx))
+
+            if not partition_rows:
+                total = total + trajectory_extract.PartitionResult(refused_empty=1)
+                continue
+            rows_by_partition[(collection_id, year)] = partition_rows
+
+    # Nothing is written until EVERY partition's rows are in hand: a
+    # partial failure above exits before this point, so a batch summary can
+    # never describe a half-finished extraction.
+    input_assets = [
+        SourceAsset(
+            uri=str(register_path),
+            sha256=register_manifest["output"]["sha256"],
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(register_dir.name),
+            licence=licence.SOURCES["dmirs_001_minedex"].licence_id,
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(crosswalk_path),
+            sha256=crosswalk_manifest["output"]["sha256"],
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(crosswalk_dir.name),
+            licence=None,
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(footprints_path),
+            sha256=footprints_manifest["output"]["sha256"],
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(footprints_dir.name),
+            licence="CC-BY-SA-4.0",
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(maus_path),
+            sha256=maus_gpkg_sha256,
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(maus_snapshot_dir.name),
+            licence=maus_licence_id,
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(catalogue_dir / snapshots.SHA256SUMS_FILENAME),
+            sha256=sha256_file(catalogue_dir / snapshots.SHA256SUMS_FILENAME),
+            collection="dea_stac",
+            snapshot_date=dt_date.fromisoformat(catalogue_dir.name),
+            licence="CC-BY-4.0",
+            redistribute_public=True,
+        ),
+        SourceAsset(
+            uri=str(protocol_artifact_path),
+            sha256=sha256_file(protocol_artifact_path),
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(protocol_dir.name),
+            licence=None,
+            redistribute_public=False,
+        ),
+    ]
+
+    written: list[dict[str, object]] = []
+    for (collection_id, year), partition_rows in sorted(rows_by_partition.items()):
+        partition = trajectory_extract.partition_dir(out_dir, collection_id, year)
+        frame = pd.DataFrame(partition_rows)
+        try:
+            path, result = trajectory_extract.write_partition(frame, partition)
+        except (trajectory_extract.TrajectoryExtractError, trajectories.TrajectoryError) as exc:
+            typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+            raise typer.Exit(1) from None
+        manifests.write_run_manifest(
+            output=path,
+            inputs=input_assets,
+            config=resolved_config,
+            git_state=git_state,
+            resolved_args={
+                "date": date,
+                "scope": scope,
+                "collection_id": collection_id,
+                "year": year,
+                "n_sites": len(extracted_sites),
+                **result.as_dict(),
+            },
+        )
+        written.append({"collection_id": collection_id, "year": year, "path": str(path)})
+        total = total + result
+
+    summary_path = out_dir / "extraction_summary.json"
+    summary = {
+        "date": date,
+        "scope": scope,
+        "site_ids": extracted_sites,
+        "partitions": written,
+        "protocol_digest": frozen_digest,
+        **total.as_dict(),
+    }
+    out_dir.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    manifests.write_run_manifest(
+        output=summary_path,
+        inputs=input_assets,
+        config=resolved_config,
+        git_state=git_state,
+        resolved_args={"date": date, "scope": scope, **total.as_dict()},
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "output_dir": str(out_dir),
+                "summary_path": str(summary_path),
+                "manifest_path": str(summary_path) + manifests.MANIFEST_SUFFIX,
+                "n_partitions_written": len(written),
+                **total.as_dict(),
+            },
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+    )
+
+
+ReferenceCubeOption = typer.Option(
+    ...,
+    "--reference-cube",
+    help=(
+        "Parquet path of the jarrah Huntly per-site-year series "
+        "(default reference: .../probe-out/detection_estimand/"
+        "series_incumbent_w1.parquet; the w3/shifted variants share its schema)."
+    ),
+)
+CompositesDirOption = typer.Option(
+    ...,
+    "--composites-dir",
+    help=(
+        "The jarrah pilot cube the reference was built from "
+        "(.../interim/pilot/composites), holding nbart/ and fractional_cover/ "
+        "annual COGs. The monitor's zonal engine samples THESE rasters, so the "
+        "comparison is like-for-like and the D13 tolerances are meaningful."
+    ),
+)
+SiteMetaOption = typer.Option(
+    ...,
+    "--site-meta",
+    help=(
+        "Parquet with site_id, x_incumbent, y_incumbent in EPSG:3577 (jarrah site_meta.parquet)."
+    ),
+)
+WindowOption = typer.Option(
+    3, "--window", help="Sampling window in pixels, square, centred (jarrah w1 = 3)."
+)
+SpectralTolOption = typer.Option(
+    1e-6, "--spectral-abs", help="Absolute tolerance for NBR/NDMI (D13 E5 default 1e-6)."
+)
+FcTolOption = typer.Option(
+    0.1, "--fc-abs", help="Absolute tolerance for FC metrics, percentage points (D13 E5: 0.1)."
+)
+RequireCountsOption = typer.Option(
+    True,
+    "--require-pixel-counts/--no-require-pixel-counts",
+    help=(
+        "D13 E5 requires exact member/valid pixel agreement. The jarrah reference table "
+        "(HUNTLY_REFERENCE_SCHEMA) carries no pixel-count columns, so this honest default "
+        "refuses until a counts-bearing reference is supplied, or the requirement is "
+        "explicitly waived with --no-require-pixel-counts."
+    ),
+)
+
+#: `--site-meta`'s required columns and their rename onto the `x`/`y`
+#: `huntly_validation.sample_pilot_cube` takes -- jarrah's own `site_meta.
+#: parquet` (`scripts/probes/detection_estimand/build_base.py` in
+#: `~/Documents/jarrah-rehab`) carries `x_incumbent`/`y_incumbent`, not
+#: `x`/`y`.
+_SITE_META_COLUMNS: dict[str, str] = {
+    "site_id": "site_id",
+    "x_incumbent": "x",
+    "y_incumbent": "y",
+}
+
+
+@app.command("validate-huntly")
+def validate_huntly_cmd(
+    config: Path = ConfigOption,
+    date: str = DateOption,
+    reference_cube: Path = ReferenceCubeOption,
+    composites_dir: Path = CompositesDirOption,
+    site_meta: Path = SiteMetaOption,
+    window: int = WindowOption,
+    spectral_abs: float = SpectralTolOption,
+    fc_abs: float = FcTolOption,
+    require_pixel_counts: bool = RequireCountsOption,
+) -> None:
+    """Validate the monitor's own zonal engine against the jarrah Huntly
+    pilot cube (D13 E5, engine-parity re-scope: `docs/decisions/
+    2026-08-25-e5-engine-parity-rescope.md`), and write the verdict
+    `curated/huntly-validation/<date>/validation.json` that
+    `extract-trajectories --scope statewide` gates on
+    (`trajectory_extract.require_huntly_gate`).
+
+    The comparison is engine parity, not a product test: `--composites-dir`
+    is the SAME pilot cube `--reference-cube` was built from, sampled with
+    the monitor's OWN zonal engine (`huntly_validation.sample_pilot_cube`)
+    at jarrah's own site points (`--site-meta`), and compared against the
+    reference at the D13 tolerances (`--spectral-abs`/`--fc-abs`). There is
+    no cross-project site mapping and no fractional-cover rescaling -- both
+    sides key on jarrah's own `site_id` and share the same rasters and
+    units.
+
+    The command writes a `passed: false` verdict just as readily as a
+    `passed: true` one: a failing comparison is a RESULT with a manifest,
+    never a crash and never a silent nothing. Only a malformed comparison
+    (`HuntlyValidationError` -- e.g. a reference cube that cannot be read,
+    or `--require-pixel-counts` against a reference carrying no counts) is
+    a refusal.
+    """
+    resolved: ProjectConfig = _load_config_or_exit(config)
+    resolved_config = resolved.model_dump(mode="json")
+    git_state = _collect_git_state_disclosing_gaps(_REPO_ROOT)
+    data_root = resolved.run.data_root
+
+    try:
+        site_meta_table = pq.read_table(site_meta)
+    except (OSError, pa.ArrowInvalid) as exc:
+        typer.echo(
+            json.dumps(
+                {"refusal": f"cannot read {site_meta}: {exc}", "site_meta": str(site_meta)},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+    missing_site_meta_columns = [
+        name for name in _SITE_META_COLUMNS if name not in site_meta_table.column_names
+    ]
+    if missing_site_meta_columns:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"{site_meta} is missing column(s) {missing_site_meta_columns} -- "
+                        f"jarrah site_meta must carry {list(_SITE_META_COLUMNS)}"
+                    ),
+                    "site_meta": str(site_meta),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    sites = site_meta_table.select(list(_SITE_META_COLUMNS)).to_pandas()
+    sites = sites.rename(columns=_SITE_META_COLUMNS)
+    sites["site_id"] = sites["site_id"].astype(str)
+
+    try:
+        sampled = huntly_validation.sample_pilot_cube(composites_dir, sites, window=window)
+        extracted = huntly_validation.melt_sampled_frame(sampled)
+        reference = huntly_validation.read_reference_cube(reference_cube)
+        tolerances = huntly_validation.Tolerances(
+            spectral_abs=spectral_abs, fc_abs=fc_abs, require_pixel_counts=require_pixel_counts
+        )
+        report = huntly_validation.compare(extracted, reference, tolerances)
+    except huntly_validation.HuntlyValidationError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    out_dir = data_root / "curated" / "huntly-validation" / date
+    output_path = out_dir / "validation.json"
+    _refuse_if_curated_output_already_exists(
+        output_path, config=resolved_config, git_state=git_state
+    )
+
+    payload: dict[str, object] = {
+        **report.as_dict(),
+        "reference_cube": str(reference_cube),
+        "composites_dir": str(composites_dir),
+        "site_meta": str(site_meta),
+        "window": window,
+        "date": date,
+    }
+    out_dir.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+    input_assets = [
+        SourceAsset(
+            uri=str(reference_cube),
+            sha256=sha256_file(reference_cube),
+            collection=None,
+            snapshot_date=None,
+            licence=None,
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(site_meta),
+            sha256=sha256_file(site_meta),
+            collection=None,
+            snapshot_date=None,
+            licence=None,
+            redistribute_public=False,
+        ),
+    ]
+    manifests.write_run_manifest(
+        output=output_path,
+        inputs=input_assets,
+        config=resolved_config,
+        git_state=git_state,
+        resolved_args={
+            "date": date,
+            "reference_cube": str(reference_cube),
+            "composites_dir": str(composites_dir),
+            "site_meta": str(site_meta),
+            "window": window,
+            "spectral_abs": spectral_abs,
+            "fc_abs": fc_abs,
+            "require_pixel_counts": require_pixel_counts,
+        },
+    )
+    manifest_path = str(output_path) + manifests.MANIFEST_SUFFIX
+    typer.echo(
+        json.dumps(
+            {**payload, "output_path": str(output_path), "manifest_path": manifest_path},
+            indent=2,
+            sort_keys=True,
         )
     )
 

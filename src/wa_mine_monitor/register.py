@@ -75,10 +75,18 @@ MINEDEX_SITES_SOURCE_CRS = "EPSG:7844"
 #: Declared Arrow schema for `curated/register/<date>/register.parquet`.
 #: Written explicitly to `tables.write_table` -- a table written to disk
 #: declares its column types, never infers them from the rows. Geometry is
-#: carried as `lon`/`lat` float columns ONLY, so the ported export gate's
-#: geometry-column check (`export_gate.has_geometry`, `GEOMETRY_NAME_TOKENS`)
-#: never fires on this table. `owners_at_snapshot` is a NULLABLE string --
-#: `pd.NA` on a site with no resolvable current owner (D8).
+#: carried as `lon`/`lat` float columns ONLY -- no WKT/WKB/geometry-dtype
+#: column reaches this table -- but a point coordinate is still geometry
+#: however it is spelled, so `export_gate.has_geometry` correctly returns
+#: `True` for a register frame (`COORDINATE_COLUMN_NAMES` matches `lon`/`lat`
+#: by exact name). That is intentional, not a gap: the register frame is
+#: never exported (per the cross-task ledger, "the register is never
+#: exported") and `has_geometry` answers "does this frame carry geometry at
+#: all", not "is this frame safe to export" -- the row gate and the drop in
+#: `export_gate.export_public` are the actual export-boundary enforcement,
+#: and neither has ever been called on a register frame. `owners_at_snapshot`
+#: is a NULLABLE string -- `pd.NA` on a site with no resolvable current
+#: owner (D8).
 #:
 #: `n_tenements_intersecting` is a NULLABLE int64 (D12.2,
 #: `docs/decisions/2026-08-16-d9-d12-commit-remote-naming-sequencing.md`):
@@ -1124,6 +1132,7 @@ D3_ELIGIBILITY_COLUMNS: tuple[str, ...] = (
     "d3_threshold_px",
     "d3_eligible",
     "trajectory_status",
+    "d3_forced_threshold",
 )
 
 #: The five `trajectory_status` categories `apply-d3-threshold` assigns,
@@ -1146,14 +1155,19 @@ _JUDGED_TRAJECTORY_STATUSES: frozenset[str] = frozenset(
     {"threshold_not_computed", "insufficient_pixel_support", "eligible"}
 )
 
-#: `ENRICHED_REGISTER_SCHEMA` plus the four D5 eligibility fields -- built
+#: `ENRICHED_REGISTER_SCHEMA` plus the five D5 eligibility fields -- built
 #: FROM the enriched schema, the same way `ENRICHED_REGISTER_SCHEMA` is
 #: itself built from `REGISTER_SCHEMA`, so the three can never drift apart.
 #: `effective_pixel_support_px`/`d3_threshold_px`/`d3_eligible` are NULLABLE
 #: (null = no judgement was possible -- `no_usable_footprint`/`crosswalk_
 #: not_high_confidence`); `trajectory_status` is non-null -- every register
 #: row is assigned exactly one of `_TRAJECTORY_STATUSES`, never left
-#: unclassified.
+#: unclassified. `d3_forced_threshold` is the Batch E Task 0 disclosure
+#: column (`docs/decisions/2026-08-25-batch-e-forced-threshold-entry.md`):
+#: `True` on every row judged under the forced-144 entry path, `False` on
+#: every row judged under a passing-criteria run, NULL on rows that were
+#: never judged (rules 1/2) -- a reader must never have to infer it from a
+#: manifest.
 ELIGIBLE_REGISTER_SCHEMA = pa.schema(
     list(ENRICHED_REGISTER_SCHEMA)
     + [
@@ -1161,6 +1175,7 @@ ELIGIBLE_REGISTER_SCHEMA = pa.schema(
         pa.field("d3_threshold_px", pa.int64(), nullable=True),
         pa.field("d3_eligible", pa.bool_(), nullable=True),
         pa.field("trajectory_status", pa.string(), nullable=False),
+        pa.field("d3_forced_threshold", pa.bool_(), nullable=True),
     ]
 )
 
@@ -1241,12 +1256,35 @@ def assign_trajectory_eligibility(
     *,
     n_star: int,
     criteria_passed: bool,
+    forced_threshold: bool = False,
 ) -> pd.DataFrame:
-    """Append the four D5 eligibility columns (`D3_ELIGIBILITY_COLUMNS`)
+    """Append the five D5 eligibility columns (`D3_ELIGIBILITY_COLUMNS`)
     onto `register_df`, exactly one `trajectory_status` per row (D13 D5,
     `apply-d3-threshold`). Row identity, count and order are NEVER touched
     -- the same append-only discipline `enrich_register_with_dea_coverage`
     applies to the DEA coverage columns.
+
+    `forced_threshold` (default `False`) is the Batch E Task 0 entry path
+    (`docs/decisions/2026-08-25-batch-e-forced-threshold-entry.md`):
+    `criteria_passed=False` alone leaves every judged site
+    `threshold_not_computed` (rule 3 below) with `d3_eligible=False` --
+    this is the default, unchanged behaviour, and stays pinned. Passing
+    `forced_threshold=True` alongside `criteria_passed=False` instead
+    takes rules 4/5, the SAME eligible/insufficient-support split a
+    passing-criteria run would take, applying the pre-registered
+    forced-144 fallback (design doc §8 D3) at the eligibility layer
+    rather than refusing to judge. `criteria_passed` itself is NEVER
+    flipped by this argument or by anything downstream of it -- it stays
+    the frozen record of the D3 outcome. Two refusals guard the
+    contradiction and the pinned constant: `forced_threshold=True` with
+    `criteria_passed=True` is refused (a forced entry only makes sense
+    when the criteria did NOT pass), and `forced_threshold=True` with
+    `n_star != d3_protocol.MIN_FULL_SUPPORT_PX` is refused (the forced
+    path is only ever the pre-registered 144-pixel fallback, never an
+    arbitrary threshold smuggled in under the forced flag). Every judged
+    row carries the disclosure column `d3_forced_threshold`: `True` under
+    the forced path, `False` under a passing-criteria run, `NA` on a
+    never-judged row (rules 1/2) -- see `ELIGIBLE_REGISTER_SCHEMA`.
 
     Status assignment, exactly one per row, first match wins:
 
@@ -1270,15 +1308,24 @@ def assign_trajectory_eligibility(
     2. `crosswalk_not_high_confidence` -- the site IS present in
        `crosswalk_df` but its `confidence` is not `"high"`. NULL/NULL,
        same as (1).
-    3. `threshold_not_computed` -- `criteria_passed` is `False`: EVERY
-       remaining (matched, high-confidence, support-computed) site lands
-       here, `d3_eligible=False`, `d3_threshold_px=144`
+    3. `threshold_not_computed` -- `criteria_passed` is `False` and
+       `forced_threshold` is `False` (the default): EVERY remaining
+       (matched, high-confidence, support-computed) site lands here,
+       `d3_eligible=False`, `d3_threshold_px=144`
        (`d3_protocol.MIN_FULL_SUPPORT_PX`) -- the forced value applied and
-       disclosed (decision 14), never a refusal.
-    4. `insufficient_pixel_support` -- `criteria_passed` is `True` and the
-       site's `effective_pixel_support_px < n_star`: `d3_eligible=False`,
+       disclosed (decision 14), never a refusal, but eligibility itself is
+       never judged.
+    4. `insufficient_pixel_support` -- EITHER `criteria_passed` is `True`,
+       OR `forced_threshold` is `True` (Batch E Task 0) -- and the site's
+       `effective_pixel_support_px < n_star`: `d3_eligible=False`,
        `d3_threshold_px=n_star`.
-    5. `eligible` -- otherwise: `d3_eligible=True`, `d3_threshold_px=n_star`.
+    5. `eligible` -- same gate as (4) but the support comparison passes:
+       `d3_eligible=True`, `d3_threshold_px=n_star`.
+
+    `d3_forced_threshold` is set on every row that reached rule 3, 4 or 5
+    (`judged_mask`): `forced_threshold`'s own value, verbatim -- `True` on
+    every judged row of a forced-entry run, `False` on every judged row of
+    a default or passing-criteria run. Rows 1/2 (never judged) carry `NA`.
 
     A site with more than one candidate `maus_id` row in `crosswalk_df` (an
     ambiguous match -- `ambiguity_n > 1`, which can only occur at
@@ -1294,6 +1341,20 @@ def assign_trajectory_eligibility(
     ever changes WHICH footprint's support an ambiguous high-confidence
     site is judged against, never a site's rule-1-vs-rule-2 classification.
     """
+    if forced_threshold and criteria_passed:
+        raise ValueError(
+            "forced_threshold=True is refused when criteria_passed=True -- a forced entry "
+            "only makes sense when the D3 criteria did NOT pass; this combination is a "
+            "contradiction, not a case to silently resolve"
+        )
+    if forced_threshold and n_star != d3_protocol.MIN_FULL_SUPPORT_PX:
+        raise ValueError(
+            f"forced_threshold=True was passed with n_star={n_star}, but the forced path is "
+            f"only ever the pre-registered fallback at d3_protocol.MIN_FULL_SUPPORT_PX "
+            f"({d3_protocol.MIN_FULL_SUPPORT_PX}) -- refusing an arbitrary threshold smuggled "
+            "in under the forced flag"
+        )
+
     missing_crosswalk = sorted(_REQUIRED_CROSSWALK_ELIGIBILITY_COLUMNS - set(crosswalk_df.columns))
     if missing_crosswalk:
         raise ValueError(
@@ -1333,7 +1394,7 @@ def assign_trajectory_eligibility(
     status = pd.Series("", index=register_df.index, dtype="object")
     status.loc[no_footprint_mask | support_not_computed_mask] = "no_usable_footprint"
     status.loc[not_high_confidence_mask] = "crosswalk_not_high_confidence"
-    if not criteria_passed:
+    if not criteria_passed and not forced_threshold:
         status.loc[judged_mask] = "threshold_not_computed"
     else:
         insufficient_mask = judged_mask & (effective_support < n_star)
@@ -1349,9 +1410,13 @@ def assign_trajectory_eligibility(
     d3_threshold_px.loc[status == "threshold_not_computed"] = d3_protocol.MIN_FULL_SUPPORT_PX
     d3_threshold_px.loc[status.isin(["insufficient_pixel_support", "eligible"])] = n_star
 
+    d3_forced_threshold = pd.Series(pd.NA, index=register_df.index, dtype="boolean")
+    d3_forced_threshold.loc[judged_mask] = forced_threshold
+
     result = register_df.copy()
     result["effective_pixel_support_px"] = effective_support.astype("Int64")
     result["d3_threshold_px"] = d3_threshold_px
     result["d3_eligible"] = d3_eligible
     result["trajectory_status"] = status
+    result["d3_forced_threshold"] = d3_forced_threshold
     return result

@@ -7,14 +7,28 @@ from typing import NamedTuple
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
+import rasterio
 import typer
 import yaml
+from rasterio.transform import from_origin
 from shapely.geometry import Polygon, box
 from shapely.ops import unary_union
 from typer.testing import CliRunner
 
-from wa_mine_monitor import d3_inputs, d3_protocol, manifests, register, snapshots, tables
+from wa_mine_monitor import (
+    cli,
+    d3_inputs,
+    d3_protocol,
+    huntly_validation,
+    manifests,
+    register,
+    snapshots,
+    tables,
+    trajectories,
+)
 from wa_mine_monitor.cli import (
     _collect_git_state_disclosing_gaps,
     _latest_curated_dated_dir,
@@ -2287,3 +2301,676 @@ def test_apply_d3_threshold_forced_144_discloses(tmp_path, monkeypatch):
     print("MANIFEST:", manifest.keys())
     assert "failed_criteria" in manifest.get("resolved_args", {})
     assert len(manifest["resolved_args"]["failed_criteria"]) > 0
+
+
+def test_apply_d3_threshold_refuses_forced_threshold_without_decision_record(tmp_path, monkeypatch):
+    seed = _run_d3_threshold_chain(tmp_path, monkeypatch)
+
+    result = runner.invoke(
+        app,
+        [
+            "apply-d3-threshold",
+            "--config",
+            str(seed.cfg_file),
+            "--date",
+            "2026-08-20",
+            "--forced-threshold",
+        ],
+    )
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.output)
+    assert "decision-record" in payload["refusal"] or "decision_record" in payload["refusal"]
+
+
+def test_apply_d3_threshold_refuses_forced_threshold_with_missing_decision_record_file(
+    tmp_path, monkeypatch
+):
+    seed = _run_d3_threshold_chain(tmp_path, monkeypatch)
+    missing_record = tmp_path / "no-such-decision.md"
+
+    result = runner.invoke(
+        app,
+        [
+            "apply-d3-threshold",
+            "--config",
+            str(seed.cfg_file),
+            "--date",
+            "2026-08-20",
+            "--forced-threshold",
+            "--decision-record",
+            str(missing_record),
+        ],
+    )
+    assert result.exit_code == 1, result.output
+
+
+def test_apply_d3_threshold_forced_threshold_makes_sites_eligible_with_decision_record(
+    tmp_path, monkeypatch
+):
+    seed = _run_d3_threshold_chain(tmp_path, monkeypatch)
+    decision_record = tmp_path / "decision.md"
+    decision_record.write_text("# Forced-threshold entry, authorised 2026-08-25\n")
+
+    result = runner.invoke(
+        app,
+        [
+            "apply-d3-threshold",
+            "--config",
+            str(seed.cfg_file),
+            "--date",
+            "2026-08-20",
+            "--forced-threshold",
+            "--decision-record",
+            str(decision_record),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["criteria_passed"] is False
+
+    out = tables.read_table(Path(payload["output_path"]))
+    judged_mask = ~out["trajectory_status"].isin(
+        ["no_usable_footprint", "crosswalk_not_high_confidence"]
+    )
+    judged = out[judged_mask]
+    assert judged["trajectory_status"].isin(["eligible", "insufficient_pixel_support"]).all()
+    assert judged["d3_forced_threshold"].all()
+    register.validate_eligible_register(out)  # must not raise
+
+    manifest_path = Path(payload["manifest_path"])
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+    # `criteria_passed` itself is not re-checked from the manifest here: the
+    # manifest's `resolved_args` run through `secrets.redact_secrets`
+    # (`manifests.write_run_manifest`'s own documented discipline), which is
+    # key-name-based and redacts `criteria_passed` as a `pass`-substring
+    # match -- an existing, pre-dated behaviour of that redaction, not
+    # something this task changes. The echoed `payload["criteria_passed"]`
+    # above (unredacted) is the authoritative check that it stayed `False`.
+    resolved_args = manifest["resolved_args"]
+    assert resolved_args["forced_threshold"] is True
+    assert resolved_args["decision_record"] == str(decision_record)
+
+
+# --- extract-trajectories CLI command ---------------------------------------
+#
+# Chains `_seed_d3_inputs_chain` through `build-d3-inputs` (2026-08-18),
+# `derive-d3-threshold` (2026-08-19) and `apply-d3-threshold` (2026-08-20),
+# leaving an ELIGIBLE register as the latest curated register, then
+# exercises `extract-trajectories` at 2026-08-21 -- the D13 E4 resumable
+# Parquet-partition extraction.
+
+
+def _seed_through_apply_d3_threshold(tmp_path, monkeypatch, **seed_kwargs) -> tuple[D3Seed, Path]:
+    """`_seed_d3_inputs_chain` plus build-d3-inputs (2026-08-18),
+    derive-d3-threshold (2026-08-19) and apply-d3-threshold (2026-08-20),
+    leaving an ELIGIBLE register as the latest curated register. Returns
+    `(seed, data_root)`. `seed_kwargs` are passed straight through to
+    `_seed_d3_inputs_chain` (e.g. `extra_register_rows`).
+
+    Applies via `--forced-threshold` (Batch E Task 0, docs/decisions/
+    2026-08-25-batch-e-forced-threshold-entry.md): the D3 fixture's `pv_pc_50`/
+    `npv_pc_50` bands are deliberately CONSTANT across years (`_D3_BAND_VALUE_
+    FNS`'s own docstring), so their Spearman correlation is never computable
+    and `criteria_passed` is always `False` for this fixture -- the forced
+    path is the only way this fixture chain ever reaches `eligible` rows,
+    exactly like `test_apply_d3_threshold_forced_threshold_makes_sites_
+    eligible_with_decision_record` already relies on.
+    """
+    seed = _seed_d3_inputs_chain(tmp_path, monkeypatch, **seed_kwargs)
+    data_root = tmp_path / "data"
+    decision_record = tmp_path / "forced-threshold-decision.md"
+    decision_record.write_text("# Forced-threshold entry, authorised 2026-08-25\n")
+    for argv in (
+        [
+            "build-d3-inputs",
+            "--config",
+            str(seed.cfg_file),
+            "--protocol-config",
+            str(seed.d3_yaml_path),
+            "--date",
+            "2026-08-18",
+        ],
+        [
+            "derive-d3-threshold",
+            "--config",
+            str(seed.cfg_file),
+            "--protocol-config",
+            str(seed.d3_yaml_path),
+            "--date",
+            "2026-08-19",
+        ],
+        [
+            "apply-d3-threshold",
+            "--config",
+            str(seed.cfg_file),
+            "--date",
+            "2026-08-20",
+            "--forced-threshold",
+            "--decision-record",
+            str(decision_record),
+        ],
+    ):
+        result = runner.invoke(app, argv)
+        assert result.exit_code == 0, result.output
+    return seed, data_root
+
+
+def test_extract_trajectories_writes_collection_year_partitions(tmp_path, monkeypatch):
+    seed, data_root = _seed_through_apply_d3_threshold(tmp_path, monkeypatch)
+    result = runner.invoke(
+        app,
+        [
+            "extract-trajectories",
+            "--config",
+            str(seed.cfg_file),
+            "--date",
+            "2026-08-21",
+            "--scope",
+            "sites",
+            "--site-id",
+            "site-d3-00",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    out_dir = data_root / "curated" / "trajectories" / "2026-08-21"
+    assert payload["n_partitions_written"] > 0
+    assert payload["inserted"] > 0
+    parts = sorted(out_dir.glob("collection_id=*/year=*/part-0000.parquet"))
+    assert parts, sorted(p.name for p in out_dir.rglob("*"))
+    for part in parts:
+        assert Path(str(part) + manifests.MANIFEST_SUFFIX).exists()
+    frame = tables.read_table(parts[0])
+    assert set(frame.columns) == set(trajectories.TRAJECTORY_SCHEMA.names)
+    assert (frame["site_id"] == "site-d3-00").all()
+    assert (frame["computable"] | frame["not_computable_reason"].notna()).all()
+    assert (out_dir / "extraction_summary.json").exists()
+    assert (out_dir / ("extraction_summary.json" + manifests.MANIFEST_SUFFIX)).exists()
+
+
+def test_extract_trajectories_skips_already_verified_partitions(tmp_path, monkeypatch):
+    seed, data_root = _seed_through_apply_d3_threshold(tmp_path, monkeypatch)
+    argv = [
+        "extract-trajectories",
+        "--config",
+        str(seed.cfg_file),
+        "--scope",
+        "sites",
+        "--site-id",
+        "site-d3-00",
+    ]
+    first = runner.invoke(app, [*argv, "--date", "2026-08-21"])
+    assert first.exit_code == 0, first.output
+    n_written = json.loads(first.output)["n_partitions_written"]
+
+    # Simulate an INTERRUPTED first run: the partitions completed (each
+    # digest-verified by its own manifest) but the run never reached the
+    # batch summary. `extraction_summary.json` (and its manifest) is what
+    # `_refuse_if_curated_output_already_exists` gates on -- it is the
+    # ONLY thing standing between this dated directory and a resume, per
+    # the docstring's "resuming into an existing dated directory is the
+    # point of E4": a run that already finished (summary present) has
+    # nothing left to resume.
+    summary_path = data_root / "curated" / "trajectories" / "2026-08-21" / "extraction_summary.json"
+    summary_path.unlink()
+    Path(str(summary_path) + manifests.MANIFEST_SUFFIX).unlink()
+
+    # Same dated directory: every partition is already covered, so the
+    # second run inserts nothing and reports them all as `existing`.
+    second = runner.invoke(app, [*argv, "--date", "2026-08-21"])
+    assert second.exit_code == 0, second.output
+    payload = json.loads(second.output)
+    assert payload["existing"] == n_written
+    assert payload["inserted"] == 0
+    parts = list((data_root / "curated" / "trajectories" / "2026-08-21").rglob("part-*.parquet"))
+    assert all(p.name == "part-0000.parquet" for p in parts)
+
+
+def test_extract_trajectories_refuses_an_ineligible_site(tmp_path, monkeypatch):
+    seed, _data_root = _seed_through_apply_d3_threshold(tmp_path, monkeypatch)
+    result = runner.invoke(
+        app,
+        [
+            "extract-trajectories",
+            "--config",
+            str(seed.cfg_file),
+            "--date",
+            "2026-08-21",
+            "--scope",
+            "sites",
+            "--site-id",
+            "site-does-not-exist",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "not D3-eligible" in json.loads(result.output)["refusal"]
+
+
+def test_extract_trajectories_refuses_statewide_without_the_huntly_gate(tmp_path, monkeypatch):
+    seed, _data_root = _seed_through_apply_d3_threshold(tmp_path, monkeypatch)
+    result = runner.invoke(
+        app,
+        [
+            "extract-trajectories",
+            "--config",
+            str(seed.cfg_file),
+            "--date",
+            "2026-08-21",
+            "--scope",
+            "statewide",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "validate-huntly" in json.loads(result.output)["refusal"]
+
+
+# --- validate-huntly CLI command (D13 E5, engine-parity re-scope) ----------
+#
+# `sample_pilot_cube` (huntly_validation.py) is the left-hand side, sampled
+# from a tiny synthetic pilot cube built here -- deliberately NOT imported
+# from `tests/test_huntly_validation.py` (each test file builds its own
+# fixtures). The grid mirrors that module's own fixture: a 4x4, 30 m grid
+# with its north-west corner at (0, 120), so a site at (45, 75) sits
+# squarely in the interior and a 3x3 window around it never clips.
+
+_HUNTLY_TRANSFORM = from_origin(0, 120, 30, 30)
+
+
+def _write_huntly_cog(path: Path, band_arrays: dict[str, np.ndarray]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    height, width = next(iter(band_arrays.values())).shape
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        height=height,
+        width=width,
+        count=len(band_arrays),
+        dtype="float64",
+        crs="EPSG:3577",
+        transform=_HUNTLY_TRANSFORM,
+    ) as dst:
+        for i, (name, array) in enumerate(band_arrays.items(), start=1):
+            dst.write(array, i)
+            dst.set_band_description(i, name)
+
+
+def _write_huntly_pilot_cube(composites_dir: Path, year: int) -> None:
+    """A single-year pilot cube, uniform-valued so every pixel in the
+    sampling window agrees, matching the exact-agreement reference the
+    passing tests build against `nbr=0.5, ndmi=0.3, ndvi=0.2,
+    bare=10.0, pv=40.0, npv=50.0`."""
+    _write_huntly_cog(
+        composites_dir / "nbart" / f"nbart_{year}.tif",
+        {
+            "nbr": np.full((4, 4), 0.5, dtype=np.float64),
+            "ndmi": np.full((4, 4), 0.3, dtype=np.float64),
+            "ndvi": np.full((4, 4), 0.2, dtype=np.float64),
+        },
+    )
+    _write_huntly_cog(
+        composites_dir / "fractional_cover" / f"fractional_cover_{year}.tif",
+        {
+            "bare": np.full((4, 4), 10.0, dtype=np.float64),
+            "pv": np.full((4, 4), 40.0, dtype=np.float64),
+            "npv": np.full((4, 4), 50.0, dtype=np.float64),
+        },
+    )
+
+
+def _write_huntly_site_meta(path: Path, site_id: str = "H0001") -> None:
+    """jarrah's own `site_meta.parquet` column names
+    (`x_incumbent`/`y_incumbent`, per `scripts/probes/detection_estimand/
+    build_base.py` in `~/Documents/jarrah-rehab`), not `x`/`y`."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"site_id": [site_id], "x_incumbent": [45.0], "y_incumbent": [75.0]}).to_parquet(
+        path, index=False
+    )
+
+
+def _write_huntly_reference(path: Path, *, site_id: str = "H0001", year: int, nbr: float) -> None:
+    """A `HUNTLY_REFERENCE_SCHEMA` reference table that agrees exactly with
+    `_write_huntly_pilot_cube` on every metric except `nbr`, which callers
+    control directly (to build both the passing and the failing fixture
+    from one helper)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    table = pa.Table.from_pylist(
+        [
+            {
+                "site_id": site_id,
+                "year": year,
+                "bare": 10.0,
+                "pv": 40.0,
+                "npv": 50.0,
+                "nbr": nbr,
+                "ndmi": 0.3,
+                "ndvi": 0.2,
+            }
+        ],
+        schema=huntly_validation.HUNTLY_REFERENCE_SCHEMA,
+    )
+    pq.write_table(table, path)
+
+
+def test_validate_huntly_writes_a_passing_verdict(tmp_path, monkeypatch):
+    """Sample an agreeing pilot cube and confirm the verdict artefact +
+    manifest land where `require_huntly_gate` reads them.
+
+    `--no-require-pixel-counts`: `read_reference_cube` always selects
+    exactly `HUNTLY_REFERENCE_SCHEMA`'s columns, which carries no pixel
+    count fields -- a reference this command can ever read never carries
+    counts, so the passing path can only be reached with the requirement
+    off (test (b) below confirms the on-by-default refusal this implies).
+    """
+    _init_git_repo(tmp_path)
+    monkeypatch.setattr("wa_mine_monitor.cli._REPO_ROOT", tmp_path)
+    cfg_file = _write_monitor_config(tmp_path)
+    composites_dir = tmp_path / "composites"
+    _write_huntly_pilot_cube(composites_dir, 2011)
+    site_meta_path = tmp_path / "site_meta.parquet"
+    _write_huntly_site_meta(site_meta_path)
+    reference_path = tmp_path / "reference.parquet"
+    _write_huntly_reference(reference_path, year=2011, nbr=0.5)
+
+    result = runner.invoke(
+        app,
+        [
+            "validate-huntly",
+            "--config",
+            str(cfg_file),
+            "--date",
+            "2026-08-22",
+            "--reference-cube",
+            str(reference_path),
+            "--composites-dir",
+            str(composites_dir),
+            "--site-meta",
+            str(site_meta_path),
+            "--no-require-pixel-counts",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["passed"] is True
+    assert payload["n_failures"] == 0
+
+    output_path = (
+        tmp_path / "data" / "curated" / "huntly-validation" / "2026-08-22" / "validation.json"
+    )
+    assert output_path.exists()
+    assert Path(str(output_path) + manifests.MANIFEST_SUFFIX).exists()
+    assert payload["output_path"] == str(output_path)
+
+
+def test_validate_huntly_refuses_without_pixel_counts_by_default(tmp_path, monkeypatch):
+    """The D13 default refuses against a reference carrying no counts --
+    the honest state until a counts-bearing reference exists, and NOT to be
+    weakened."""
+    _init_git_repo(tmp_path)
+    monkeypatch.setattr("wa_mine_monitor.cli._REPO_ROOT", tmp_path)
+    cfg_file = _write_monitor_config(tmp_path)
+    composites_dir = tmp_path / "composites"
+    _write_huntly_pilot_cube(composites_dir, 2011)
+    site_meta_path = tmp_path / "site_meta.parquet"
+    _write_huntly_site_meta(site_meta_path)
+    reference_path = tmp_path / "reference.parquet"
+    _write_huntly_reference(reference_path, year=2011, nbr=0.5)
+
+    result = runner.invoke(
+        app,
+        [
+            "validate-huntly",
+            "--config",
+            str(cfg_file),
+            "--date",
+            "2026-08-22",
+            "--reference-cube",
+            str(reference_path),
+            "--composites-dir",
+            str(composites_dir),
+            "--site-meta",
+            str(site_meta_path),
+        ],
+    )
+    assert result.exit_code == 1, result.output
+    assert "pixel count" in json.loads(result.output)["refusal"]
+
+
+def test_validate_huntly_writes_a_failing_verdict_and_exits_zero(tmp_path, monkeypatch):
+    """A metric outside tolerance is a RESULT, not a crash."""
+    _init_git_repo(tmp_path)
+    monkeypatch.setattr("wa_mine_monitor.cli._REPO_ROOT", tmp_path)
+    cfg_file = _write_monitor_config(tmp_path)
+    composites_dir = tmp_path / "composites"
+    _write_huntly_pilot_cube(composites_dir, 2011)
+    site_meta_path = tmp_path / "site_meta.parquet"
+    _write_huntly_site_meta(site_meta_path)
+    reference_path = tmp_path / "reference.parquet"
+    # nbr off by 0.1, far outside the 1e-6 default tolerance.
+    _write_huntly_reference(reference_path, year=2011, nbr=0.6)
+
+    result = runner.invoke(
+        app,
+        [
+            "validate-huntly",
+            "--config",
+            str(cfg_file),
+            "--date",
+            "2026-08-22",
+            "--reference-cube",
+            str(reference_path),
+            "--composites-dir",
+            str(composites_dir),
+            "--site-meta",
+            str(site_meta_path),
+            "--no-require-pixel-counts",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["passed"] is False
+    assert payload["failures"][0]["reason"] == "value_outside_tolerance"
+
+
+def test_extract_trajectories_statewide_runs_once_the_verdict_passes(tmp_path, monkeypatch):
+    """The E4<->E5 interlock, end to end: statewide is refused, then
+    validate-huntly passes, then statewide is permitted. ONE seed."""
+    seed, data_root = _seed_through_apply_d3_threshold(tmp_path, monkeypatch)
+
+    refused = runner.invoke(
+        app,
+        [
+            "extract-trajectories",
+            "--config",
+            str(seed.cfg_file),
+            "--date",
+            "2026-08-21",
+            "--scope",
+            "statewide",
+        ],
+    )
+    assert refused.exit_code == 1
+    assert "validate-huntly" in json.loads(refused.output)["refusal"]
+
+    composites_dir = tmp_path / "composites"
+    _write_huntly_pilot_cube(composites_dir, 2011)
+    site_meta_path = tmp_path / "site_meta.parquet"
+    _write_huntly_site_meta(site_meta_path)
+    reference_path = tmp_path / "reference.parquet"
+    _write_huntly_reference(reference_path, year=2011, nbr=0.5)
+
+    validated = runner.invoke(
+        app,
+        [
+            "validate-huntly",
+            "--config",
+            str(seed.cfg_file),
+            "--date",
+            "2026-08-22",
+            "--reference-cube",
+            str(reference_path),
+            "--composites-dir",
+            str(composites_dir),
+            "--site-meta",
+            str(site_meta_path),
+            "--no-require-pixel-counts",
+        ],
+    )
+    assert validated.exit_code == 0, validated.output
+    assert json.loads(validated.output)["passed"] is True
+
+    permitted = runner.invoke(
+        app,
+        [
+            "extract-trajectories",
+            "--config",
+            str(seed.cfg_file),
+            "--date",
+            "2026-08-23",
+            "--scope",
+            "statewide",
+        ],
+    )
+    assert permitted.exit_code == 0, permitted.output
+    payload = json.loads(permitted.output)
+    assert payload["n_partitions_written"] > 0
+    assert (
+        data_root / "curated" / "trajectories" / "2026-08-23" / "extraction_summary.json"
+    ).exists()
+
+
+def test_extract_trajectories_refuses_a_bare_register(tmp_path, monkeypatch):
+    """A register that never went through apply-d3-threshold carries no
+    `trajectory_status`, so nothing can be known to be eligible."""
+    seed = _seed_d3_inputs_chain(tmp_path, monkeypatch)
+    result = runner.invoke(
+        app,
+        [
+            "extract-trajectories",
+            "--config",
+            str(seed.cfg_file),
+            "--date",
+            "2026-08-21",
+            "--scope",
+            "sites",
+            "--site-id",
+            "site-d3-00",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "apply-d3-threshold" in json.loads(result.output)["refusal"]
+
+
+def test_extract_trajectories_records_item_missing_rather_than_dropping(tmp_path, monkeypatch):
+    """Delete one collection's catalogue items for one year and confirm the
+    site-year still produces rows -- carrying `item_missing`, never absent."""
+    seed, data_root = _seed_through_apply_d3_threshold(tmp_path, monkeypatch)
+    # Blank the FC item for 2011 in the catalogue snapshot BEFORE extraction.
+    # (Monkeypatch `cli._load_dea_items` to drop that item from the returned
+    # mapping -- the snapshot's own digest gate must not be broken by
+    # editing the file on disk.)
+    real_loader = cli._load_dea_items
+
+    def _drop_fc_2011(catalogue_dir):
+        items = real_loader(catalogue_dir)
+        items["dea_fc_pc"] = [
+            item
+            for item in items["dea_fc_pc"]
+            if not str(item["properties"]["datetime"]).startswith("2011")
+        ]
+        return items
+
+    monkeypatch.setattr("wa_mine_monitor.cli._load_dea_items", _drop_fc_2011)
+    result = runner.invoke(
+        app,
+        [
+            "extract-trajectories",
+            "--config",
+            str(seed.cfg_file),
+            "--date",
+            "2026-08-21",
+            "--scope",
+            "sites",
+            "--site-id",
+            "site-d3-00",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    out_dir = data_root / "curated" / "trajectories" / "2026-08-21"
+    fc_2011 = out_dir / "collection_id=ga_ls_fc_pc_cyear_3" / "year=2011"
+    # No FC item exists for 2011 at all (dropped from the catalogue), so no
+    # (source_id, tile, year) key exists in `item_index` for it either --
+    # the whole partition is absent, while every OTHER FC year is present.
+    assert not fc_2011.exists()
+    other_fc_years = sorted(
+        p.parent.name
+        for p in out_dir.glob("collection_id=ga_ls_fc_pc_cyear_3/year=*/part-*.parquet")
+    )
+    assert other_fc_years
+    assert "year=2011" not in other_fc_years
+
+
+def test_extract_trajectories_reads_each_footprint_once_for_sites_that_share_it(
+    tmp_path, monkeypatch
+):
+    """Two eligible sites on ONE footprint => ONE raster read per
+    (collection, year), TWO rows.
+
+    A per-site read loop would re-read the same pixels once per site
+    sharing a footprint, for byte-identical values -- nothing else in the
+    suite would notice that regression.
+    """
+    extra_row = {
+        "site_id": "site-d3-00b",
+        "site_name": "Site 0 (second entry)",
+        "commodity": "Au",
+        "stage": "Operating",
+        "owners_at_snapshot": "Owner 0b",
+        "snapshot_date": "2026-08-10",
+        "lon": 116.40,
+        "lat": -32.60,
+        "n_tenements_intersecting": 0,
+        "inclusion_status": "operating",
+    }
+    seed, data_root = _seed_through_apply_d3_threshold(
+        tmp_path, monkeypatch, extra_register_rows=[extra_row]
+    )
+
+    calls: list[str] = []
+    real = cli._read_footprint_year_bands
+
+    def _tracking_read(**kw):
+        calls.append(f"{kw['source_id']}:{kw['year']}")
+        return real(**kw)
+
+    monkeypatch.setattr(cli, "_read_footprint_year_bands", _tracking_read)
+
+    result = runner.invoke(
+        app,
+        [
+            "extract-trajectories",
+            "--config",
+            str(seed.cfg_file),
+            "--date",
+            "2026-08-21",
+            "--scope",
+            "sites",
+            "--site-id",
+            "site-d3-00",
+            "--site-id",
+            "site-d3-00b",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert calls, "no raster reads were recorded"
+    assert len(calls) == len(set(calls))  # one read per (collection, year)
+
+    out_dir = data_root / "curated" / "trajectories" / "2026-08-21"
+    parts = sorted(out_dir.glob("collection_id=*/year=*/part-0000.parquet"))
+    assert parts
+    rows = tables.read_table(parts[0])
+    assert set(rows["site_id"]) == {"site-d3-00", "site-d3-00b"}
+    a = rows[rows["site_id"] == "site-d3-00"].set_index("metric")["value"]
+    b = rows[rows["site_id"] == "site-d3-00b"].set_index("metric")["value"]
+    assert a.equals(b)  # identical, not merely close

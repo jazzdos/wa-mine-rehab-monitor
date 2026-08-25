@@ -966,9 +966,17 @@ def test_register_writes_through_write_table_with_declared_schema(tmp_path: Path
     assert list(back["site_id"]) == ["M0001"]
 
 
-def test_register_frame_carries_no_geometry_bearing_column() -> None:
+def test_register_frame_is_flagged_geometry_bearing_by_its_lon_lat_columns() -> None:
+    """`has_geometry` answers "does this frame carry geometry at all", not "is
+    this frame safe to export" -- the register frame legitimately carries
+    `lon`/`lat` (`REGISTER_SCHEMA`), and a point coordinate is geometry
+    however it is spelled (`export_gate.COORDINATE_COLUMN_NAMES`), so
+    `has_geometry` correctly returns `True` here. This is not a licence-gate
+    breach: the register frame is never exported (`export_public` and
+    `has_geometry` have no caller on a register frame anywhere in this
+    tree), so no public artefact is affected by this result."""
     df = build_register(_sites_df([_sites_row()]), _owners_df([]), _tenements_gdf([]), "2026-08-15")
-    assert export_gate.has_geometry(df) is False
+    assert export_gate.has_geometry(df) is True
 
 
 def test_register_schema_has_nullable_owners_and_lonlat_types() -> None:
@@ -1991,3 +1999,131 @@ def test_validate_eligible_register_accepts_a_conforming_frame():
         ]
     )
     register_module.validate_eligible_register(frame)  # must not raise
+
+
+# =============================================================================
+# assign_trajectory_eligibility -- forced-threshold path (Batch E Task 0,
+# docs/decisions/2026-08-25-batch-e-forced-threshold-entry.md)
+# =============================================================================
+
+
+def _forced_threshold_register_df() -> pd.DataFrame:
+    """Two matched, high-confidence sites: one with support >= 144 (would
+    be `eligible` under the forced path), one with support < 144 (stays
+    `insufficient_pixel_support` even when forced)."""
+    return pd.DataFrame(
+        {
+            "site_id": ["site-a", "site-b"],
+            "site_name": ["Site A", "Site B"],
+            "commodity": ["Gold", "Gold"],
+            "stage": ["Operating", "Operating"],
+            "owners_at_snapshot": ["Owner A", "Owner B"],
+            "snapshot_date": ["2026-08-10", "2026-08-10"],
+            "lon": [116.0, 117.0],
+            "lat": [-31.0, -32.0],
+            "n_tenements_intersecting": [1, 1],
+            "inclusion_status": ["operating", "operating"],
+        }
+    )
+
+
+def _forced_threshold_crosswalk_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "site_id": ["site-a", "site-b"],
+            "maus_id": ["maus-a", "maus-b"],
+            "confidence": ["high", "high"],
+        }
+    )
+
+
+def _forced_threshold_support_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "maus_id": ["maus-a", "maus-b"],
+            "effective_pixel_support_px": [200, 100],
+        }
+    )
+
+
+def test_forced_threshold_makes_supported_sites_eligible_without_passing_criteria():
+    out = register_module.assign_trajectory_eligibility(
+        _forced_threshold_register_df(),
+        _forced_threshold_crosswalk_df(),
+        _forced_threshold_support_df(),
+        n_star=register_module.d3_protocol.MIN_FULL_SUPPORT_PX,
+        criteria_passed=False,
+        forced_threshold=True,
+    )
+    assert set(out["trajectory_status"]) <= set(register_module._TRAJECTORY_STATUSES)
+    eligible = out.loc[out["trajectory_status"] == "eligible"]
+    assert len(eligible) == 1
+    assert eligible["d3_forced_threshold"].all()
+    assert (eligible["d3_threshold_px"] == 144).all()
+
+
+def test_forced_threshold_still_separates_insufficient_support():
+    out = register_module.assign_trajectory_eligibility(
+        _forced_threshold_register_df(),
+        _forced_threshold_crosswalk_df(),
+        _forced_threshold_support_df(),
+        n_star=register_module.d3_protocol.MIN_FULL_SUPPORT_PX,
+        criteria_passed=False,
+        forced_threshold=True,
+    )
+    row_b = out.loc[out["site_id"] == "site-b"].iloc[0]
+    assert row_b["trajectory_status"] == "insufficient_pixel_support"
+    assert row_b["d3_eligible"] == False
+    assert row_b["d3_forced_threshold"] == True
+
+
+def test_forced_threshold_is_refused_when_criteria_actually_passed():
+    with pytest.raises(ValueError, match="forced_threshold"):
+        register_module.assign_trajectory_eligibility(
+            _forced_threshold_register_df(),
+            _forced_threshold_crosswalk_df(),
+            _forced_threshold_support_df(),
+            n_star=100,
+            criteria_passed=True,
+            forced_threshold=True,
+        )
+
+
+def test_forced_threshold_refuses_n_star_other_than_min_full_support():
+    with pytest.raises(ValueError, match="forced_threshold"):
+        register_module.assign_trajectory_eligibility(
+            _forced_threshold_register_df(),
+            _forced_threshold_crosswalk_df(),
+            _forced_threshold_support_df(),
+            n_star=100,
+            criteria_passed=False,
+            forced_threshold=True,
+        )
+
+
+def test_default_is_unchanged_criteria_failed_means_threshold_not_computed():
+    out = register_module.assign_trajectory_eligibility(
+        _forced_threshold_register_df(),
+        _forced_threshold_crosswalk_df(),
+        _forced_threshold_support_df(),
+        n_star=register_module.d3_protocol.MIN_FULL_SUPPORT_PX,
+        criteria_passed=False,
+    )
+    judged = out.loc[out["site_id"].isin(["site-a", "site-b"])]
+    assert (judged["trajectory_status"] == "threshold_not_computed").all()
+    assert (judged["d3_eligible"] == False).all()
+    assert not judged["d3_forced_threshold"].fillna(False).any()
+
+
+def test_d3_forced_threshold_is_false_not_null_on_every_judged_row():
+    out = register_module.assign_trajectory_eligibility(
+        _forced_threshold_register_df(),
+        _forced_threshold_crosswalk_df(),
+        _forced_threshold_support_df(),
+        n_star=150,
+        criteria_passed=True,
+    )
+    judged = out.loc[out["site_id"].isin(["site-a", "site-b"])]
+    assert judged["trajectory_status"].isin(["eligible", "insufficient_pixel_support"]).all()
+    assert (judged["d3_forced_threshold"] == False).all()
+    assert judged["d3_forced_threshold"].notna().all()

@@ -208,18 +208,32 @@ check would need a protocol decision.
 
 ### Licence and export
 
-**L10 — export gate proven at the manifest layer only.** Tier 0
-acceptance requires the export gate to prove no restricted geometry
-escapes. No standalone export command exists yet, so the criterion is
-met by `minedex_public_export_blocked: true` in the register manifest
-and the closed D7 adjudication, not by a refused live export.
+**L10 — closed by `export-release`.** The stated gap was the ABSENCE of
+a standalone, refusal-tested export command; `export-release`
+(`cli.py`, `tests/test_cli_export_release.py`) now exists, is the sole
+caller of `export_gate.export_public`, and has its row-gate refusal
+pinned by `test_export_release_refuses_restricted_rows`. This is NOT
+Batch G closure: ROADMAP row 5's product releases (trajectory packages)
+stay gated on accepted Tier 1, and no wording here implies otherwise —
+`export-release`'s registry (`release.PACKAGES`) carries exactly one
+package (`footprint-areas`) today, and a register/trajectory package is
+added only when a release of it is actually decided.
 
-**L11 — two export-boundary items unimplemented.** Batch B finding 7,
-deferred non-blocking to Batch G / the Tier 0 public-RC lane, where
-`export_public` gains its first caller: `export_gate.GEOMETRY_NAME_TOKENS`
-omits `lon`/`lat` while `REGISTER_SCHEMA` declares both, and the design
-doc §4 criterion "licence fields non-null on every row" has no
-corresponding check anywhere in the tree.
+**L11 — coordinate-token half closed, non-null-licence half RE-SCOPED.**
+Batch B finding 7. The coordinate-token half is closed:
+`export_gate.COORDINATE_COLUMN_NAMES` now covers `lon`/`lat`/
+`longitude`/`latitude` by exact name match, so `REGISTER_SCHEMA`'s
+`lon`/`lat` columns are dropped at the boundary. The non-null-licence
+half — design doc §4's "licence fields non-null on every row" — is
+RE-SCOPED, not closed: `export-release` attaches `redistribute_public`
+from `licence.SOURCES[spec.source_id]` per package, and `export_public`'s
+existing row gate fail-closes on an absent, null, or non-bool value, so
+the criterion is enforced at the boundary FOR EVERY PACKAGE THIS PROJECT
+EXPORTS. The Tier 0 register itself is never exported — no register
+release package exists, and a register row must refuse under the row
+gate regardless — so the design §4 criterion AS WRITTEN AGAINST REGISTER
+ROWS is never exercised by any test or live export. That residue is
+recorded here explicitly, not implied closed.
 
 **L12 — MINEDEX redistribution is closed.** D7 adjudicated a licence
 conflict with a contrary notice; `minedex_redistribution_allowed` is
@@ -277,22 +291,36 @@ misread the nulls.
 | ~~O5~~ | ~~D5 Pages gate is pre-registered as recordable-failed~~ | **Closed 2026-08-25: `decisions/2026-08-25-public-web-page-descope.md`** |
 | ~~O6~~ | ~~Shared-footprint product framing (L17) undecided~~ | **Closed 2026-08-25: `decisions/2026-08-25-tier1-product-framing.md`** |
 | O7 | No SILO account or snapshot exists on either data root | Batch F F5 |
-| O8 | Why the eligibility replay buckets 933 never-judged sites differently from the register build | Task 0's six-count live assertion, not the eligibility split |
+| ~~O8~~ | ~~Why the eligibility replay buckets 933 never-judged sites differently from the register build~~ | **Closed 2026-08-25: replay now calls the production function (`tests/test_diag_replay_parity.py`)** |
 
-**O8.** Replaying the eligibility join against
-`curated/crosswalk/2026-08-16` reproduces the judged population exactly
-(10,910) but shifts 933 sites between `no_usable_footprint` (31,766
-replayed vs 30,833 recorded) and `crosswalk_not_high_confidence` (7,488
-vs 8,421). Both are never-judged buckets, so the 10,372/538 eligibility
-split is unaffected. **Narrowed 2026-08-25:** the register run
-manifest's recorded crosswalk digest
-(`10e1bfe0…`) matches `curated/crosswalk/2026-08-16/crosswalk.parquet`
-on disk exactly, so "built from a differently dated crosswalk" is
-refuted; the live hypothesis is that the replay's
-bucketing/de-duplication semantics differ from
-`assign_trajectory_eligibility`'s. Open until the replay reproduces all
-six counts. Full statement in
-`docs/reviews/2026-08-25-batch-e-findings.md`.
+**O8 — closed 2026-08-25.** Replaying the eligibility join against
+`curated/crosswalk/2026-08-16` had reproduced the judged population
+exactly (10,910) but shifted 933 sites between `no_usable_footprint`
+(31,766 replayed vs 30,833 recorded) and `crosswalk_not_high_confidence`
+(7,488 vs 8,421). **Narrowed 2026-08-25:** the register run manifest's
+recorded crosswalk digest (`10e1bfe0…`) matches
+`curated/crosswalk/2026-08-16/crosswalk.parquet` on disk exactly, so
+"built from a differently dated crosswalk" was refuted; the divergence
+was the replay's own hand-rolled join, whose `judged` flag required
+`maus_id`/support/confidence together and left everything else to fall
+through to `no_usable_footprint` on a missing support value regardless of
+confidence. Production's rule 1 (`no_usable_footprint`) is gated on
+high confidence first — a low-confidence match whose `maus_id` carries no
+computed support is `crosswalk_not_high_confidence` (rule 2), never
+`no_usable_footprint`, because rule 2 does not consult support at all.
+The 933-site shift is exactly the low-confidence, no-support population
+the replay misrouted.
+`scripts/diag_batch_e_readiness.py`'s `replay_eligibility` now calls
+`register.assign_trajectory_eligibility` directly for every
+`trajectory_status` bucket and only appends `maus_id`/`region` as
+post-hoc lookups that cannot change a status; the reimplemented join is
+retired.
+`tests/test_diag_replay_parity.py::test_replay_counts_equal_production_counts`
+pins replay/production count parity on a fixture built to include that
+exact divergence class (`s3`), and
+`test_replay_frame_carries_the_diagnostic_columns` pins that the replay
+frame still carries the columns the diagnostics read. Full prior
+statement in `docs/reviews/2026-08-25-batch-e-findings.md`.
 
 **O1 — closed.** Read from the 2026-08-23 `footprint_support.parquet`:
 20 of 1,252 Tier-1 footprints with usable Maus geometry are outside

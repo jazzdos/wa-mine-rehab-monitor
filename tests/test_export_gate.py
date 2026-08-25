@@ -25,7 +25,12 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from wa_mine_monitor.export_gate import GEOMETRY_NAME_TOKENS, REDISTRIBUTE_COLUMN, export_public
+from wa_mine_monitor.export_gate import (
+    GEOMETRY_NAME_TOKENS,
+    REDISTRIBUTE_COLUMN,
+    export_public,
+    is_geometry_column,
+)
 
 
 @pytest.fixture
@@ -275,3 +280,26 @@ def test_ordinary_prose_and_ordinary_bytes_are_not_mistaken_for_geometry() -> No
     )
     exported = export_public(frame)
     assert set(exported.columns) == {"site_id", "comment", "digest", "area_ha"}
+
+
+def test_coordinate_names_are_geometry_bearing() -> None:
+    series = pd.Series([115.8, 116.1])
+    for name in ("lon", "lat", "longitude", "latitude", "LON", "Latitude"):
+        assert is_geometry_column(name, series), name
+
+
+def test_coordinate_matching_is_exact_not_substring() -> None:
+    # "lat" must not fire inside an ordinary word: a substring rule would
+    # drop `cumulative_area_m2` (contains "lat") from every export.
+    series = pd.Series([1.0, 2.0])
+    assert not is_geometry_column("cumulative_area_m2", series)
+    assert not is_geometry_column("dilation_px", series)
+
+
+def test_export_public_drops_lon_lat() -> None:
+    frame = pd.DataFrame(
+        {"site_id": ["a"], "lon": [115.8], "lat": [-31.9], "redistribute_public": [True]}
+    )
+    published = export_public(frame)
+    assert sorted(published.columns) == ["site_id"]
+    assert "lon" in published.attrs["export_public"]["dropped_columns"]

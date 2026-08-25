@@ -49,6 +49,8 @@ from pathlib import Path
 import geopandas as gpd
 import pandas as pd
 
+from wa_mine_monitor import register
+
 DEFAULT_CURATED_ROOT = Path.home() / "data" / "wa-mine-monitor" / "curated"
 DEFAULT_RAW_ROOT = Path.home() / "data" / "wa-mine-monitor" / "raw"
 DEFAULT_JARRAH_ROOT = Path.home() / "data" / "jarrah-rehab"
@@ -75,32 +77,44 @@ def _load(curated_root: Path, d3_date: str) -> tuple[pd.DataFrame, pd.DataFrame,
     return support, register, crosswalk
 
 
-def _judged(register: pd.DataFrame, crosswalk: pd.DataFrame, support: pd.DataFrame) -> pd.DataFrame:
-    """One row per register row with the columns the eligibility rules read.
+def replay_eligibility(
+    register_df: pd.DataFrame, crosswalk_df: pd.DataFrame, support_df: pd.DataFrame
+) -> pd.DataFrame:
+    """What `apply-d3-threshold --forced-threshold` would produce, by calling
+    the production function directly (O8: a hand-rolled join here can drift
+    from `register.assign_trajectory_eligibility`'s own bucketing rules --
+    see the 933-site divergence this replaced).
 
-    Mirrors `register.assign_trajectory_eligibility`'s own deterministic
-    de-duplication (sort by `(site_id, maus_id)`, keep first) so an ambiguous
-    high-confidence match is resolved the same way here as in the command.
+    All `trajectory_status` bucketing comes from
+    `register.assign_trajectory_eligibility` itself, called with
+    `n_star=FULL_SUPPORT_PX, criteria_passed=False, forced_threshold=True`
+    (the Batch E Task 0 forced-144 entry path). Two diagnostic-only columns
+    the check functions below read are appended afterwards, as pure lookups
+    that cannot change any status the production call already assigned:
+    `maus_id`, via the SAME deterministic dedup production uses internally
+    (sort by `(site_id, maus_id)`, keep first per `site_id`), and `region`,
+    mapped from `support_df` on that `maus_id`.
     """
-    deduped = crosswalk.sort_values(
+    production = register.assign_trajectory_eligibility(
+        register_df,
+        crosswalk_df,
+        support_df,
+        n_star=FULL_SUPPORT_PX,
+        criteria_passed=False,
+        forced_threshold=True,
+    )
+    crosswalk_dedup = crosswalk_df.sort_values(
         ["site_id", "maus_id"], na_position="last", kind="stable"
     ).drop_duplicates(subset="site_id", keep="first")
-    support_by_maus = support.drop_duplicates(subset="maus_id", keep="first").set_index("maus_id")
+    maus_id_by_site = crosswalk_dedup.set_index("site_id")["maus_id"]
+    region_by_maus = support_df.drop_duplicates(subset="maus_id", keep="first").set_index(
+        "maus_id"
+    )["region"]
 
-    matched = register["site_id"].map(deduped.set_index("site_id")["maus_id"])
-    frame = pd.DataFrame(
-        {
-            "site_id": register["site_id"],
-            "maus_id": matched,
-            "confidence": register["site_id"].map(deduped.set_index("site_id")["confidence"]),
-            "support_px": matched.map(support_by_maus["effective_pixel_support_px"]),
-            "region": matched.map(support_by_maus["region"]),
-        }
-    )
-    frame["judged"] = (
-        frame["maus_id"].notna() & frame["support_px"].notna() & (frame["confidence"] == "high")
-    )
-    return frame
+    matched_maus_id = production["site_id"].map(maus_id_by_site)
+    production["maus_id"] = matched_maus_id
+    production["region"] = matched_maus_id.map(region_by_maus)
+    return production
 
 
 def check_outside_rdc(support: pd.DataFrame) -> None:
@@ -128,15 +142,15 @@ def check_outside_rdc(support: pd.DataFrame) -> None:
     print()
 
 
-def check_eligibility(frame: pd.DataFrame, register: pd.DataFrame) -> None:
+def check_eligibility(replay: pd.DataFrame, register_current: pd.DataFrame) -> None:
     """What `apply-d3-threshold --forced-threshold` would produce."""
     print("== 2. eligibility under a forced-144 threshold ==")
     print("current register, as built with criteria_passed=false:")
-    print(register["trajectory_status"].value_counts(dropna=False).to_string())
+    print(register_current["trajectory_status"].value_counts(dropna=False).to_string())
     print()
-    judged = frame["judged"]
-    eligible = judged & (frame["support_px"] >= FULL_SUPPORT_PX)
-    insufficient = judged & (frame["support_px"] < FULL_SUPPORT_PX)
+    judged = replay["trajectory_status"].isin(["insufficient_pixel_support", "eligible"])
+    eligible = replay["trajectory_status"] == "eligible"
+    insufficient = replay["trajectory_status"] == "insufficient_pixel_support"
     print(f"judged population (must equal threshold_not_computed above): {int(judged.sum())}")
     print(
         f"  would become eligible at n_star={FULL_SUPPORT_PX}:                     "
@@ -145,19 +159,19 @@ def check_eligibility(frame: pd.DataFrame, register: pd.DataFrame) -> None:
     print(f"  would become insufficient_pixel_support:                   {int(insufficient.sum())}")
     print(
         f"  distinct footprints behind the eligible sites:             "
-        f"{frame.loc[eligible, 'maus_id'].nunique()}"
+        f"{replay.loc[eligible, 'maus_id'].nunique()}"
     )
     print()
     print("eligible sites by region (D4 Tier 2 hard gate: >= 30):")
-    print(frame.loc[eligible, "region"].value_counts(dropna=False).to_string())
+    print(replay.loc[eligible, "region"].value_counts(dropna=False).to_string())
     print()
 
 
-def check_sharing(frame: pd.DataFrame, support: pd.DataFrame) -> None:
+def check_sharing(replay: pd.DataFrame, support: pd.DataFrame) -> None:
     """Footprint sharing, and the cost of a per-site read loop."""
     print("== 3. footprint sharing and read amplification ==")
-    eligible = frame["judged"] & (frame["support_px"] >= FULL_SUPPORT_PX)
-    per_footprint = frame.loc[eligible, "maus_id"].value_counts()
+    eligible = replay["trajectory_status"] == "eligible"
+    per_footprint = replay.loc[eligible, "maus_id"].value_counts()
     print(f"eligible sites: {int(eligible.sum())} over {per_footprint.size} footprints")
     print(
         f"sites per footprint: mean {per_footprint.mean():.1f} "
@@ -174,7 +188,7 @@ def check_sharing(frame: pd.DataFrame, support: pd.DataFrame) -> None:
     footprint_px = by_maus.loc[
         by_maus.index.isin(per_footprint.index), "effective_pixel_support_px"
     ]
-    site_px = frame.loc[eligible, "maus_id"].map(by_maus["effective_pixel_support_px"])
+    site_px = replay.loc[eligible, "maus_id"].map(by_maus["effective_pixel_support_px"])
     print("member pixels read per collection-year:")
     print(f"  loop over distinct footprints: {footprint_px.sum() / 1e6:.3f} M")
     print(f"  loop over sites (as drafted):  {site_px.sum() / 1e6:.3f} M")
@@ -252,15 +266,15 @@ def main() -> None:
     parser.add_argument("--d3-date", default=DEFAULT_D3_DATE)
     args = parser.parse_args()
 
-    support, register, crosswalk = _load(args.curated_root, args.d3_date)
-    frame = _judged(register, crosswalk, support)
+    support, register_current, crosswalk = _load(args.curated_root, args.d3_date)
+    replay = replay_eligibility(register_current, crosswalk, support)
 
     if args.check in ("all", "outside-rdc"):
         check_outside_rdc(support)
     if args.check in ("all", "eligibility"):
-        check_eligibility(frame, register)
+        check_eligibility(replay, register_current)
     if args.check in ("all", "sharing"):
-        check_sharing(frame, support)
+        check_sharing(replay, support)
     if args.check in ("all", "huntly"):
         check_huntly(support, crosswalk, args.raw_root, args.jarrah_root)
 
