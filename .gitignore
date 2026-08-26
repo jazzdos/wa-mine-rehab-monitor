@@ -70,3 +70,4 @@ data/
 data_root/
 site/build/
 .claude/worktrees/
+.worktrees/
