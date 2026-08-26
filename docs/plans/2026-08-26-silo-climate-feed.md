@@ -1155,6 +1155,42 @@ def test_fetch_silo_resumes_by_skipping_a_valid_file_already_present(
     payload = json.loads(result.output)
     assert payload["resumed"] == 1
     assert payload["fetched"] == 1
+
+
+def test_fetch_silo_refuses_a_stray_part_file_left_by_an_earlier_range(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`finalize_snapshot` hashes EVERY file under the snapshot
+    directory (`snapshots.py:182-186`), and `verify_snapshot` afterwards
+    checks integrity, not SILO validity. A `.part` left by an earlier
+    failed download over a WIDER year range is never looked at by this
+    run's per-year loop, so without the pre-finalize gate it would be
+    checksummed into SHA256SUMS.txt and verify clean -- a finalized
+    snapshot carrying a truncated file.
+    """
+    data_root = tmp_path / "data"
+    cfg_file = _write_config(tmp_path, data_root)
+    _stub_git_state(monkeypatch)
+    monkeypatch.setattr(cli_module, "_SILO_REQUIRE_STATEWIDE", False)
+    snapshot_dir = snapshots.create_snapshot_dir(data_root, "silo", "2026-08-30")
+    (snapshot_dir / "2005.daily_rain.nc.part").write_bytes(b"truncated")
+
+    def fake_download(url: str, dest_path: Path, **kwargs: object) -> Path:
+        return _write_statewide_year_nc(Path(dest_path), 2001)
+
+    monkeypatch.setattr(cli_module, "download_annual_file", fake_download)
+    result = runner.invoke(
+        app,
+        [
+            "fetch-silo", "--config", str(cfg_file), "--date", "2026-08-30",
+            "--start-year", "2001", "--end-year", "2001",
+        ],
+    )
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert "refusal" in payload
+    assert "2005.daily_rain.nc.part" in json.dumps(payload)
+    assert not (snapshot_dir / "SHA256SUMS.txt").exists()
 ```
 
 **Why `_write_statewide_year_nc` is not a real statewide grid.** A grid
@@ -1191,7 +1227,7 @@ reaches validation:
 **Step 2: Run to verify failure**
 
 Run: `uv run pytest tests/sources/test_silo.py -k fetch_silo -q`
-Expected: 6 failures — `No such command 'fetch-silo'`.
+Expected: 7 failures — `No such command 'fetch-silo'`.
 
 **Step 3: Add the import**
 
@@ -1283,6 +1319,20 @@ Behaviour, in order:
      Both exit 1 **before** finalize.
 7. `snapshots.write_snapshot_metadata(snapshot_dir, source=f"{source.title} (gridded daily_rain, annual NetCDF)", endpoint=annual_object_url("daily_rain", start_year), licence_note=f"{source.licence_id} -- {source.licence_url}", purpose="SILO gridded daily rainfall for Batch F climate context.")`
    — mirror the call shape at `cli.py:948–962`.
+7a. **Refuse any unexpected file in the snapshot directory, before
+   finalize.** `snapshots.finalize_snapshot` hashes *every* file under
+   the directory (`snapshots.py:182–186`, `rglob("*")`), and
+   `verify_snapshot` afterwards checks integrity, not SILO validity. So
+   a `.part` left behind by an earlier failed download — or by an
+   earlier run over a *different* year range, which this run's per-year
+   loop never looks at — would be swept into `SHA256SUMS.txt` and then
+   verify clean. Build the expected set as
+   `{"metadata.txt"} | {annual_object_name("daily_rain", y) for y in range(start_year, end_year + 1)}`,
+   compare against the actual directory listing, and refuse naming every
+   unexpected file and the remedy (delete it, or re-run over the range
+   that covers it). This is the fail-closed form: it catches stray
+   `.part` files, half-renamed downloads, and years fetched under a
+   previous range, rather than only the case that prompted it.
 8. `sums_path = snapshots.finalize_snapshot(snapshot_dir)`;
    `n_ok, n_bad, n_missing = snapshots.verify_snapshot(snapshot_dir)`.
 9. One `SourceAsset` per file, fetched or resumed:
@@ -1294,7 +1344,7 @@ Behaviour, in order:
 **Step 5: Run to verify pass**
 
 Run: `uv run pytest tests/sources/test_silo.py -q`
-Expected: 27 passed.
+Expected: 28 passed.
 
 **Step 6: Check for regressions in the CLI surface**
 
@@ -1499,7 +1549,19 @@ two high-confidence crosswalk rows resolves to the lexicographically
 smallest `maus_id`;
 
 (g) **a footprint outside the grid** yields `not_computable` rows for
-that site rather than aborting the run or snapping to an edge cell.
+that site rather than aborting the run or snapping to an edge cell;
+
+(h) **an inverted year range refuses** (`--start-year 2003
+--end-year 2001`) and writes nothing — assert the output directory does
+not exist afterwards. Without the step 1a guard this run exits 0 and
+leaves an empty, schema-valid, permanently-defended parquet;
+
+(i) **an eligible site missing from the crosswalk refuses by name.**
+Seed a register whose eligible set includes a site the crosswalk has no
+high-confidence row for; assert exit 1, the site id in the refusal, and
+no output written. This is the case `assemble_rows`' row-count
+guarantee cannot catch, because the pair list it counts against has
+already dropped the site.
 
 **Step 3: Run to verify failure**
 
@@ -1521,6 +1583,15 @@ def build_climate_context_cmd(
 Order of operations:
 
 1. `_load_config_or_exit`; `git_state = _collect_git_state_disclosing_gaps(_REPO_ROOT)`.
+1a. **Refuse `start_year > end_year`, before any I/O.** Without this,
+   `range(start_year, end_year + 1)` is empty while the baseline union
+   stays populated, so every gate below passes, `assemble_rows` honestly
+   emits zero rows, and the command writes a schema-valid, finalized
+   `climate_context.parquet` containing no site-years at all. An empty
+   curated artefact that verifies clean is worse than a refusal: the
+   next run of `_refuse_if_curated_output_already_exists` will defend
+   it, and D13 F5 requires context aligned by footprint/cell **and
+   year**. Emit the same JSON refusal shape `fetch-silo` uses.
 2. `_refuse_if_curated_output_already_exists(data_root / "curated" / "climate-context" / date / "climate_context.parquet", config=..., git_state=...)`.
 3. Resolve the latest `raw/silo` snapshot via
    `register.latest_snapshot(data_root, "silo")`, then
@@ -1539,6 +1610,18 @@ Order of operations:
    at `cli.py:5875–5888`.
 6. Reproduce the tie-break at `cli.py:5941–5945` **verbatim**, comment
    included, pointing at `register.py:~1373`.
+6a. **Reproduce the eligible-site-not-in-crosswalk refusal at
+   `cli.py:5956–5974` too.** The tie-break alone is not the whole gate.
+   A stale register/crosswalk pair can leave an eligible site out of the
+   Tier 1 crosswalk population entirely; if `site_maus_pairs` is built
+   only from sites that happen to have a mapping, those sites vanish
+   silently. `assemble_rows`' row-count guarantee does **not** catch
+   this — it reconciles against the already-reduced pair list, so it
+   still passes. The output and manifest would finalize with climate
+   rows missing for part of the Tier 1 population, which nothing
+   downstream would flag. Loop over the full `eligible` list, look up
+   `maus_id_by_site.get(site)`, and refuse by name on `None` — the same
+   JSON refusal `extract-trajectories` emits, not a bare `KeyError`.
 7. **Centroids in equal-area, then to geographic.** Read the Maus gpkg
    and reproject to `crosswalk.TARGET_CRS` (EPSG:3577) as every other
    command does, take `.centroid`, then reproject the centroid points to
@@ -1660,8 +1743,8 @@ Expected: the new entries, consistent with surrounding rows.
 **Step 3:** `uv run mypy src scripts` — expected: `Success`.
 
 **Step 4:** `uv run pytest -q -rs` — expected: all pass. Baseline was
-**855 passed in ~9 minutes**; this plan adds roughly 40 tests, so
-expect ~895 and no failures. Any drop below 855 is a regression, not a
+**855 passed in ~9 minutes**; this plan adds roughly 45 tests, so
+expect ~900 and no failures. Any drop below 855 is a regression, not a
 rounding difference.
 
 ---
