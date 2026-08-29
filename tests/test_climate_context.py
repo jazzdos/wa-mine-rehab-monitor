@@ -5,17 +5,21 @@ crosswalk/Maus inputs and calls it.
 
 from __future__ import annotations
 
+import calendar
 import json
 from pathlib import Path
 
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 import pytest
 from shapely.geometry import Polygon
 from typer.testing import CliRunner
 
-from tests.sources.test_silo import write_full_year_nc
+from tests.sources.test_silo import LATS as _SILO_GRID_LATS
+from tests.sources.test_silo import LONS as _SILO_GRID_LONS
+from tests.sources.test_silo import write_daily_rain_nc, write_full_year_nc
 from wa_mine_monitor import cli as cli_module
 from wa_mine_monitor import (
     climate_context,
@@ -29,7 +33,8 @@ from wa_mine_monitor import (
 )
 from wa_mine_monitor.cli import app
 from wa_mine_monitor.provenance import SourceAsset, sha256_file
-from wa_mine_monitor.sources.silo import AnnualMetrics, annual_object_name
+from wa_mine_monitor.sources import silo
+from wa_mine_monitor.sources.silo import AnnualMetrics, SiloError, annual_object_name
 from wa_mine_monitor.tables import write_table
 
 runner = CliRunner()
@@ -105,6 +110,29 @@ def test_incomplete_baseline_makes_every_year_of_that_cell_not_computable() -> N
     assert df["annual_rainfall_mm"].isna().all()
     for reason in df["not_computable_reason"]:
         assert "baseline missing years 1991-2005" in reason
+
+
+def test_empty_baseline_not_flagged_in_baseline_gap_raises_silo_error() -> None:
+    # baseline_annuals_by_cell has an empty list for this cell, and the cell
+    # is NOT present in baseline_gap_by_cell -- assemble_rows must reach the
+    # COMPUTED branch and delegate to silo.rainfall_anomaly_mm's explicit
+    # empty-baseline guard, not divide by zero itself.
+    with pytest.raises(SiloError, match="empty baseline"):
+        climate_context.assemble_rows(
+            site_maus_pairs=[("S1", "M1")],
+            cell_id_by_maus={"M1": "-32.000_116.000"},
+            metrics_by_cell_year={
+                ("-32.000_116.000", 2020): AnnualMetrics(
+                    annual_rainfall_mm=650.0, rain_days_ge_1mm=80
+                )
+            },
+            not_computable_by_cell_year={},
+            baseline_annuals_by_cell={"-32.000_116.000": []},
+            baseline_gap_by_cell={},
+            years=[2020],
+            snapshot_date="2026-08-26",
+            source_version="v1",
+        )
 
 
 def test_two_sites_sharing_one_maus_id_get_same_cell_and_metrics() -> None:
@@ -219,11 +247,17 @@ def _box(lon: float, lat: float, *, delta: float = 0.005) -> Polygon:
 
 
 def _seed_silo_snapshot(
-    data_root: Path, date_str: str, years: list[int], *, finalize: bool = True
+    data_root: Path,
+    date_str: str,
+    years: list[int],
+    *,
+    finalize: bool = True,
+    shifted_lat_years: set[int] = frozenset(),
 ) -> Path:
     snapshot_dir = snapshots.create_snapshot_dir(data_root, "silo", date_str)
     for year in years:
-        write_full_year_nc(snapshot_dir / annual_object_name("daily_rain", year), year)
+        lats = [lat - 0.05 for lat in _SILO_GRID_LATS] if year in shifted_lat_years else None
+        write_full_year_nc(snapshot_dir / annual_object_name("daily_rain", year), year, lats=lats)
     snapshots.write_snapshot_metadata(
         snapshot_dir,
         source="SILO Climate Database (gridded daily_rain, annual NetCDF)",
@@ -342,6 +376,7 @@ def _seed_world(
     maus_geoms: dict[str, Polygon],
     silo_years: list[int],
     finalize_silo: bool = True,
+    shifted_lat_years: set[int] = frozenset(),
 ) -> tuple[Path, Path]:
     data_root = tmp_path / "data"
     cfg_file = _write_config(tmp_path, data_root)
@@ -350,7 +385,13 @@ def _seed_world(
         "collect_git_state",
         lambda repo_root: {"sha": "testsha", "dirty": False, "diff": ""},
     )
-    _seed_silo_snapshot(data_root, "2026-08-10", silo_years, finalize=finalize_silo)
+    _seed_silo_snapshot(
+        data_root,
+        "2026-08-10",
+        silo_years,
+        finalize=finalize_silo,
+        shifted_lat_years=shifted_lat_years,
+    )
     _, maus_sha256 = _seed_maus_extract(data_root, "2026-08-14", maus_geoms)
     _seed_eligible_register(data_root, "2026-08-15", register_rows)
     _seed_crosswalk(data_root, "2026-08-16", crosswalk_rows, maus_sha256=maus_sha256)
@@ -416,6 +457,136 @@ def test_build_climate_context_cli_writes_parquet_and_manifest_end_to_end(
         if asset.get("licence") == licence.SOURCES["silo"].licence_id
     }
     assert silo_asset_uris == {annual_object_name("daily_rain", year) for year in _BASELINE_YEARS}
+
+
+def test_build_climate_context_two_sites_in_different_real_cells_get_independent_rainfall(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every other real-rainfall test pins its site(s) to the single fixed
+    cell centre (`_GRID_LAT`, `_GRID_LON`). Nothing else covers two sites
+    resolving to two DIFFERENT real grid cells with materially different
+    rainfall series -- the statewide multi-cell aggregation path that
+    `real_cell_indices` and the per-cell keying of
+    `baseline_annuals_by_cell` / `metrics_by_cell_year` exist to serve.
+    This also catches a loop-inversion that mixes the two cells up, since
+    a swap would make each site's numbers land on the OTHER cell's clearly
+    distinct values."""
+    lats = _SILO_GRID_LATS
+    lons = _SILO_GRID_LONS
+    # Opposite corners of the 3x3 fixture lattice -- unambiguously distinct
+    # cells, not adjacent ones.
+    cell_a_lat, cell_a_lon = lats[0], lons[0]
+    cell_b_lat, cell_b_lon = lats[2], lons[2]
+    lat_i_a, lon_i_a = 0, 0
+    lat_i_b, lon_i_b = 2, 2
+    # Cell A: heavy, every day counts as a rain day. Cell B: light, no day
+    # crosses the 1mm rain-day threshold. Different totals AND different
+    # rain-day counts by construction, not by coincidence.
+    rate_a = 2.0
+    rate_b = 0.5
+
+    data_root = tmp_path / "data"
+    cfg_file = _write_config(tmp_path, data_root)
+    monkeypatch.setattr(
+        cli_module,
+        "collect_git_state",
+        lambda repo_root: {"sha": "testsha", "dirty": False, "diff": ""},
+    )
+
+    snapshot_dir = snapshots.create_snapshot_dir(data_root, "silo", "2026-08-10")
+    for year in _BASELINE_YEARS:
+        n_days = 366 if calendar.isleap(year) else 365
+        rain = np.zeros((n_days, len(lats), len(lons)), dtype="f4")
+        rain[:, lat_i_a, lon_i_a] = rate_a
+        rain[:, lat_i_b, lon_i_b] = rate_b
+        write_daily_rain_nc(
+            snapshot_dir / annual_object_name("daily_rain", year), year, lats, lons, rain
+        )
+    snapshots.write_snapshot_metadata(
+        snapshot_dir,
+        source="SILO Climate Database (gridded daily_rain, annual NetCDF)",
+        endpoint="https://example.test/silo",
+        licence_note="CC-BY-4.0",
+        purpose="test fixture",
+    )
+    snapshots.finalize_snapshot(snapshot_dir)
+
+    _, maus_sha256 = _seed_maus_extract(
+        data_root,
+        "2026-08-14",
+        {
+            "MAUS_A": _box(cell_a_lon, cell_a_lat),
+            "MAUS_B": _box(cell_b_lon, cell_b_lat),
+        },
+    )
+    _seed_eligible_register(
+        data_root,
+        "2026-08-15",
+        [
+            _eligible_register_row("S_A", lon=cell_a_lon, lat=cell_a_lat),
+            _eligible_register_row("S_B", lon=cell_b_lon, lat=cell_b_lat),
+        ],
+    )
+    _seed_crosswalk(
+        data_root,
+        "2026-08-16",
+        [_crosswalk_row("S_A", "MAUS_A"), _crosswalk_row("S_B", "MAUS_B")],
+        maus_sha256=maus_sha256,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "build-climate-context",
+            "--config",
+            str(cfg_file),
+            "--date",
+            "2026-08-20",
+            "--start-year",
+            "2019",
+            "--end-year",
+            "2020",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    output_path = (
+        data_root / "curated" / "climate-context" / "2026-08-20" / "climate_context.parquet"
+    )
+    written = pd.read_parquet(output_path)
+
+    expected_cell_a = silo.cell_id(lat=cell_a_lat, lon=cell_a_lon)
+    expected_cell_b = silo.cell_id(lat=cell_b_lat, lon=cell_b_lon)
+    assert expected_cell_a != expected_cell_b
+
+    rows_a = written.loc[written["site_id"] == "S_A"].set_index("year")
+    rows_b = written.loc[written["site_id"] == "S_B"].set_index("year")
+    assert len(rows_a) == 2
+    assert len(rows_b) == 2
+
+    assert set(rows_a["silo_cell_id"]) == {expected_cell_a}
+    assert set(rows_b["silo_cell_id"]) == {expected_cell_b}
+    assert (rows_a["climate_status"] == climate_context.CLIMATE_STATUS_COMPUTED).all()
+    assert (rows_b["climate_status"] == climate_context.CLIMATE_STATUS_COMPUTED).all()
+
+    baseline_n_days = [366 if calendar.isleap(y) else 365 for y in _BASELINE_YEARS]
+    baseline_mean_days = sum(baseline_n_days) / len(baseline_n_days)
+    for year in (2019, 2020):
+        n_days = 366 if calendar.isleap(year) else 365
+        assert rows_a.loc[year, "annual_rainfall_mm"] == pytest.approx(rate_a * n_days)
+        assert rows_b.loc[year, "annual_rainfall_mm"] == pytest.approx(rate_b * n_days)
+        assert rows_a.loc[year, "rain_days_ge_1mm"] == n_days
+        assert rows_b.loc[year, "rain_days_ge_1mm"] == 0
+        # Rate is constant across the whole baseline, so each cell's own
+        # anomaly is exactly the rate times the year's day-count offset from
+        # the baseline's mean day-count -- a cross-cell mixup would instead
+        # show up as the (materially different) other cell's anomaly.
+        assert rows_a.loc[year, "rainfall_anomaly_mm"] == pytest.approx(
+            rate_a * (n_days - baseline_mean_days)
+        )
+        assert rows_b.loc[year, "rainfall_anomaly_mm"] == pytest.approx(
+            rate_b * (n_days - baseline_mean_days)
+        )
 
 
 def test_build_climate_context_refuses_when_output_already_exists(
@@ -633,6 +804,100 @@ def test_build_climate_context_footprint_outside_grid_is_not_computable_not_abor
 
     in_rows = written.loc[written["site_id"] == "S1"]
     assert (in_rows["climate_status"] == climate_context.CLIMATE_STATUS_COMPUTED).all()
+
+
+def test_build_climate_context_reads_each_annual_file_once_regardless_of_cell_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A statewide run occupies hundreds of cells; the read must be
+    year-outer -- one `cells_daily_series` call per needed year -- not
+    cell-outer, which would call it (or open the underlying file) once per
+    (cell, year) instead. Regresses silently if the loop nesting flips
+    back, so pin the call count directly."""
+    lats = _SILO_GRID_LATS
+    lons = [115.60, 115.65, 115.70]
+    register_rows = [
+        _eligible_register_row(f"S{i}", lon=lon, lat=lat)
+        for i, (lat, lon) in enumerate(zip(lats, lons, strict=True))
+    ]
+    crosswalk_rows = [_crosswalk_row(f"S{i}", f"MAUS{i}") for i in range(len(lats))]
+    maus_geoms = {
+        f"MAUS{i}": _box(lon, lat) for i, (lat, lon) in enumerate(zip(lats, lons, strict=True))
+    }
+    cfg_file, _data_root = _seed_world(
+        tmp_path,
+        monkeypatch,
+        register_rows=register_rows,
+        crosswalk_rows=crosswalk_rows,
+        maus_geoms=maus_geoms,
+        silo_years=_BASELINE_YEARS,
+    )
+
+    call_paths: list[Path] = []
+    real_cells_daily_series = silo.cells_daily_series
+
+    def spy(path: Path, *, indices: dict, grid: object) -> object:
+        call_paths.append(path)
+        return real_cells_daily_series(path, indices=indices, grid=grid)
+
+    monkeypatch.setattr(cli_module.silo, "cells_daily_series", spy)
+
+    result = runner.invoke(
+        app,
+        [
+            "build-climate-context",
+            "--config",
+            str(cfg_file),
+            "--date",
+            "2026-08-20",
+            "--start-year",
+            "2019",
+            "--end-year",
+            "2020",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    # Three distinct occupied cells, but exactly one call per needed year --
+    # never one call per (cell, year).
+    assert len(call_paths) == len(_BASELINE_YEARS)
+    assert len(set(call_paths)) == len(call_paths)
+
+
+def test_build_climate_context_refuses_a_year_with_a_shifted_grid_and_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mid-range year whose grid is shifted relative to the 1991
+    reference is a run-wide refusal, not a per-cell not-computable entry --
+    the whole snapshot is internally inconsistent, so every row derived
+    from it is suspect."""
+    shifted_year = 2003
+    cfg_file, data_root = _seed_world(
+        tmp_path,
+        monkeypatch,
+        register_rows=[_eligible_register_row("S1", lon=_GRID_LON, lat=_GRID_LAT)],
+        crosswalk_rows=[_crosswalk_row("S1", "MAUS001")],
+        maus_geoms={"MAUS001": _box(_GRID_LON, _GRID_LAT)},
+        silo_years=_BASELINE_YEARS,
+        shifted_lat_years={shifted_year},
+    )
+    result = runner.invoke(
+        app,
+        [
+            "build-climate-context",
+            "--config",
+            str(cfg_file),
+            "--date",
+            "2026-08-20",
+            "--start-year",
+            "2019",
+            "--end-year",
+            "2020",
+        ],
+    )
+    assert result.exit_code != 0
+    payload = json.loads(result.output)
+    assert f"{shifted_year}.daily_rain.nc" in payload["refusal"]
+    assert not (data_root / "curated" / "climate-context").exists()
 
 
 def test_build_climate_context_refuses_an_inverted_year_range_and_writes_nothing(

@@ -22,7 +22,7 @@ whatever it fetches before that file is trusted downstream.
 from __future__ import annotations
 
 import calendar
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -150,7 +150,18 @@ def cell_id(*, lat: float, lon: float) -> str:
     """`silo_cell_id` for a cell CENTRE: fixed three-decimal
     `lat_lon`. Self-describing -- a reader recovers the cell centre from
     the id alone, with no lookup table -- and stable across runs, which
-    is what the D13 F5 schema keys climate context on."""
+    is what the D13 F5 schema keys climate context on.
+
+    That recoverability promise holds only when `lat`/`lon` are an actual
+    grid cell centre. The climate-context CLI also calls this function on
+    a footprint centroid when the footprint falls outside the SILO grid,
+    to mint a pseudo-cell id in the same format so the row still has
+    something to carry in `silo_cell_id`. For those rows the returned
+    string is NOT a grid cell centre and cannot be read back as one --
+    only the row's `not_computable_reason` (an "outside the SILO grid"
+    message) discloses that. Nothing about the id's own format
+    distinguishes the two cases.
+    """
     return f"{lat:.3f}_{lon:.3f}"
 
 
@@ -227,6 +238,17 @@ def cell_daily_series(path: Path, *, lat_i: int, lon_i: int) -> np.ma.MaskedArra
     Reads a single `(time,)` slice rather than the whole grid, so a
     statewide build touches only the cells Tier 1 footprints actually
     occupy -- a few hundred cells out of ~700k per annual file.
+
+    UNVERIFIED, and no longer used in production: this indexes `path`
+    positionally on trust, so an annual file whose grid is flipped or
+    shifted relative to the grid `lat_i`/`lon_i` were derived from
+    silently returns a DIFFERENT cell's rainfall.
+    `validate_daily_rain_file` does not catch that -- it checks spacing
+    and WA coverage, never ordering or origin. Builds go through
+    `cells_daily_series`, which verifies the file's coordinate arrays
+    against a reference grid first. Kept only as the equivalence oracle
+    in `tests/sources/test_silo.py`; a new caller wants that function,
+    not this one.
     """
     ds = netCDF4.Dataset(path, "r")
     try:
@@ -234,6 +256,53 @@ def cell_daily_series(path: Path, *, lat_i: int, lon_i: int) -> np.ma.MaskedArra
     finally:
         ds.close()
     return np.ma.masked_invalid(values)
+
+
+def cells_daily_series(
+    path: Path,
+    *,
+    indices: Mapping[str, tuple[int, int]],
+    grid: SiloGrid,
+) -> dict[str, np.ma.MaskedArray]:
+    """Many cells' daily series from one open `path`, verified against
+    `grid` before anything is read.
+
+    THE FINDING this closes: `cell_daily_series` reads a cell
+    positionally, trusting that `path`'s own lat/lon arrays match the
+    grid its indices were derived from. `validate_daily_rain_file`
+    checks spacing and WA coverage but never ordering or origin, so a
+    file with a flipped or shifted grid would otherwise pass every gate
+    and silently hand one cell's rainfall to another cell's row. Here
+    `path`'s coordinate arrays are compared against `grid` -- exact
+    float equality, not a tolerance, because this is the same published
+    product re-read year to year and any difference at all is the
+    anomaly worth refusing on -- before a single value is read.
+
+    Opens `path` once regardless of how many cells are requested, so a
+    statewide build touches each annual file exactly once no matter how
+    many sites fall in it.
+    """
+    ds = netCDF4.Dataset(path, "r")
+    try:
+        file_lats = tuple(float(v) for v in np.asarray(ds.variables["lat"][:], dtype="f8"))
+        file_lons = tuple(float(v) for v in np.asarray(ds.variables["lon"][:], dtype="f8"))
+        if file_lats != grid.lats:
+            raise SiloError(
+                f"{path} lat grid does not match the reference grid -- refusing to "
+                "read cells that would be silently mis-indexed"
+            )
+        if file_lons != grid.lons:
+            raise SiloError(
+                f"{path} lon grid does not match the reference grid -- refusing to "
+                "read cells that would be silently mis-indexed"
+            )
+        result: dict[str, np.ma.MaskedArray] = {}
+        for key, (lat_i, lon_i) in indices.items():
+            values = ds.variables["daily_rain"][:, lat_i, lon_i]
+            result[key] = np.ma.masked_invalid(values)
+        return result
+    finally:
+        ds.close()
 
 
 def annual_metrics(series: np.ma.MaskedArray) -> AnnualMetrics:

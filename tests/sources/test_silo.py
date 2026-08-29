@@ -31,6 +31,7 @@ runner = CliRunner()
 # A tiny grid on the real 0.05-degree lattice, near Huntly.
 LATS = [-32.75, -32.70, -32.65]
 LONS = [115.60, 115.65, 115.70]
+GRID_STEP = 0.05
 
 
 def write_daily_rain_nc(
@@ -232,6 +233,71 @@ def test_anomaly_refuses_an_empty_baseline() -> None:
     1991-2020 baseline; the caller must refuse before reaching here."""
     with pytest.raises(silo.SiloError, match="empty baseline"):
         silo.rainfall_anomaly_mm(annual_rainfall_mm=500.0, baseline_annuals_mm=[])
+
+
+def test_cells_daily_series_refuses_a_reversed_lat_axis(tmp_path: Path) -> None:
+    """A file whose lat array is reversed relative to the reference grid
+    would silently hand each cell's rainfall to the wrong row if indexed
+    positionally -- refuse before reading anything."""
+    reference_path = write_full_year_nc(tmp_path / "1991.daily_rain.nc", 1991)
+    grid = silo.read_grid(reference_path)
+    flipped_path = write_full_year_nc(
+        tmp_path / "2003.daily_rain.nc", 2003, lats=list(reversed(LATS))
+    )
+    with pytest.raises(silo.SiloError, match=r"2003\.daily_rain\.nc"):
+        silo.cells_daily_series(flipped_path, indices={"a": (0, 0)}, grid=grid)
+
+
+def test_cells_daily_series_refuses_a_shifted_origin(tmp_path: Path) -> None:
+    """A file whose grid origin is shifted by one cell must be refused,
+    not silently read as if it shared the reference grid."""
+    reference_path = write_full_year_nc(tmp_path / "1991.daily_rain.nc", 1991)
+    grid = silo.read_grid(reference_path)
+    shifted_lats = [lat - GRID_STEP for lat in LATS]
+    shifted_path = write_full_year_nc(tmp_path / "2003.daily_rain.nc", 2003, lats=shifted_lats)
+    with pytest.raises(silo.SiloError, match=r"2003\.daily_rain\.nc"):
+        silo.cells_daily_series(shifted_path, indices={"a": (0, 0)}, grid=grid)
+
+
+def test_cells_daily_series_matches_cell_daily_series_on_a_matching_grid(
+    tmp_path: Path,
+) -> None:
+    """On a file whose grid matches the reference exactly, each
+    requested cell's series is identical to what `cell_daily_series`
+    would return for that (lat_i, lon_i)."""
+    reference_path = write_full_year_nc(tmp_path / "1991.daily_rain.nc", 1991)
+    grid = silo.read_grid(reference_path)
+    path = write_full_year_nc(tmp_path / "2003.daily_rain.nc", 2003, daily_mm=3.5)
+    indices = {"site-a": (0, 0), "site-b": (1, 2)}
+    result = silo.cells_daily_series(path, indices=indices, grid=grid)
+    assert set(result) == set(indices)
+    for key, (lat_i, lon_i) in indices.items():
+        expected = silo.cell_daily_series(path, lat_i=lat_i, lon_i=lon_i)
+        np.testing.assert_array_equal(result[key], expected)
+        assert np.ma.getmaskarray(result[key]).tolist() == np.ma.getmaskarray(expected).tolist()
+
+
+def test_cells_daily_series_opens_the_dataset_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """However many cells are requested, the file is opened once -- not
+    once per cell."""
+    reference_path = write_full_year_nc(tmp_path / "1991.daily_rain.nc", 1991)
+    grid = silo.read_grid(reference_path)
+    path = write_full_year_nc(tmp_path / "2003.daily_rain.nc", 2003)
+
+    open_count = 0
+    real_dataset = netCDF4.Dataset
+
+    def spy_dataset(*args: object, **kwargs: object) -> netCDF4.Dataset:
+        nonlocal open_count
+        open_count += 1
+        return real_dataset(*args, **kwargs)
+
+    monkeypatch.setattr(netCDF4, "Dataset", spy_dataset)
+    indices = {"site-a": (0, 0), "site-b": (1, 2), "site-c": (2, 1)}
+    silo.cells_daily_series(path, indices=indices, grid=grid)
+    assert open_count == 1
 
 
 class _FakeStreamedResponse:

@@ -497,6 +497,44 @@ def _refuse_if_snapshot_already_finalized(
         raise typer.Exit(1)
 
 
+def _refuse_if_unexpected_files(
+    snapshot_dir: Path,
+    *,
+    expected_names: set[str],
+    closing_clause: str,
+) -> None:
+    """Refuse when `snapshot_dir` holds file(s) not accounted for by
+    `expected_names`.
+
+    Shared by `fetch_silo_cmd`'s two unexpected-file gates: a pre-download
+    gate (BEFORE any bytes are fetched -- each annual SILO object is ~410 MB
+    and this command is built to run off a metered connection) and a
+    pre-finalize gate (catching anything that appeared during the run,
+    before `finalize_snapshot` hashes the directory's contents into
+    `SHA256SUMS.txt`). `closing_clause` names which point in the run the
+    refusal message trails off into (e.g. "before fetching" or "before
+    finalizing").
+    """
+    actual_names = {p.name for p in snapshot_dir.iterdir() if p.is_file()}
+    unexpected = sorted(actual_names - expected_names)
+    if unexpected:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        "snapshot directory holds unexpected file(s) not accounted for "
+                        f"by this run's year range: {unexpected} -- delete them, or "
+                        f"re-run over the year range that covers them, {closing_clause}"
+                    ),
+                    "unexpected_files": unexpected,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+
+
 def _refuse_if_curated_output_already_exists(
     output_path: Path,
     *,
@@ -1775,24 +1813,9 @@ def fetch_silo_cmd(
     _refuse_if_snapshot_already_finalized(snapshot_dir, config=resolved_config, git_state=git_state)
 
     expected_names = {"metadata.txt"} | {annual_object_name("daily_rain", year) for year in years}
-    actual_names = {p.name for p in snapshot_dir.iterdir() if p.is_file()}
-    unexpected = sorted(actual_names - expected_names)
-    if unexpected:
-        typer.echo(
-            json.dumps(
-                {
-                    "refusal": (
-                        "snapshot directory holds unexpected file(s) not accounted for "
-                        f"by this run's year range: {unexpected} -- delete them, or "
-                        "re-run over the year range that covers them, before fetching"
-                    ),
-                    "unexpected_files": unexpected,
-                },
-                indent=2,
-                sort_keys=True,
-            )
-        )
-        raise typer.Exit(1) from None
+    _refuse_if_unexpected_files(
+        snapshot_dir, expected_names=expected_names, closing_clause="before fetching"
+    )
 
     n_fetched = 0
     n_resumed = 0
@@ -1873,24 +1896,9 @@ def fetch_silo_cmd(
     )
 
     expected_names = {"metadata.txt"} | {annual_object_name("daily_rain", year) for year in years}
-    actual_names = {p.name for p in snapshot_dir.iterdir() if p.is_file()}
-    unexpected = sorted(actual_names - expected_names)
-    if unexpected:
-        typer.echo(
-            json.dumps(
-                {
-                    "refusal": (
-                        "snapshot directory holds unexpected file(s) not accounted for "
-                        f"by this run's year range: {unexpected} -- delete them, or "
-                        "re-run over the year range that covers them, before finalizing"
-                    ),
-                    "unexpected_files": unexpected,
-                },
-                indent=2,
-                sort_keys=True,
-            )
-        )
-        raise typer.Exit(1) from None
+    _refuse_if_unexpected_files(
+        snapshot_dir, expected_names=expected_names, closing_clause="before finalizing"
+    )
 
     sums_path = snapshots.finalize_snapshot(snapshot_dir)
     n_ok, n_bad, n_missing = snapshots.verify_snapshot(snapshot_dir)
@@ -2957,19 +2965,41 @@ def build_climate_context_cmd(
     not_computable_by_cell_year: dict[tuple[str, int], str] = {}
     baseline_annuals_by_cell: dict[str, list[float]] = {}
     silo_files_read: set[int] = set()
-    for cell, (lat_i, lon_i) in real_cell_indices.items():
-        for year in needed_years:
-            path = silo_snapshot_dir / annual_object_name("daily_rain", year)
-            silo_files_read.add(year)
-            series = silo.cell_daily_series(path, lat_i=lat_i, lon_i=lon_i)
+    # One `cells_daily_series` call per year, not one `cell_daily_series`
+    # call per (cell, year): it opens `path` once, verifies that year's own
+    # lat/lon coordinate arrays against `grid` (the BASELINE_START_YEAR
+    # reference) BEFORE reading any cell, and only then reads every real
+    # cell needed from it. A year whose file has a flipped or shifted grid
+    # is refused here rather than silently indexed against the wrong cell.
+    for year in needed_years:
+        path = silo_snapshot_dir / annual_object_name("daily_rain", year)
+        silo_files_read.add(year)
+        try:
+            series_by_cell = silo.cells_daily_series(path, indices=real_cell_indices, grid=grid)
+        except SiloError as exc:
+            typer.echo(
+                json.dumps(
+                    {
+                        "refusal": (
+                            f"{path} failed grid verification against the "
+                            f"{climate_context.BASELINE_START_YEAR} reference grid: {exc}"
+                        )
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            raise typer.Exit(1) from None
+        for cell, series in series_by_cell.items():
             try:
                 metrics_by_cell_year[(cell, year)] = silo.annual_metrics(series)
             except silo.SiloNotComputableError as exc:
                 not_computable_by_cell_year[(cell, year)] = str(exc)
 
-        baseline_years = range(
-            climate_context.BASELINE_START_YEAR, climate_context.BASELINE_END_YEAR + 1
-        )
+    baseline_years = range(
+        climate_context.BASELINE_START_YEAR, climate_context.BASELINE_END_YEAR + 1
+    )
+    for cell in real_cell_indices:
         missing_baseline_years = [
             year for year in baseline_years if (cell, year) not in metrics_by_cell_year
         ]

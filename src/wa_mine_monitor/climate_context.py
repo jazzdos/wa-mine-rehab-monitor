@@ -53,6 +53,7 @@ from collections.abc import Mapping, Sequence
 import pandas as pd
 import pyarrow as pa
 
+from wa_mine_monitor.sources import silo
 from wa_mine_monitor.sources.silo import AnnualMetrics
 
 CLIMATE_CONTEXT_SCHEMA = pa.schema(
@@ -60,6 +61,14 @@ CLIMATE_CONTEXT_SCHEMA = pa.schema(
         pa.field("site_id", pa.string(), nullable=False),
         pa.field("maus_id", pa.string(), nullable=False),
         pa.field("year", pa.int32(), nullable=False),
+        # `silo_cell_id` (`silo.cell_id` format: `{lat:.3f}_{lon:.3f}`) is
+        # normally a real SILO grid cell centre, self-describing per its
+        # docstring. When the site's footprint falls outside the SILO
+        # grid, the caller instead mints this id from the footprint
+        # CENTROID (D13 F5) -- same format, but not recoverable to a grid
+        # cell centre. Those rows are always `not_computable` with an
+        # "outside the SILO grid" `not_computable_reason`; that reason is
+        # the only thing on the row disclosing which case it is.
         pa.field("silo_cell_id", pa.string(), nullable=False),
         pa.field("annual_rainfall_mm", pa.float64(), nullable=True),
         pa.field("rain_days_ge_1mm", pa.int32(), nullable=True),
@@ -172,7 +181,9 @@ def assemble_rows(
 
             metrics = metrics_by_cell_year[(cell, year)]
             baseline_annuals = baseline_annuals_by_cell[cell]
-            anomaly = metrics.annual_rainfall_mm - (sum(baseline_annuals) / len(baseline_annuals))
+            anomaly = silo.rainfall_anomaly_mm(
+                annual_rainfall_mm=metrics.annual_rainfall_mm, baseline_annuals_mm=baseline_annuals
+            )
             rows.append(
                 {
                     **base_row,
