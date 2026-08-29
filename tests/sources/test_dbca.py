@@ -324,6 +324,71 @@ def test_fetch_dbca_fire_refuses_source_digest_mismatch(
     assert not data_root.exists()
 
 
+def test_fetch_dbca_fire_refuses_when_no_source_digest_is_verifiable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A sums file whose entries all name absent files verifies nothing --
+    # the gate must refuse rather than silently degrade to unchecked.
+    data_root = tmp_path / "data"
+    cfg_file = _write_config(tmp_path, data_root)
+    _stub_git_state(monkeypatch)
+    source_dir = _seed_source_dir(tmp_path)
+    (source_dir / "SHA256SUMS.txt").write_text(f"{'0' * 64}  not-present.zip\n")
+
+    result = runner.invoke(
+        app,
+        [
+            "fetch-dbca-fire",
+            "--config",
+            str(cfg_file),
+            "--date",
+            "2026-08-29",
+            "--source-dir",
+            str(source_dir),
+        ],
+    )
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["stage"] == "source_digests"
+    assert "nothing could be digest-verified" in payload["refusal"]
+    assert not data_root.exists()
+
+
+def test_fetch_dbca_fire_refuses_evidence_without_licence_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A 200 response that is a maintenance page or consent shell is not
+    # licence evidence; the snapshot must never finalize on it.
+    data_root = tmp_path / "data"
+    cfg_file = _write_config(tmp_path, data_root)
+    _stub_git_state(monkeypatch)
+    source_dir = _seed_source_dir(tmp_path)
+    monkeypatch.setattr(
+        cli_module,
+        "_fetch_catalogue_page",
+        lambda url: b"<html>Scheduled maintenance -- back soon</html>",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "fetch-dbca-fire",
+            "--config",
+            str(cfg_file),
+            "--date",
+            "2026-08-29",
+            "--source-dir",
+            str(source_dir),
+        ],
+    )
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["stage"] == "licence_evidence"
+    snapshot_dir = data_root / "raw" / "dbca_060_fire" / "2026-08-29"
+    assert not (snapshot_dir / "SHA256SUMS.txt").exists()
+    assert not (snapshot_dir / "catalogue-page.html").exists()
+
+
 def test_fetch_dbca_fire_refuses_invalid_gpkg_before_finalize(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

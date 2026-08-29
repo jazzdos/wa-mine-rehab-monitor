@@ -2078,6 +2078,7 @@ def fetch_dbca_fire_cmd(
             )
             raise typer.Exit(1) from None
 
+    n_source_digests_verified = 0
     for line in source_sums_path.read_text().splitlines():
         line = line.strip()
         if not line:
@@ -2087,6 +2088,7 @@ def fetch_dbca_fire_cmd(
         entry_path = source_dir / name
         if not entry_path.is_file():
             continue
+        n_source_digests_verified += 1
         actual_digest = sha256_file(entry_path)
         if actual_digest != expected_digest:
             typer.echo(
@@ -2104,6 +2106,25 @@ def fetch_dbca_fire_cmd(
                 )
             )
             raise typer.Exit(1) from None
+
+    # A sums file none of whose entries name a file that is present verifies
+    # nothing -- refusing here keeps the gate fail-closed instead of letting a
+    # stripped-down source directory pass as digest-checked.
+    if n_source_digests_verified == 0:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"no entry in {source_sums_path} names a file present in "
+                        f"--source-dir {source_dir} -- nothing could be digest-verified"
+                    ),
+                    "stage": "source_digests",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
 
     source = licence.SOURCES["dbca_060_fire"]
     snapshot_dir = snapshots.create_snapshot_dir(resolved.run.data_root, "dbca_060_fire", date)
@@ -2150,6 +2171,25 @@ def fetch_dbca_fire_cmd(
                     "refusal": (
                         f"licence-evidence fetch of {source.source_url} failed: {exc} -- "
                         "the snapshot is never finalized without evidence"
+                    ),
+                    "stage": "licence_evidence",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+    evidence_text = evidence_bytes.decode("utf-8", errors="replace").lower()
+    licence_markers = ("cc-by", "cc by", "creative commons attribution")
+    if not any(marker in evidence_text for marker in licence_markers):
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"licence-evidence capture of {source.source_url} contains none of "
+                        f"the expected licence markers {list(licence_markers)} -- a "
+                        "maintenance page, consent shell, or unrelated response is not "
+                        "evidence, and the snapshot is never finalized without evidence"
                     ),
                     "stage": "licence_evidence",
                 },
