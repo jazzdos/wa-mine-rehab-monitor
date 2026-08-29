@@ -14,6 +14,7 @@ import functools
 import io
 import json
 import os
+import shutil
 import subprocess
 import zipfile
 from collections.abc import Callable, Mapping, Sequence
@@ -29,6 +30,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pyogrio
 import rasterio  # type: ignore[import-untyped]
+import requests
 import shapely
 import typer
 import yaml
@@ -44,6 +46,7 @@ from wa_mine_monitor import (
     dea_raster,
     dea_volume,
     export_gate,
+    fire_context,
     huntly_validation,
     licence,
     manifests,
@@ -66,7 +69,7 @@ from wa_mine_monitor.http import (
 from wa_mine_monitor.provenance import SourceAsset, collect_git_state, sha256_file
 from wa_mine_monitor.secrets import redact_secrets, scrub_string_leaves
 from wa_mine_monitor.source_catalogue import DEA_COLLECTIONS, SourceSpec
-from wa_mine_monitor.sources import silo, wa_regions
+from wa_mine_monitor.sources import dbca, silo, wa_regions
 from wa_mine_monitor.sources.dea import (
     DEA_RETRY_POLICY,
     CatalogueValidationError,
@@ -358,6 +361,18 @@ SourceGpkgOption = typer.Option(
 )
 
 
+#: `fetch-dbca-fire`'s `--source-dir`: the authoritative DBCA-060 package
+#: directory (a Data WA download this command never fetches itself). No
+#: `exists=True` here -- unlike `SourceGpkgOption` -- because a missing
+#: `--source-dir` is refused with this module's own structured JSON error
+#: (`"stage": "source_package"`), not typer's built-in path validation.
+DbcaSourceDirOption = typer.Option(
+    ...,
+    "--source-dir",
+    help="Authoritative DBCA-060 package directory (Data WA download).",
+)
+
+
 #: DPIRD-020 via the SLIP public ArcGIS REST layer, pinned 2026-08-21
 #: (Data WA catalogue record `regional-development-commission-boundaries`,
 #: licence CC-BY-4.0 re-verified the same day via the CKAN API). The
@@ -399,6 +414,16 @@ SiteIdOption = typer.Option(
     "--site-id",
     help="Repeatable. Required for --scope sites; rejected for --scope statewide.",
 )
+
+
+def _fetch_catalogue_page(url: str) -> bytes:
+    """Download the licence-evidence catalogue page at `url` (network seam,
+    monkeypatchable). Used by `fetch_dbca_fire_cmd` to capture proof of the
+    licence terms displayed at the Data WA catalogue page for DBCA-060 --
+    the snapshot is never finalized without this evidence."""
+    response = requests.get(url, timeout=60)
+    response.raise_for_status()
+    return response.content
 
 
 def _fetch_region_boundaries_bytes() -> bytes:
@@ -1934,6 +1959,272 @@ def fetch_silo_cmd(
     )
 
 
+@app.command("fetch-dbca-fire")
+def fetch_dbca_fire_cmd(
+    config: Path = ConfigOption,
+    date: str = DateOption,
+    mode: str = typer.Option(
+        "authoritative", "--mode", help="authoritative|mirror -- mirror is declined."
+    ),
+    source_dir: Path = DbcaSourceDirOption,
+) -> None:
+    """Stage a dated DBCA-060 fire-history snapshot from an authoritative,
+    already-downloaded Data WA package directory (CC BY 4.0).
+
+    `--mode` accepts only `authoritative`: the ArcGIS mirror route stays
+    declined (`docs/decisions/2026-08-29-dbca-mirror-declined.md`) and
+    `mirror` refuses fail-closed, before any I/O, naming that record.
+
+    `--source-dir` must already hold exactly one `*.gpkg`, a
+    `SHA256SUMS.txt`, and a `metadata.txt` -- this command never downloads
+    anything itself, it only stages and validates a package a human already
+    fetched from Data WA. Every zip entry named in the source
+    `SHA256SUMS.txt` that exists in `--source-dir` is digest-verified
+    before staging; the GeoPackage itself is not covered by those sums (they
+    cover only the zips), so its digest is computed fresh here and recorded
+    in the run manifest.
+
+    Staging copies the GeoPackage plus the source `SHA256SUMS.txt` and
+    `metadata.txt` (renamed `source-SHA256SUMS.txt` / `source-metadata.txt`
+    so they cannot collide with this snapshot's own `metadata.txt` /
+    `SHA256SUMS.txt`) into `<data_root>/raw/dbca_060_fire/<date>/`, then runs
+    `dbca.validate_fire_history_file` before anything is finalized.
+
+    Licence evidence -- the Data WA catalogue page for DBCA-060 -- is
+    fetched and written as `catalogue-page.html` before the snapshot is
+    finalized; the snapshot is NEVER finalized without it, so a fetch
+    failure refuses the run even though staging and validation already
+    passed.
+
+    The stray-file gate (`_refuse_if_unexpected_files`) runs both before
+    staging and before finalizing, mirroring `fetch-silo`'s discipline. The
+    manifest carries two `SourceAsset` inputs: the source GeoPackage (its
+    own resolved file:// URI) and the catalogue page (the Data WA URL),
+    both under `licence.SOURCES["dbca_060_fire"]`.
+    """
+    resolved: ProjectConfig = _load_config_or_exit(config)
+    resolved_config = resolved.model_dump(mode="json")
+
+    if mode != "authoritative":
+        if mode == "mirror":
+            typer.echo(
+                json.dumps(
+                    {
+                        "refusal": (
+                            "--mode mirror -- the ArcGIS mirror route is declined -- see "
+                            "docs/decisions/2026-08-29-dbca-mirror-declined.md"
+                        )
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            typer.echo(
+                json.dumps(
+                    {
+                        "refusal": (
+                            f"--mode {mode!r} is not recognised -- valid modes are "
+                            "'authoritative' or 'mirror'"
+                        )
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        raise typer.Exit(1) from None
+
+    if not source_dir.is_dir():
+        typer.echo(
+            json.dumps(
+                {"refusal": f"--source-dir {source_dir} does not exist or is not a directory"},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+
+    gpkgs = sorted(source_dir.glob("*.gpkg"))
+    if len(gpkgs) != 1:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"--source-dir {source_dir} must hold exactly one *.gpkg, found "
+                        f"{[p.name for p in gpkgs]}"
+                    ),
+                    "stage": "source_package",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+    source_gpkg = gpkgs[0]
+
+    source_sums_path = source_dir / "SHA256SUMS.txt"
+    source_metadata_path = source_dir / "metadata.txt"
+    for required in (source_sums_path, source_metadata_path):
+        if not required.is_file():
+            typer.echo(
+                json.dumps(
+                    {
+                        "refusal": f"--source-dir {source_dir} is missing {required.name}",
+                        "stage": "source_package",
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            raise typer.Exit(1) from None
+
+    for line in source_sums_path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        expected_digest, _, name = line.partition("  ")
+        name = name.strip()
+        entry_path = source_dir / name
+        if not entry_path.is_file():
+            continue
+        actual_digest = sha256_file(entry_path)
+        if actual_digest != expected_digest:
+            typer.echo(
+                json.dumps(
+                    {
+                        "refusal": (
+                            f"{name} digest mismatch: SHA256SUMS.txt says {expected_digest}, "
+                            f"actual is {actual_digest}"
+                        ),
+                        "stage": "source_digests",
+                        "file": name,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            raise typer.Exit(1) from None
+
+    source = licence.SOURCES["dbca_060_fire"]
+    snapshot_dir = snapshots.create_snapshot_dir(resolved.run.data_root, "dbca_060_fire", date)
+    git_state = _collect_git_state_disclosing_gaps(_REPO_ROOT)
+    _refuse_if_snapshot_already_finalized(snapshot_dir, config=resolved_config, git_state=git_state)
+
+    gpkg_name = source_gpkg.name
+    evidence_name = "catalogue-page.html"
+    expected_names = {
+        "metadata.txt",
+        gpkg_name,
+        evidence_name,
+        "source-SHA256SUMS.txt",
+        "source-metadata.txt",
+    }
+    _refuse_if_unexpected_files(
+        snapshot_dir, expected_names=expected_names, closing_clause="before staging"
+    )
+
+    dest = snapshot_dir / gpkg_name
+    if not dest.exists():
+        shutil.copy2(source_gpkg, dest)
+    shutil.copy2(source_sums_path, snapshot_dir / "source-SHA256SUMS.txt")
+    shutil.copy2(source_metadata_path, snapshot_dir / "source-metadata.txt")
+
+    try:
+        summary = dbca.validate_fire_history_file(dest, snapshot_year=int(date[:4]))
+    except dbca.DbcaError as exc:
+        typer.echo(
+            json.dumps(
+                {"refusal": f"{dest.name} failed validation: {exc}", "stage": "validation"},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+
+    try:
+        evidence_bytes = _fetch_catalogue_page(source.source_url)
+    except Exception as exc:  # noqa: BLE001 -- surfaced as a structured refusal
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"licence-evidence fetch of {source.source_url} failed: {exc} -- "
+                        "the snapshot is never finalized without evidence"
+                    ),
+                    "stage": "licence_evidence",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+    evidence_path = snapshot_dir / evidence_name
+    evidence_path.write_bytes(evidence_bytes)
+
+    snapshots.write_snapshot_metadata(
+        snapshot_dir,
+        source=f"{source.title} ({dbca.LAYER_NAME})",
+        endpoint=source.source_url,
+        licence_note=f"{source.licence_id} -- catalogue page: {source.source_url}",
+        purpose="DBCA-060 recorded-fire-overlap context (Batch F F3).",
+    )
+
+    _refuse_if_unexpected_files(
+        snapshot_dir, expected_names=expected_names, closing_clause="before finalizing"
+    )
+
+    sums_path = snapshots.finalize_snapshot(snapshot_dir)
+    n_ok, n_bad, n_missing = snapshots.verify_snapshot(snapshot_dir)
+
+    assets = [
+        SourceAsset(
+            uri=source_gpkg.resolve().as_uri(),
+            sha256=sha256_file(dest),
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(date),
+            licence=source.licence_id,
+            redistribute_public=source.redistribute_public,
+        ),
+        SourceAsset(
+            uri=source.source_url,
+            sha256=sha256_file(evidence_path),
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(date),
+            licence=source.licence_id,
+            redistribute_public=source.redistribute_public,
+        ),
+    ]
+
+    manifests.write_run_manifest(
+        output=sums_path,
+        inputs=assets,
+        config=resolved_config,
+        git_state=git_state,
+        resolved_args={
+            "date": date,
+            "mode": mode,
+            "feature_count": summary.feature_count,
+            "counts_by_type": summary.counts_by_type,
+            "year_min": summary.year_min,
+            "year_max": summary.year_max,
+        },
+    )
+
+    typer.echo(
+        json.dumps(
+            {
+                "snapshot_dir": str(snapshot_dir),
+                "feature_count": summary.feature_count,
+                "counts_by_type": summary.counts_by_type,
+                "verified": {"ok": n_ok, "bad": n_bad, "missing": n_missing},
+            },
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+    )
+
+
 def _csv_zip_member_row_count(zip_path: Path, member_name: str) -> int:
     """The number of DATA rows (excluding the header) `member_name` carries
     inside the zip at `zip_path`, counted via `csv.reader` -- deliberately
@@ -3110,6 +3401,402 @@ def build_climate_context_cmd(
                 "n_sites": len({s for s, _m in site_maus_pairs}),
                 "start_year": start_year,
                 "end_year": end_year,
+            },
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+    )
+
+
+@app.command("build-fire-context")
+def build_fire_context_cmd(
+    config: Path = ConfigOption,
+    date: str = DateOption,
+    start_year: int = typer.Option(..., "--start-year"),
+    end_year: int = typer.Option(..., "--end-year"),
+) -> None:
+    """Build DBCA-060 fire-history context rows (D13 F4) for every D3-eligible
+    site, one row per `(site_id, year)` for `year` in `[start_year, end_year]`.
+
+    Mirrors `build-climate-context`'s gate structure exactly (GATE 1
+    inverted-range refusal before any I/O; GATE 2 latest verified
+    `raw/dbca_060_fire/<date>/` snapshot; GATE 3 latest D3-eligibility-
+    annotated register; GATE 4 crosswalk + Maus snapshot, sha-tied). Context
+    rows are context only (see `fire_context.py`'s docstring): this command
+    never joins fire history to trajectory rows and never states a cause.
+    `not_recorded` is NEVER a known-negative fire label.
+    """
+    resolved: ProjectConfig = _load_config_or_exit(config)
+    resolved_config = resolved.model_dump(mode="json")
+    git_state = _collect_git_state_disclosing_gaps(_REPO_ROOT)
+    data_root = resolved.run.data_root
+
+    # GATE 1 -- year range, BEFORE any I/O. See `build_climate_context_cmd`'s
+    # identical gate for why an inverted range must never reach `assemble_
+    # rows` and produce a schema-valid, finalized, empty artefact.
+    if start_year > end_year:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"--start-year {start_year} is after --end-year {end_year} -- "
+                        "refusing an inverted year range"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+
+    output_dir = data_root / "curated" / "fire-context" / date
+    output_path = output_dir / "fire_context.parquet"
+    _refuse_if_curated_output_already_exists(
+        output_path, config=resolved_config, git_state=git_state
+    )
+
+    requested_years = list(range(start_year, end_year + 1))
+
+    # GATE 2 -- the latest DBCA-060 fire snapshot: locate the single *.gpkg
+    # inside it FIRST (refuse if zero or more than one), then digest-verify
+    # the snapshot with that gpkg named in `required_files` -- an unlisted
+    # file dropped in after finalisation otherwise passes verification (same
+    # gate `build_climate_context_cmd` GATE 2 applies to the SILO files it
+    # consumes).
+    try:
+        dbca_snapshot_dir = register.latest_snapshot(data_root, "dbca_060_fire")
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    gpkgs = sorted(dbca_snapshot_dir.glob("*.gpkg"))
+    if len(gpkgs) != 1:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"{dbca_snapshot_dir} must hold exactly one *.gpkg, found "
+                        f"{[p.name for p in gpkgs]}"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+    gpkg_path = gpkgs[0]
+
+    dbca_verification = _verify_snapshot_or_refuse(
+        dbca_snapshot_dir, source_id="dbca_060_fire", required_files=(gpkg_path.name,)
+    )
+    snapshot_year = int(dbca_snapshot_dir.name[:4])
+    gpkg_sha256 = sha256_file(gpkg_path)
+    source_version = f"dbca-060-{dbca_snapshot_dir.name}-sha256-{gpkg_sha256[:12]}"
+
+    # GATE 3 -- latest curated register: digest-verified, and must be the
+    # D3-eligibility-annotated register `apply-d3-threshold` writes -- the
+    # same two column checks `build_climate_context_cmd` GATE 3 applies.
+    try:
+        register_dir = _latest_curated_dated_dir(
+            data_root / "curated" / "register", label="curated/register"
+        )
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    register_path = register_dir / "register.parquet"
+    register_manifest = _digest_verified_manifest(register_path)
+    register_df = read_table(register_path)
+    if "trajectory_status" not in register_df.columns:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        "latest curated register is not D3-eligibility-annotated -- run "
+                        "apply-d3-threshold first"
+                    ),
+                    "register_path": str(register_path),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    if "d3_forced_threshold" not in register_df.columns:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        "latest curated register predates the d3_forced_threshold column -- "
+                        "run apply-d3-threshold to re-write it"
+                    ),
+                    "register_path": str(register_path),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+
+    eligible = trajectory_extract.select_eligible_sites(register_df)
+
+    # GATE 4 -- crosswalk + Maus snapshot, resolved and sha256-tied exactly
+    # as `build_climate_context_cmd` GATE 4 does.
+    try:
+        crosswalk_dir = _latest_curated_dated_dir(
+            data_root / "curated" / "crosswalk", label="curated/crosswalk"
+        )
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    crosswalk_path = crosswalk_dir / "crosswalk.parquet"
+    crosswalk_manifest = _digest_verified_manifest(crosswalk_path)
+    crosswalk_df = read_table(crosswalk_path)
+    tier1_df = crosswalk.tier1_population(crosswalk_df)
+
+    maus_licence_id = licence.SOURCES["maus_v2"].licence_id
+    crosswalk_maus_input = next(
+        (
+            asset
+            for asset in crosswalk_manifest.get("inputs", [])
+            if asset.get("licence") == maus_licence_id
+        ),
+        None,
+    )
+    if crosswalk_maus_input is None:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"{crosswalk_path}'s manifest carries no Maus input (licence "
+                        f"{maus_licence_id!r}) -- cannot verify which Maus snapshot it "
+                        "was built from"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    crosswalk_maus_sha256 = crosswalk_maus_input["sha256"]
+
+    try:
+        maus_snapshot_dir = register.latest_snapshot(data_root, "maus_v2")
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    _verify_snapshot_or_refuse(
+        maus_snapshot_dir, source_id="maus_v2", required_files=("wa_extract.gpkg",)
+    )
+    maus_path = maus_snapshot_dir / "wa_extract.gpkg"
+    maus_gpkg_sha256 = sha256_file(maus_path)
+    if maus_gpkg_sha256 != crosswalk_maus_sha256:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"latest maus_v2 raw snapshot ({maus_path}) hashes "
+                        f"{maus_gpkg_sha256[:12]}..., but the crosswalk's manifest records "
+                        f"Maus sha256 {crosswalk_maus_sha256[:12]}... -- the latest raw Maus "
+                        "snapshot is not the one the crosswalk was built from"
+                    ),
+                    "maus_gpkg_sha256": maus_gpkg_sha256,
+                    "crosswalk_maus_gpkg_sha256": crosswalk_maus_sha256,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    try:
+        maus_source_gdf = gpd.read_file(maus_path)
+        maus_gdf = maus_source_gdf[["maus_id", "geometry"]].to_crs(crosswalk.TARGET_CRS)
+    except (pyogrio.errors.DataSourceError, OSError) as exc:
+        typer.echo(
+            json.dumps({"refusal": str(exc), "maus_gpkg": str(maus_path)}, indent=2, sort_keys=True)
+        )
+        raise typer.Exit(1) from None
+    except KeyError as exc:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": f"wa_extract.gpkg is missing the expected column {exc}",
+                    "maus_gpkg": str(maus_path),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+    maus_geom_by_id: dict[str, Any] = dict(
+        zip(maus_gdf["maus_id"].astype(str), maus_gdf.geometry, strict=True)
+    )
+
+    # Site->Maus tie-break, reproduced EXACTLY from `build_climate_context_
+    # cmd` (mirrors `register.py`'s own eligibility tie-break: stable sort
+    # by `["site_id", "maus_id"]`, `drop_duplicates(keep="first")` -- the
+    # lexicographically SMALLEST `maus_id` per site).
+    tier1_dedup = tier1_df.sort_values(
+        ["site_id", "maus_id"], na_position="last", kind="stable"
+    ).drop_duplicates(subset="site_id", keep="first")
+    maus_id_by_site: dict[str, str] = dict(
+        zip(tier1_dedup["site_id"].astype(str), tier1_dedup["maus_id"].astype(str), strict=True)
+    )
+
+    # An eligible site absent from the Tier 1 crosswalk population is
+    # refused by name, not silently dropped: `assemble_rows`' row-count
+    # guarantee reconciles against `site_maus_pairs`, which by then has
+    # already excluded the missing site, so it cannot catch this itself.
+    # `no_footprint` is reserved for step 6's empty/invalid geometry below --
+    # this is a DELIBERATE integrity gate, never downgraded to a per-row
+    # unknown.
+    site_maus_pairs: list[tuple[str, str]] = []
+    for site in eligible:
+        maus_id = maus_id_by_site.get(site)
+        if maus_id is None:
+            typer.echo(
+                json.dumps(
+                    {
+                        "refusal": (
+                            f"eligible site {site!r} is not in the Tier 1 crosswalk "
+                            f"population ({crosswalk_path}) -- an eligible site must have a "
+                            "high-confidence Maus match"
+                        )
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            raise typer.Exit(1)
+        site_maus_pairs.append((site, maus_id))
+
+    missing_geometry = sorted({m for _s, m in site_maus_pairs} - set(maus_geom_by_id))
+    if missing_geometry:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"maus_id(s) {missing_geometry} (from eligible sites) are absent "
+                        f"from the latest Maus snapshot ({maus_path})"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+
+    # Per distinct maus_id, reproject the single footprint geometry to
+    # EPSG:4283 (the fire layer's own CRS) -- an empty or invalid geometry
+    # becomes a per-row `unknown`/`no_footprint`, never a run abort.
+    distinct_maus_ids = sorted({m for _s, m in site_maus_pairs})
+    footprints_4283 = gpd.GeoSeries(
+        [maus_geom_by_id[m] for m in distinct_maus_ids], crs=crosswalk.TARGET_CRS
+    ).to_crs("EPSG:4283")
+
+    no_footprint_by_maus: dict[str, str] = {}
+    counts_by_maus_year: dict[tuple[str, int], int] = {}
+    for maus_id, geom in zip(distinct_maus_ids, footprints_4283, strict=True):
+        if geom.is_empty or not geom.is_valid:
+            no_footprint_by_maus[maus_id] = "footprint geometry empty or invalid"
+            continue
+        year_counts = dbca.fire_year_counts_for_footprint(gpkg_path, geom)
+        for year, count in year_counts.items():
+            if start_year <= year <= end_year:
+                counts_by_maus_year[(maus_id, year)] = count
+
+    try:
+        rows_df = fire_context.assemble_rows(
+            site_maus_pairs=site_maus_pairs,
+            counts_by_maus_year=counts_by_maus_year,
+            no_footprint_by_maus=no_footprint_by_maus,
+            years=requested_years,
+            snapshot_year=snapshot_year,
+            snapshot_date=dbca_snapshot_dir.name,
+            source_version=source_version,
+        )
+    except fire_context.FireContextError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    fire_context.validate_row_counts(
+        rows_df, n_pairs=len(site_maus_pairs), n_years=end_year - start_year + 1
+    )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _write_table_or_refuse(rows_df, output_path, fire_context.FIRE_CONTEXT_SCHEMA)
+
+    dbca_source = licence.SOURCES["dbca_060_fire"]
+    input_assets = [
+        SourceAsset(
+            uri=str(gpkg_path.resolve().as_uri()),
+            sha256=gpkg_sha256,
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(dbca_snapshot_dir.name),
+            licence=dbca_source.licence_id,
+            redistribute_public=dbca_source.redistribute_public,
+        ),
+        SourceAsset(
+            uri=str(register_path),
+            sha256=register_manifest["output"]["sha256"],
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(register_dir.name),
+            licence=licence.SOURCES["dmirs_001_minedex"].licence_id,
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(crosswalk_path),
+            sha256=crosswalk_manifest["output"]["sha256"],
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(crosswalk_dir.name),
+            licence=None,
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(maus_path),
+            sha256=maus_gpkg_sha256,
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(maus_snapshot_dir.name),
+            licence=maus_licence_id,
+            redistribute_public=False,
+        ),
+    ]
+
+    status_counts = {
+        str(status): int(count) for status, count in rows_df["fire_status"].value_counts().items()
+    }
+
+    try:
+        manifests.write_run_manifest(
+            output=output_path,
+            inputs=input_assets,
+            config=resolved_config,
+            git_state=git_state,
+            resolved_args={
+                "date": date,
+                "start_year": start_year,
+                "end_year": end_year,
+                "register_dir": str(register_dir),
+                "crosswalk_dir": str(crosswalk_dir),
+                "maus_snapshot_dir": str(maus_snapshot_dir),
+                "dbca_snapshot_dir": str(dbca_snapshot_dir),
+                "dbca_snapshot_verification": dbca_verification,
+                "n_sites": len({s for s, _m in site_maus_pairs}),
+                "n_rows": len(rows_df),
+                "status_counts": status_counts,
+            },
+        )
+    except FileExistsError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    typer.echo(
+        json.dumps(
+            {
+                "output_path": str(output_path),
+                "manifest_path": str(output_path) + manifests.MANIFEST_SUFFIX,
+                "rows": len(rows_df),
+                "status_counts": status_counts,
             },
             indent=2,
             sort_keys=True,
