@@ -2,6 +2,7 @@ import json
 
 import pytest  # noqa: F401 -- kept to match the task spec's test verbatim
 
+from wa_mine_monitor import licence
 from wa_mine_monitor.licence import SOURCES, minedex_redistribution_allowed
 
 
@@ -442,3 +443,41 @@ def test_dbca_060_fire_entry_is_cc_by_with_catalogue_evidence() -> None:
     assert entry.redistribute_public is True
     assert "3ce8a891-b050-4c38-952b-c40ca8bdc042" in entry.notes
     assert "NEVER a known-negative" in entry.notes
+
+
+class TestLicenceState:
+    """Three-state licence governance (D13 §8 P1): every `SourceLicence`
+    carries a `licence_state` enum member, defaulting closed, and the
+    boolean `redistribute_public` must stay consistent with it.
+    """
+
+    def test_enum_members(self) -> None:
+        assert licence.LicenceState.PUBLIC.value == "public"
+        assert licence.LicenceState.GATED_INTERNAL.value == "gated_internal"
+        assert licence.LicenceState.RESEARCH_ONLY.value == "research_only"
+
+    def test_every_source_carries_a_licence_state(self) -> None:
+        for entry in SOURCES.values():
+            assert isinstance(entry.licence_state, licence.LicenceState)
+
+    def test_default_state_is_gated_internal(self) -> None:
+        record = licence.SourceLicence(
+            source_id="test_default",
+            title="Test Default Source",
+            source_url="https://example.org/test",
+            licence_id="CC-BY-4.0",
+            licence_url="https://creativecommons.org/licenses/by/4.0/",
+            attribution_text="Test attribution.",
+            redistribute_public=False,
+            notes="Test notes.",
+        )
+        assert record.licence_state is licence.LicenceState.GATED_INTERNAL
+
+    def test_minedex_is_gated_internal(self) -> None:
+        assert SOURCES["dmirs_001_minedex"].licence_state is licence.LicenceState.GATED_INTERNAL
+
+    def test_state_boolean_invariant(self) -> None:
+        for entry in SOURCES.values():
+            assert entry.redistribute_public is (
+                entry.licence_state is licence.LicenceState.PUBLIC
+            ), entry.source_id

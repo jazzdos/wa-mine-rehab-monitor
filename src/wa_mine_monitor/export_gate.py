@@ -104,9 +104,25 @@ import re
 
 import pandas as pd
 
+from wa_mine_monitor import licence
+
 #: The row-level licence gate column. A row is publishable only when this is
 #: exactly `True`.
 REDISTRIBUTE_COLUMN = "redistribute_public"
+
+
+def licence_state_allows_public(state: object) -> bool:
+    """Fail-closed enum-to-boolean mapping (D13 §8 P1).
+
+    True ONLY for the `PUBLIC` member itself. Strings (even `"public"`),
+    `None`, other `LicenceState` members, and unknown objects are all
+    False -- an unrecognised state is a denial, not a pass. This mirrors
+    `export_public`'s own refuse-rather-than-filter posture: a caller that
+    hands this function something that merely *looks* like `PUBLIC` (a
+    matching string, a truthy int) gets `False`, not a permissive guess.
+    """
+    return isinstance(state, licence.LicenceState) and state is licence.LicenceState.PUBLIC
+
 
 #: Lower-cased substrings that mark a column as geometry-bearing by NAME.
 #: `wkt`/`wkb` are included because serialised geometry is still geometry:

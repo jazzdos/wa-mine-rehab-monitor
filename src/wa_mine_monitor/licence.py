@@ -28,6 +28,7 @@ notice).
 
 from __future__ import annotations
 
+import enum
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +44,25 @@ EVIDENCE_FILENAME = "licence_evidence.json"
 
 #: The only `explicit_grant` value that can unblock MINEDEX redistribution.
 _REQUIRED_GRANT = "CC-BY-4.0"
+
+
+class LicenceState(enum.StrEnum):
+    """Three-state licence governance (D13 §8 P1).
+
+    - `PUBLIC`: exact-resource evidence supports public redistribution.
+    - `GATED_INTERNAL`: default-deny, internal-only. `dmirs_001_minedex`
+      lives here.
+    - `RESEARCH_ONLY`: may never enter internal reporting intended for
+      later publication. No registered source carries it today.
+
+    This is UNRELATED to `source_catalogue.SourceSpec.licence_state`, which
+    is a plain licence-id string used for the DEA live-vs-pinned
+    cross-check -- same field name, different module, different purpose.
+    """
+
+    PUBLIC = "public"
+    GATED_INTERNAL = "gated_internal"
+    RESEARCH_ONLY = "research_only"
 
 
 @dataclass(frozen=True)
@@ -77,6 +97,10 @@ class SourceLicence:
     #: Free-text notes: scope limits, transformation notices, and the
     #: reasoning behind the redistribution decision.
     notes: str
+    #: Three-state licence governance (D13 §8 P1). Defaults closed: an
+    #: entry must EARN `PUBLIC` with exact-resource evidence in `notes`,
+    #: never inherit it silently.
+    licence_state: LicenceState = LicenceState.GATED_INTERNAL
 
 
 _HANSEN_DISPLAY_CREDIT = "Source: Hansen/UMD/Google/USGS/NASA"
@@ -102,6 +126,7 @@ SOURCES: dict[str, SourceLicence] = {
             "data courtesy of the U.S. Geological Survey."
         ),
         redistribute_public=True,
+        licence_state=LicenceState.PUBLIC,
         notes=(
             "Licence read from the collection's own STAC JSON `license` field, "
             "per the design doc's measurement, not inferred from Geoscience "
@@ -122,6 +147,7 @@ SOURCES: dict[str, SourceLicence] = {
             "data courtesy of the U.S. Geological Survey."
         ),
         redistribute_public=True,
+        licence_state=LicenceState.PUBLIC,
         notes="Licence read from the collection's own STAC JSON `license` field.",
     ),
     "dea_gm_ls8cls9c": SourceLicence(
@@ -136,6 +162,7 @@ SOURCES: dict[str, SourceLicence] = {
             "Landsat data courtesy of the U.S. Geological Survey."
         ),
         redistribute_public=True,
+        licence_state=LicenceState.PUBLIC,
         notes="Licence read from the collection's own STAC JSON `license` field.",
     ),
     "dea_fc_pc": SourceLicence(
@@ -150,6 +177,7 @@ SOURCES: dict[str, SourceLicence] = {
             "data courtesy of the U.S. Geological Survey."
         ),
         redistribute_public=True,
+        licence_state=LicenceState.PUBLIC,
         notes="Licence read from the collection's own STAC JSON `license` field.",
     ),
     "dmirs_003_tenements": SourceLicence(
@@ -164,6 +192,7 @@ SOURCES: dict[str, SourceLicence] = {
             "licensed under CC-BY-4.0."
         ),
         redistribute_public=True,
+        licence_state=LicenceState.PUBLIC,
         notes="Data WA catalogue `license_id: cc-by`, read 2026-08-15.",
     ),
     "dmirs_001_minedex": SourceLicence(
@@ -178,6 +207,7 @@ SOURCES: dict[str, SourceLicence] = {
             "only; not for public redistribution pending licence resolution."
         ),
         redistribute_public=False,
+        licence_state=LicenceState.GATED_INTERNAL,
         notes=(
             "Data WA's own catalogue record for minedex-dmirs-001 states "
             "`license_id: cc-nc` (CC-BY-NC-4.0). WA's Digital Atlas of "
@@ -224,6 +254,7 @@ SOURCES: dict[str, SourceLicence] = {
             "This derived work is licensed under CC-BY-SA-4.0."
         ),
         redistribute_public=True,
+        licence_state=LicenceState.PUBLIC,
         notes=(
             "ShareAlike applies to the whole Maus-derived package (the "
             "design's D1: WA extract, crosswalk, trajectories over the Maus "
@@ -243,6 +274,7 @@ SOURCES: dict[str, SourceLicence] = {
         licence_url="https://creativecommons.org/licenses/by/4.0/",
         attribution_text=f"{_HANSEN_DISPLAY_CREDIT}\n\n{_HANSEN_CITATION_CREDIT}",
         redistribute_public=True,
+        licence_state=LicenceState.PUBLIC,
         notes=(
             "CC-BY-4.0, conditional on attaching BOTH credit strings verbatim "
             "-- they are NOT interchangeable. The display string "
@@ -269,6 +301,7 @@ SOURCES: dict[str, SourceLicence] = {
             "Conservation and Attractions (DBCA), Fire History (DBCA-060)."
         ),
         redistribute_public=True,
+        licence_state=LicenceState.PUBLIC,
         notes=(
             "Open, jarrah-verified. Context-only use: the record is "
             "incomplete statewide, and its own metadata says it can include "
@@ -295,6 +328,7 @@ SOURCES: dict[str, SourceLicence] = {
             "SILO climate database (longpaddock.qld.gov.au/silo)."
         ),
         redistribute_public=True,
+        licence_state=LicenceState.PUBLIC,
         notes=(
             "Consumed as the GRIDDED product from the anonymous AWS "
             "open-data bucket (s3://silo-open-data, ap-southeast-2): "
@@ -319,6 +353,7 @@ SOURCES: dict[str, SourceLicence] = {
             "(WA), licensed under CC-BY-4.0."
         ),
         redistribute_public=True,
+        licence_state=LicenceState.PUBLIC,
         notes=(
             "The nine regions defined under the Regional Development "
             "Commissions Act 1993, pinned as the design doc D4's 'official "

@@ -33,18 +33,19 @@ means the source's geometry or attributes never cross the public export
 boundary (`export_gate.export_public`) under any circumstance the export
 gate itself can enforce.
 
-| Source | Exact resource | Licence | Redistribution | Attribution text |
-|---|---|---|---|---|
-| DEA Landsat 5 TM Geomedian (`ga_ls5t_gm_cyear_3`) | https://explorer.dea.ga.gov.au/stac/collections/ga_ls5t_gm_cyear_3 | CC-BY-4.0 | **True** | "Contains Digital Earth Australia data (Geoscience Australia), collection ga_ls5t_gm_cyear_3, licensed under CC-BY-4.0. Landsat data courtesy of the U.S. Geological Survey." |
-| DEA Landsat 7 ETM+ Geomedian (`ga_ls7e_gm_cyear_3`) | https://explorer.dea.ga.gov.au/stac/collections/ga_ls7e_gm_cyear_3 | CC-BY-4.0 | **True** | "Contains Digital Earth Australia data (Geoscience Australia), collection ga_ls7e_gm_cyear_3, licensed under CC-BY-4.0. Landsat data courtesy of the U.S. Geological Survey." |
-| DEA Landsat 8/9 Geomedian (`ga_ls8cls9c_gm_cyear_3`) | https://explorer.dea.ga.gov.au/stac/collections/ga_ls8cls9c_gm_cyear_3 | CC-BY-4.0 | **True** | "Contains Digital Earth Australia data (Geoscience Australia), collection ga_ls8cls9c_gm_cyear_3, licensed under CC-BY-4.0. Landsat data courtesy of the U.S. Geological Survey." |
-| DEA Fractional Cover Percentiles (`ga_ls_fc_pc_cyear_3`) | https://explorer.dea.ga.gov.au/stac/collections/ga_ls_fc_pc_cyear_3 | CC-BY-4.0 | **True** | "Contains Digital Earth Australia data (Geoscience Australia), collection ga_ls_fc_pc_cyear_3, licensed under CC-BY-4.0. Landsat data courtesy of the U.S. Geological Survey." |
-| Mining Tenements (DMIRS-003) | https://catalogue.data.wa.gov.au/dataset/mining-tenements-dmirs-003 (acquired via DASC bundle `https://dasc.dmirs.wa.gov.au/Download/File/2056`, "Tenements - Current (live and pending) - [GDA2020]") | CC-BY-4.0 | **True** | "Contains data sourced from the Department of Mines, Industry Regulation and Safety (DMIRS), Mining Tenements (DMIRS-003), licensed under CC-BY-4.0." |
-| MINEDEX (DMIRS-001) | https://catalogue.data.wa.gov.au/dataset/minedex-dmirs-001 (acquired via DASC bundles `https://dasc.dmirs.wa.gov.au/Download/File/3978` SHP and `https://dasc.dmirs.wa.gov.au/Download/File/3981` CSV) | **`CONFLICT:cc-nc-vs-cc-by`** — D7-adjudicated, still closed | **False** (fail-closed) | "Contains data sourced from the Department of Mines, Industry Regulation and Safety (DMIRS), MINEDEX (DMIRS-001). Attribution only; not for public redistribution pending licence resolution." |
-| Maus et al. global mining polygons, v2 | https://doi.pangaea.de/10.1594/PANGAEA.942325 | CC-BY-SA-4.0 | **True**, share-alike package | "Contains data derived from Maus, V. et al., \"An update on global mining land use\" (PANGAEA.942325), licensed under CC-BY-SA-4.0. This derived work is licensed under CC-BY-SA-4.0." |
-| Hansen/UMD/Google/USGS/NASA Global Forest Change (`GFC-2024-v1.12`) | https://glad.earthengine.app/view/global-forest-change | CC-BY-4.0, conditional | **True**, conditional on both credit strings | see "Hansen credit strings" below — both required, not interchangeable |
-| DBCA-060 Fire History | https://catalogue.data.wa.gov.au/dataset/dbca-fire-history | CC-BY-4.0 | **True**, context-only | "Contains fire history data from the Department of Biodiversity, Conservation and Attractions (DBCA), Fire History (DBCA-060)." |
-| SILO Climate Database | https://www.longpaddock.qld.gov.au/silo/ | CC BY 4.0 (gridded, anonymous) | **True** | "Contains climate data sourced from the Queensland Government's SILO climate database (longpaddock.qld.gov.au/silo)." |
+| Source ID | Source | Exact resource | Licence | Licence state | Redistribution | Attribution text |
+|---|---|---|---|---|---|---|
+| `dea_gm_ls5t` | DEA Landsat 5 TM Geomedian (`ga_ls5t_gm_cyear_3`) | https://explorer.dea.ga.gov.au/stac/collections/ga_ls5t_gm_cyear_3 | CC-BY-4.0 | public | **True** (yes) | "Contains Digital Earth Australia data (Geoscience Australia), collection ga_ls5t_gm_cyear_3, licensed under CC-BY-4.0. Landsat data courtesy of the U.S. Geological Survey." |
+| `dea_gm_ls7e` | DEA Landsat 7 ETM+ Geomedian (`ga_ls7e_gm_cyear_3`) | https://explorer.dea.ga.gov.au/stac/collections/ga_ls7e_gm_cyear_3 | CC-BY-4.0 | public | **True** (yes) | "Contains Digital Earth Australia data (Geoscience Australia), collection ga_ls7e_gm_cyear_3, licensed under CC-BY-4.0. Landsat data courtesy of the U.S. Geological Survey." |
+| `dea_gm_ls8cls9c` | DEA Landsat 8/9 Geomedian (`ga_ls8cls9c_gm_cyear_3`) | https://explorer.dea.ga.gov.au/stac/collections/ga_ls8cls9c_gm_cyear_3 | CC-BY-4.0 | public | **True** (yes) | "Contains Digital Earth Australia data (Geoscience Australia), collection ga_ls8cls9c_gm_cyear_3, licensed under CC-BY-4.0. Landsat data courtesy of the U.S. Geological Survey." |
+| `dea_fc_pc` | DEA Fractional Cover Percentiles (`ga_ls_fc_pc_cyear_3`) | https://explorer.dea.ga.gov.au/stac/collections/ga_ls_fc_pc_cyear_3 | CC-BY-4.0 | public | **True** (yes) | "Contains Digital Earth Australia data (Geoscience Australia), collection ga_ls_fc_pc_cyear_3, licensed under CC-BY-4.0. Landsat data courtesy of the U.S. Geological Survey." |
+| `dmirs_003_tenements` | Mining Tenements (DMIRS-003) | https://catalogue.data.wa.gov.au/dataset/mining-tenements-dmirs-003 (acquired via DASC bundle `https://dasc.dmirs.wa.gov.au/Download/File/2056`, "Tenements - Current (live and pending) - [GDA2020]") | CC-BY-4.0 | public | **True** (yes) | "Contains data sourced from the Department of Mines, Industry Regulation and Safety (DMIRS), Mining Tenements (DMIRS-003), licensed under CC-BY-4.0." |
+| `dmirs_001_minedex` | MINEDEX (DMIRS-001) | https://catalogue.data.wa.gov.au/dataset/minedex-dmirs-001 (acquired via DASC bundles `https://dasc.dmirs.wa.gov.au/Download/File/3978` SHP and `https://dasc.dmirs.wa.gov.au/Download/File/3981` CSV) | **`CONFLICT:cc-nc-vs-cc-by`** — D7-adjudicated, still closed | gated_internal | **False** (fail-closed) (no) | "Contains data sourced from the Department of Mines, Industry Regulation and Safety (DMIRS), MINEDEX (DMIRS-001). Attribution only; not for public redistribution pending licence resolution." |
+| `maus_v2` | Maus et al. global mining polygons, v2 | https://doi.pangaea.de/10.1594/PANGAEA.942325 | CC-BY-SA-4.0 | public | **True** (yes), share-alike package | "Contains data derived from Maus, V. et al., \"An update on global mining land use\" (PANGAEA.942325), licensed under CC-BY-SA-4.0. This derived work is licensed under CC-BY-SA-4.0." |
+| `hansen_gfc` | Hansen/UMD/Google/USGS/NASA Global Forest Change (`GFC-2024-v1.12`) | https://glad.earthengine.app/view/global-forest-change | CC-BY-4.0, conditional | public | **True** (yes), conditional on both credit strings | see "Hansen credit strings" below — both required, not interchangeable |
+| `dbca_060_fire` | DBCA-060 Fire History | https://catalogue.data.wa.gov.au/dataset/dbca-fire-history | CC-BY-4.0 | public | **True** (yes), context-only | "Contains fire history data from the Department of Biodiversity, Conservation and Attractions (DBCA), Fire History (DBCA-060)." |
+| `silo` | SILO Climate Database | https://www.longpaddock.qld.gov.au/silo/ | CC-BY-4.0 (gridded, anonymous) | public | **True** (yes) | "Contains climate data sourced from the Queensland Government's SILO climate database (longpaddock.qld.gov.au/silo)." |
+| `wa_rdc_regions` | WA Regional Development Commission Boundaries (DPIRD-020) | https://catalogue.data.wa.gov.au/dataset/regional-development-commission-boundaries | CC-BY-4.0 | public | **True** (yes) | "Contains Regional Development Commission Boundaries (DPIRD-020) data © Department of Primary Industries and Regional Development (WA), licensed under CC-BY-4.0." |
 
 ## Snapshot policy
 
@@ -197,6 +198,28 @@ the grant:
   > 2013. "High-Resolution Global Maps of 21st-Century Forest Cover Change."
   > Science 342 (15 November): 850–53. Data available on-line from:
   > https://glad.earthengine.app/view/global-forest-change.
+
+## Tier 0 public-RC packages
+
+The public repository's release candidate ships two standalone reference
+layers in place of the private, D7-closed internal MINEDEX monitoring
+frame. Neither package carries a crosswalk to that frame or any MINEDEX
+lineage: each is a direct extract of its own upstream source, licensed and
+attributed independently, with owners recorded from the source register as
+owners only, never as operators (D8).
+
+- **`tier0-tenements`** — Mining Tenements (DMIRS-003) extract. Source:
+  https://catalogue.data.wa.gov.au/dataset/mining-tenements-dmirs-003, via
+  the DASC bundle route recorded above. Licence: **CC-BY-4.0**, the same
+  grant as the source row's public licence state in the table above.
+- **`tier0-maus-wa`** — the WA extract of Maus et al.'s global mining
+  polygons, v2. Source: https://doi.pangaea.de/10.1594/PANGAEA.942325.
+  Licence: **CC-BY-SA-4.0**, carrying its own modification statement per
+  the ShareAlike grant, published as its own separate artefact rather than
+  folded into a CC-BY export.
+
+Each package's licence is tracked and satisfied independently; nothing in
+either package is derived from, or requires, the internal MINEDEX frame.
 
 `SOURCES["hansen_gfc"].attribution_text` carries both strings, separated by a
 blank line, so a caller rendering the whole field satisfies the grant either

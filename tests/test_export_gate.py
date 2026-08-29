@@ -25,6 +25,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
+from wa_mine_monitor import export_gate, licence
 from wa_mine_monitor.export_gate import (
     GEOMETRY_NAME_TOKENS,
     REDISTRIBUTE_COLUMN,
@@ -303,3 +304,25 @@ def test_export_public_drops_lon_lat() -> None:
     published = export_public(frame)
     assert sorted(published.columns) == ["site_id"]
     assert "lon" in published.attrs["export_public"]["dropped_columns"]
+
+
+class TestLicenceStateMapping:
+    """Fail-closed mapping from `licence.LicenceState` to the export gate's
+    boolean world (D13 §8 P1): only the `PUBLIC` member itself passes.
+    """
+
+    def test_public_member_allows(self) -> None:
+        assert export_gate.licence_state_allows_public(licence.LicenceState.PUBLIC)
+
+    def test_everything_else_denies(self) -> None:
+        for value in (
+            licence.LicenceState.GATED_INTERNAL,
+            licence.LicenceState.RESEARCH_ONLY,
+            "public",
+            "PUBLIC",
+            None,
+            True,
+            1,
+            object(),
+        ):
+            assert not export_gate.licence_state_allows_public(value)

@@ -1,0 +1,201 @@
+# Committed evidence ledger (D13 §8 P2). See src/wa_mine_monitor/evidence.py
+# for the schema and the two failure classes (load-time EvidenceError vs.
+# a reported VerificationReport failure). Digests and context snippets here
+# are copied verbatim from the live data root's SHA256SUMS.txt / metadata.txt
+# files; the raw evidence bytes themselves are never committed, only their
+# digests and named-file references -- re-verify with:
+#   uv run python bin/verify_evidence.py --ledger evidence/provenance.yaml \
+#       --data-root <path-to-data-root>
+entries:
+  # -- dmirs_003_tenements: the gating claim (CC-BY-4.0 grant, required for
+  # the public export gate) plus a separate, non-gating archive-integrity
+  # entry that only pins the downloaded bundle's digest.
+  - claim_id: dmirs-003-cc-by
+    source_id: dmirs_003_tenements
+    resource_url: https://catalogue.data.wa.gov.au/dataset/mining-tenements-dmirs-003
+    snapshot_date: "2026-08-16"
+    licence_state: public
+    evidence_files:
+      metadata.txt: c1b52bc81da3908c1eceb43451c7f94db014fcb59215648b8e9fada02da1a916
+    context: "CC-BY-4.0 -- in-bundle Licence_CCBY4.pdf"
+    units: null
+    status: verified
+    delegated_verifier: null
+    offline_runnable: true
+    required_for_public_gate: true
+
+  - claim_id: dmirs-003-archive-integrity
+    source_id: dmirs_003_tenements
+    resource_url: https://catalogue.data.wa.gov.au/dataset/mining-tenements-dmirs-003
+    snapshot_date: "2026-08-16"
+    licence_state: public
+    evidence_files:
+      tenements_current_gda2020_shp.zip: cb84eb82cc836c32ac020196af9f4f637b87c8f5986c4210d55535ed9da05054
+    context: null
+    units: null
+    status: digest_only
+    delegated_verifier: null
+    offline_runnable: true
+    required_for_public_gate: false
+
+  # -- maus_v2: same split -- the gating CC-BY-SA-4.0 claim, plus a
+  # non-gating archive-integrity entry on the extracted GeoPackage.
+  - claim_id: maus-v2-cc-by-sa
+    source_id: maus_v2
+    resource_url: https://doi.pangaea.de/10.1594/PANGAEA.942325
+    snapshot_date: "2026-08-16"
+    licence_state: public
+    evidence_files:
+      metadata.txt: a6a9dc255d8824bd7f6d97d91bc4fa6c806d7bf59e72b10ce1b4e6defb60941b
+    context: "CC-BY-SA-4.0 -- Contains data derived from"
+    units: null
+    status: verified
+    delegated_verifier: null
+    offline_runnable: true
+    required_for_public_gate: true
+
+  - claim_id: maus-v2-archive-integrity
+    source_id: maus_v2
+    resource_url: https://doi.pangaea.de/10.1594/PANGAEA.942325
+    snapshot_date: "2026-08-16"
+    licence_state: public
+    evidence_files:
+      wa_extract.gpkg: 554ab2c9a64d056112f00f035166ab3ffb0295e612a5241632338383f0f96118
+    context: null
+    units: null
+    status: digest_only
+    delegated_verifier: null
+    offline_runnable: true
+    required_for_public_gate: false
+
+  # -- dmirs_001_minedex: D7 adjudicated this CLOSED (docs/decisions/
+  # 2026-08-16-d6-d8-dasc-acquisition-and-minedex-licence.md). Closure is
+  # exclusion evidence, never permission -- required_for_public_gate stays
+  # false and no evidence_files are named; the adjudication itself is the
+  # delegated verifier of record.
+  - claim_id: dmirs-001-minedex-closed
+    source_id: dmirs_001_minedex
+    resource_url: https://catalogue.data.wa.gov.au/dataset/minedex-dmirs-001
+    snapshot_date: "2026-08-16"
+    licence_state: gated_internal
+    evidence_files: {}
+    context: null
+    units: null
+    status: closed
+    delegated_verifier: "adjudicate-minedex-licence (D7, 2026-08-16)"
+    offline_runnable: false
+    required_for_public_gate: false
+
+  # -- dbca_060_fire: CC-BY-4.0, context-only use (D13 Batch F F3). Not
+  # required for the public gate; verified against the captured catalogue
+  # page's CC-BY licence badge.
+  - claim_id: dbca-060-fire-cc-by
+    source_id: dbca_060_fire
+    resource_url: https://catalogue.data.wa.gov.au/dataset/dbca-fire-history
+    snapshot_date: "2026-08-29"
+    licence_state: public
+    evidence_files:
+      catalogue-page.html: a708548bb5a5c1cfcc920c1caba878d68c7078db8b4f51ba56a6406205e9805b
+    context: "cc-by"
+    units: null
+    status: verified
+    delegated_verifier: null
+    offline_runnable: true
+    required_for_public_gate: false
+
+  # -- Sources verified only against their pinned catalogue/STAC record in
+  # licence.SOURCES, with no on-disk raw snapshot of their own (SILO, GFC,
+  # RDC boundaries) or whose licence is re-checked live-vs-pinned at fetch
+  # time (the DEA collections). Digest-only by construction: there is no
+  # local evidence file to hash, so the delegated verifier names where the
+  # pinned evidence actually lives.
+  - claim_id: silo-cc-by
+    source_id: silo
+    resource_url: https://www.longpaddock.qld.gov.au/silo/
+    snapshot_date: "2026-08-15"
+    licence_state: public
+    evidence_files: {}
+    context: null
+    units: null
+    status: digest_only
+    delegated_verifier: "pinned catalogue/licence note in licence.SOURCES; anonymous AWS open-data bucket (s3://silo-open-data) CC BY 4.0, no account/credential route"
+    offline_runnable: false
+    required_for_public_gate: false
+
+  - claim_id: hansen-gfc-cc-by
+    source_id: hansen_gfc
+    resource_url: https://glad.earthengine.app/view/global-forest-change
+    snapshot_date: "2026-08-15"
+    licence_state: public
+    evidence_files: {}
+    context: null
+    units: null
+    status: digest_only
+    delegated_verifier: "pinned catalogue/licence note in licence.SOURCES; CC-BY-4.0 conditional on the dual attribution_text credit strings"
+    offline_runnable: false
+    required_for_public_gate: false
+
+  - claim_id: wa-rdc-regions-cc-by
+    source_id: wa_rdc_regions
+    resource_url: https://catalogue.data.wa.gov.au/dataset/regional-development-commission-boundaries
+    snapshot_date: "2026-08-21"
+    licence_state: public
+    evidence_files: {}
+    context: null
+    units: null
+    status: digest_only
+    delegated_verifier: "pinned catalogue/licence note in licence.SOURCES; Data WA CKAN record for DPIRD-020, re-verified 2026-08-21"
+    offline_runnable: false
+    required_for_public_gate: false
+
+  - claim_id: dea-gm-ls5t-cc-by
+    source_id: dea_gm_ls5t
+    resource_url: https://explorer.dea.ga.gov.au/stac/collections/ga_ls5t_gm_cyear_3
+    snapshot_date: "2026-08-15"
+    licence_state: public
+    evidence_files: {}
+    context: null
+    units: null
+    status: digest_only
+    delegated_verifier: "pinned catalogue/licence note in licence.SOURCES; DEA STAC live-vs-pinned cross-check at fetch time"
+    offline_runnable: false
+    required_for_public_gate: false
+
+  - claim_id: dea-gm-ls7e-cc-by
+    source_id: dea_gm_ls7e
+    resource_url: https://explorer.dea.ga.gov.au/stac/collections/ga_ls7e_gm_cyear_3
+    snapshot_date: "2026-08-15"
+    licence_state: public
+    evidence_files: {}
+    context: null
+    units: null
+    status: digest_only
+    delegated_verifier: "pinned catalogue/licence note in licence.SOURCES; DEA STAC live-vs-pinned cross-check at fetch time"
+    offline_runnable: false
+    required_for_public_gate: false
+
+  - claim_id: dea-gm-ls8cls9c-cc-by
+    source_id: dea_gm_ls8cls9c
+    resource_url: https://explorer.dea.ga.gov.au/stac/collections/ga_ls8cls9c_gm_cyear_3
+    snapshot_date: "2026-08-15"
+    licence_state: public
+    evidence_files: {}
+    context: null
+    units: null
+    status: digest_only
+    delegated_verifier: "pinned catalogue/licence note in licence.SOURCES; DEA STAC live-vs-pinned cross-check at fetch time"
+    offline_runnable: false
+    required_for_public_gate: false
+
+  - claim_id: dea-fc-pc-cc-by
+    source_id: dea_fc_pc
+    resource_url: https://explorer.dea.ga.gov.au/stac/collections/ga_ls_fc_pc_cyear_3
+    snapshot_date: "2026-08-15"
+    licence_state: public
+    evidence_files: {}
+    context: null
+    units: null
+    status: digest_only
+    delegated_verifier: "pinned catalogue/licence note in licence.SOURCES; DEA STAC live-vs-pinned cross-check at fetch time"
+    offline_runnable: false
+    required_for_public_gate: false

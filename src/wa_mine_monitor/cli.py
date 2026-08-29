@@ -14,6 +14,7 @@ import functools
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import zipfile
@@ -52,6 +53,7 @@ from wa_mine_monitor import (
     manifests,
     maus_footprints,
     pixel_support,
+    public_rc,
     register,
     release,
     snapshots,
@@ -4317,6 +4319,334 @@ def export_release_cmd(
                 "n_rows": len(published),
                 "dropped_columns": dropped_columns,
                 "manifest_path": str(output_path) + manifests.MANIFEST_SUFFIX,
+            },
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+    )
+
+
+#: `--version` must match this before any I/O happens (D13 §8 P3): a
+#: CalVer-ish `YYYY.MM.DD` with an optional `-<suffix>` (a same-day
+#: respin), e.g. `2026.08.29` or `2026.08.29-hotfix`. Not validated as a
+#: real calendar date -- this is a release LABEL, not a date field -- so
+#: `9999.99.99` passes the regex; that is deliberate, the same way
+#: `--date`'s own `YYYY-MM-DD` check only shapes the string, and it is the
+#: version-directory immutability check (not this regex) that is the real
+#: guard against a re-run silently overwriting a prior release.
+_PUBLIC_RC_VERSION_PATTERN = re.compile(r"[0-9]{4}\.[0-9]{2}\.[0-9]{2}(-[a-z0-9]+)?")
+
+
+@app.command("build-tier0-public-rc")
+def build_tier0_public_rc_cmd(
+    config: Path = ConfigOption,
+    version: str = typer.Option(
+        ...,
+        "--version",
+        help="Immutable release version, e.g. 2026.08.29 (YYYY.MM.DD[-suffix]).",
+    ),
+) -> None:
+    """Build the two licence-clean Tier 0 public-RC fallback packages (D13 §8 P3).
+
+    Two small, source-derived reference layers -- DMIRS-003 tenements
+    geometry and the project's own Maus et al. v2 WA extract -- assembled by
+    `public_rc.assemble_tier0_tenements` / `assemble_tier0_maus` and cross-
+    checked by `public_rc.reconcile_packages`. See `public_rc.py`'s module
+    docstring for why these packages are NOT run through `export_gate.
+    export_public`: that function's geometry drop guards the MINEDEX-frame
+    register products, and D13 §8 P3 explicitly permits geometry in both
+    packages built here. "Tier 0 public-RC" names licence-clean reference-
+    layer fallbacks, never a public MINEDEX site register -- no MINEDEX-
+    derived aggregate is ever built or shipped by this command.
+
+    Mirrors `build-climate-context`'s shape: config load, git state, a
+    pre-I/O `--version` regex gate, a refuse-before-read guard on the
+    OUTPUT version directory (immutable -- a rebuild is a new `--version`,
+    never a re-run against the same one), then `_verify_snapshot_or_refuse`
+    on the LATEST `dmirs_003_tenements` and `maus_v2` raw snapshots (which
+    may carry different dates; both are recorded), assembly, reconciliation,
+    write, two run manifests, and a JSON echo. Every failure path -- a
+    missing snapshot (`register.NoSnapshotFoundError`), an unverified or
+    tampered snapshot, an unreadable shapefile/GeoPackage, a lineage or
+    schema-drift refusal from `public_rc`, a reconciliation mismatch, or a
+    write failure -- is translated to a structured JSON refusal and exit 1,
+    never an escaping traceback.
+
+    On success, writes into `<data_root>/releases/tier0-public-rc/<version>/`:
+    `tier0-tenements.parquet`, `tier0-maus-wa.parquet` (both GeoParquet, via
+    `GeoDataFrame.to_parquet` -- geometry-bearing, so `_write_table_or_refuse`
+    is not used here), `RELEASE_NOTES.md` (`public_rc.render_release_notes`,
+    registry-driven licence/attribution text, never hardcoded), and one
+    immutable run manifest per package. Each manifest's one `SourceAsset`
+    input records a snapshot-relative `uri` (never an absolute local path),
+    the sha256 `snapshots.snapshot_entries` recorded for that exact file at
+    finalize time, and the licence/redistribution fields from `licence.
+    SOURCES` -- the same registry-driven discipline `export-release` applies
+    to its own `SourceAsset`. Each package's `resolved_args` also records
+    `dropped_source_columns` (the assembly functions' disclosed
+    drop-with-disclosure lists -- open on the tenements side, the closed
+    `MAUS_BENIGN_SOURCE_COLUMNS` allowlist on the maus side), so a reader of
+    the manifest alone can see exactly which benign source columns (e.g.
+    `HOLDER1`, `ISO3_CODE`) never made it into the public artefact.
+    """
+    resolved: ProjectConfig = _load_config_or_exit(config)
+    git_state = _collect_git_state_disclosing_gaps(_REPO_ROOT)
+    data_root = resolved.run.data_root
+
+    # GATE 1 -- version string, BEFORE any I/O. An immutable release
+    # version is a label a human chooses, not something this command should
+    # ever compute or coerce -- a malformed value is refused here rather
+    # than silently accepted as a directory name that later tooling (the
+    # public-facing release index, `scripts/audit_release_payload.py`) may
+    # not expect.
+    if not _PUBLIC_RC_VERSION_PATTERN.fullmatch(version):
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"--version {version!r} does not match the required "
+                        f"{_PUBLIC_RC_VERSION_PATTERN.pattern!r} shape (YYYY.MM.DD[-suffix])"
+                    ),
+                    "stage": "bad_version",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+
+    # GATE 2 -- refuse-before-read: the OUTPUT version directory is checked
+    # BEFORE either raw snapshot is even looked up, the same ordering
+    # `export_release_cmd` applies to its own output -- a re-run against an
+    # already-published `--version` must not re-hash or re-read anything on
+    # its way to the refusal. A published Tier 0 version is immutable by
+    # design: a rebuild is always a NEW `--version`, never an overwrite.
+    output_dir = data_root / "releases" / "tier0-public-rc" / version
+    if output_dir.exists():
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"release version {version!r} already exists at {output_dir} -- "
+                        "Tier 0 public-RC versions are immutable; build a new --version "
+                        "to publish a rebuild rather than overwriting this one"
+                    ),
+                    "stage": "version_exists",
+                    "output_dir": str(output_dir),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+
+    # GATE 3 -- latest raw snapshots for both sources must exist at all.
+    try:
+        tenements_snapshot_dir = register.latest_snapshot(data_root, "dmirs_003_tenements")
+        maus_snapshot_dir = register.latest_snapshot(data_root, "maus_v2")
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(
+            json.dumps(
+                {"refusal": str(exc), "stage": "snapshot_missing"},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+
+    # GATE 4 -- integrity-verify both snapshots BEFORE either is read, the
+    # same digest-verification discipline `build_register_cmd`/`build_
+    # climate_context_cmd` apply to their own raw inputs.
+    tenements_verification = _verify_snapshot_or_refuse(
+        tenements_snapshot_dir,
+        source_id="dmirs_003_tenements",
+        required_files=(TENEMENTS_ZIP_FILENAME,),
+    )
+    maus_verification = _verify_snapshot_or_refuse(
+        maus_snapshot_dir, source_id="maus_v2", required_files=("wa_extract.gpkg",)
+    )
+
+    tenements_zip_path = tenements_snapshot_dir / TENEMENTS_ZIP_FILENAME
+    maus_path = maus_snapshot_dir / "wa_extract.gpkg"
+    tenements_date = tenements_snapshot_dir.name
+    maus_date = maus_snapshot_dir.name
+
+    # Both frames are read FULL -- never pre-selected -- so `public_rc`'s
+    # lineage gate sees every input column; see `public_rc.py`'s module
+    # docstring point 1 and `assemble_tier0_tenements`/`assemble_tier0_maus`'s
+    # own docstrings for why a caller that pre-selects columns here would
+    # blind that gate.
+    try:
+        tenements_gdf = gpd.read_file(
+            f"/vsizip/{tenements_zip_path}/{TENEMENTS_SHAPEFILE_BASENAME}.shp"
+        )
+    except (zipfile.BadZipFile, pyogrio.errors.DataSourceError, OSError) as exc:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": str(exc),
+                    "stage": "source_read",
+                    "tenements_zip": str(tenements_zip_path),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+
+    try:
+        maus_gdf = gpd.read_file(maus_path)
+    except (pyogrio.errors.DataSourceError, OSError) as exc:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": str(exc),
+                    "stage": "source_read",
+                    "maus_gpkg": str(maus_path),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+
+    try:
+        tenements_frame, dropped_source_columns = public_rc.assemble_tier0_tenements(
+            tenements_gdf, snapshot_date=tenements_date
+        )
+        maus_frame, maus_dropped_source_columns = public_rc.assemble_tier0_maus(
+            maus_gdf, snapshot_date=maus_date
+        )
+    except public_rc.PublicRcError as exc:
+        typer.echo(
+            json.dumps(
+                {"refusal": str(exc), "stage": "assembly"},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+
+    try:
+        counts = public_rc.reconcile_packages(
+            tenements_frame,
+            maus_frame,
+            n_tenements_source=len(tenements_gdf),
+            n_maus_source=len(maus_gdf),
+        )
+    except public_rc.PublicRcError as exc:
+        typer.echo(
+            json.dumps(
+                {"refusal": str(exc), "stage": "reconciliation"},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    tenements_path = output_dir / "tier0-tenements.parquet"
+    maus_output_path = output_dir / "tier0-maus-wa.parquet"
+    try:
+        tenements_frame.to_parquet(tenements_path)
+        maus_frame.to_parquet(maus_output_path)
+    except OSError as exc:
+        typer.echo(
+            json.dumps(
+                {"refusal": str(exc), "stage": "write"},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+
+    release_notes = public_rc.render_release_notes(version, tenements_date, maus_date)
+    (output_dir / "RELEASE_NOTES.md").write_text(release_notes, encoding="utf-8")
+
+    tenements_entries = snapshots.snapshot_entries(tenements_snapshot_dir)
+    maus_entries = snapshots.snapshot_entries(maus_snapshot_dir)
+    tenements_source = licence.SOURCES["dmirs_003_tenements"]
+    maus_source = licence.SOURCES["maus_v2"]
+
+    # These two manifests ship INSIDE the public release payload itself
+    # (`public_audit.audit_release_dir` scans every file under `output_dir`,
+    # `*.run_manifest.json` included) -- unlike every other command's
+    # manifest, which stays in the private `data_root` tree. The full
+    # `resolved_config` every other command embeds carries this project's
+    # internal `sources.minedex_public_export_blocked` field, which itself
+    # contains the literal substring "minedex" and would trip `public_audit`'s
+    # MINEDEX-lineage content check on a file the audit is supposed to pass
+    # clean -- so only the one config fact `write_run_manifest` actually
+    # needs (`data_root`, for root-relativising `output.path`/`inputs[].uri`)
+    # is passed here, never the full internal config.
+    public_manifest_config: dict[str, Any] = {"run": {"data_root": str(data_root)}}
+
+    try:
+        manifests.write_run_manifest(
+            output=tenements_path,
+            inputs=[
+                SourceAsset(
+                    uri=f"raw/dmirs_003_tenements/{tenements_date}/{TENEMENTS_ZIP_FILENAME}",
+                    sha256=tenements_entries[TENEMENTS_ZIP_FILENAME],
+                    collection=None,
+                    snapshot_date=dt_date.fromisoformat(tenements_date),
+                    licence=tenements_source.licence_id,
+                    redistribute_public=tenements_source.redistribute_public,
+                ),
+            ],
+            config=public_manifest_config,
+            git_state=git_state,
+            resolved_args={
+                "version": version,
+                "tenements_snapshot_date": tenements_date,
+                "maus_snapshot_date": maus_date,
+                "tenements_snapshot_verification": tenements_verification,
+                "dropped_source_columns": dropped_source_columns,
+            },
+        )
+        manifests.write_run_manifest(
+            output=maus_output_path,
+            inputs=[
+                SourceAsset(
+                    uri=f"raw/maus_v2/{maus_date}/wa_extract.gpkg",
+                    sha256=maus_entries["wa_extract.gpkg"],
+                    collection=None,
+                    snapshot_date=dt_date.fromisoformat(maus_date),
+                    licence=maus_source.licence_id,
+                    redistribute_public=maus_source.redistribute_public,
+                ),
+            ],
+            config=public_manifest_config,
+            git_state=git_state,
+            resolved_args={
+                "version": version,
+                "tenements_snapshot_date": tenements_date,
+                "maus_snapshot_date": maus_date,
+                "maus_snapshot_verification": maus_verification,
+                "dropped_source_columns": maus_dropped_source_columns,
+            },
+        )
+    except FileExistsError as exc:
+        # Same residual-race translation `export_release_cmd` applies at its
+        # own manifest write: the pre-flight `output_dir.exists()` check
+        # above cannot close a race against a concurrent run.
+        typer.echo(json.dumps({"refusal": str(exc), "stage": "write"}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    typer.echo(
+        json.dumps(
+            {
+                "version": version,
+                "tenements_path": str(tenements_path),
+                "maus_path": str(maus_output_path),
+                "tenements_manifest_path": str(tenements_path) + manifests.MANIFEST_SUFFIX,
+                "maus_manifest_path": str(maus_output_path) + manifests.MANIFEST_SUFFIX,
+                "counts": counts,
+                "tenements_snapshot_date": tenements_date,
+                "maus_snapshot_date": maus_date,
+                "dropped_source_columns": dropped_source_columns,
+                "maus_dropped_source_columns": maus_dropped_source_columns,
             },
             indent=2,
             sort_keys=True,
