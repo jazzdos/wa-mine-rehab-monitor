@@ -195,6 +195,11 @@ SYNTHETIC_FIXTURE_ALLOWLIST: frozenset[str] = frozenset(
 #:   amount of editing the file's *behaviour* can avoid, since the leak
 #:   this rule exists to catch is a substring of the rule's own
 #:   definition.
+#: - `.gitleaks.toml` is the full-history secret-scan config (D13 §8 P4,
+#:   checkpoint field `full_history_secret_scan_passed`). Its allowlist
+#:   regexes must quote the synthetic planted fixtures verbatim to exempt
+#:   them, so the file is a structural self-match for the same reason as
+#:   `public_audit.py` above.
 #: - The rest are tests (`tests/test_http.py`, `tests/test_manifests.py`,
 #:   `tests/test_public_audits.py`, `tests/test_secrets.py`) and docs
 #:   (`docs/plans/2026-08-29-public-rc-lane.md`,
@@ -206,9 +211,10 @@ SYNTHETIC_FIXTURE_ALLOWLIST: frozenset[str] = frozenset(
 #:
 #: A new file must be reviewed and added deliberately, exactly like
 #: `SYNTHETIC_FIXTURE_ALLOWLIST` -- this list narrows the credential rule
-#: only for these seven paths, not for any pattern of path or content.
+#: only for these named paths, not for any pattern of path or content.
 CREDENTIAL_FALSE_POSITIVE_ALLOWLIST: frozenset[str] = frozenset(
     {
+        ".gitleaks.toml",
         "src/wa_mine_monitor/public_audit.py",
         "tests/test_http.py",
         "tests/test_manifests.py",

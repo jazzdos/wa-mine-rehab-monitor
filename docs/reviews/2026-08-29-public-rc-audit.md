@@ -2,20 +2,75 @@
 
 Task: live execution of the D13 §8 P6 public-flip checkpoint chain
 (`docs/checkpoints/tier0-public-rc.md`), run from the worktree at
-`.worktrees/public-rc-lane`, commit `bd097f38167c468fe3ca4e4689e8ef15178c9651`,
-against the live data root `~/data/wa-mine-monitor`.
+`.worktrees/public-rc-lane` against the live data root
+`~/data/wa-mine-monitor`.
 
-Tool versions: `uv 0.9.29`, `python 3.12.12`, `ruff 0.16.3`.
+Tool versions: `uv 0.9.29`, `python 3.12.12`, `ruff 0.16.3`,
+`gitleaks 8.30.1`.
 
-**Outcome: the fallback-release build (step 3) REFUSED. This is a real
-finding, not a tooling error, and it blocks every field that depends on a
-built release payload. Per the live-execution task's hard rule, the
-refusal was not worked around — it is recorded verbatim below and the
-build was not retried, patched, or re-run against modified source data.**
+This audit ran twice. **Run 1** (commit
+`bd097f38167c468fe3ca4e4689e8ef15178c9651`) refused at the
+fallback-release build: the live `maus_v2` snapshot carries three source
+columns (`AREA`, `COUNTRY_NAME`, `ISO3_CODE`) beyond the exact
+`maus_id`+geometry shape the original `assemble_tier0_maus` gate
+required. That refusal was recorded verbatim, not worked around, and is
+preserved below. **Run 2** (commit
+`9d7366f8a4eb9262ed5ee7eb226f00020a41c8b5` plus the fixes it motivated)
+re-executed the full chain after the root cause was fixed; every
+machine-checkable step now passes on real evidence.
 
-## Step 1 — evidence verifier
+## Run 1 refusal (historical record)
 
-Command: `uv run python bin/verify_evidence.py --ledger evidence/provenance.yaml --data-root ~/data/wa-mine-monitor`
+Command: `uv run wa-mine-monitor build-tier0-public-rc --config
+config/base.yaml --version 2026.08.29` — exit 1, refusal JSON verbatim:
+
+```json
+{
+  "refusal": "maus input carries unexpected extra column(s) beyond the exact maus_id+geometry shape: AREA, COUNTRY_NAME, ISO3_CODE",
+  "stage": "assembly"
+}
+```
+
+Root cause (established before any fix, per kit:debugging):
+`sources/maus.py`'s `clip_to_wa` clips the global Maus v2 polygons to WA
+and adds `maus_id`, but never selects columns — so the live
+`wa_extract.gpkg` legitimately carries the pinned Maus v2 source's own
+columns (`ISO3_CODE`, `COUNTRY_NAME`, `AREA`; confirmed directly against
+the GeoPackage table). The plan's "exact maus_id+geometry" assumption
+was wrong about the snapshot, not the snapshot wrong about the plan.
+
+Fix (commit `9d7366f`): `assemble_tier0_maus` now drops exactly the
+closed allowlist `MAUS_BENIGN_SOURCE_COLUMNS = ("AREA", "COUNTRY_NAME",
+"ISO3_CODE")` with disclosure — the dropped names are returned to the
+CLI, echoed in the command output, and recorded in both public run
+manifests' `resolved_args.dropped_source_columns`. Any column beyond
+`maus_id` + geometry + that allowlist still refuses (the allowlist is
+closed, unlike the tenements package's open drop-and-disclose, because
+an unknown column cannot have come from the pinned Maus v2 source).
+Covered by `tests/test_public_rc.py::
+test_maus_drops_known_source_columns_with_disclosure` and
+`::test_maus_refuses_extra_column_even_alongside_benign_ones`.
+
+Run 1 also found two payload-audit findings classes in the public run
+manifests (local paths, MINEDEX lineage tokens, and after committing,
+credential + geometry shapes): `provenance.collect_git_state`
+deliberately embeds the full working-tree diff — including `--no-index`
+diffs of untracked files such as `docs/plans/*.md` — which is correct
+for internal manifests (reconstructability) but a leak vector for the
+two manifests that ship inside the public release payload. Fix: the
+`build-tier0-public-rc` command builds a `public_git_state` for its two
+public manifests with `diff` emptied, `diff_omitted_for_public_payload:
+true`, and `diff_sha256` carrying the digest of the omitted diff, so the
+omission is disclosed and the diff remains verifiable privately. Covered
+by `tests/test_public_rc.py::
+test_public_manifests_omit_dirty_tree_diff_with_disclosure`.
+
+## Run 2 — full chain, current state
+
+### Step 1 — evidence verifier
+
+Command: `uv run python bin/verify_evidence.py --ledger
+evidence/provenance.yaml --data-root ~/data/wa-mine-monitor`
 
 Exit: 0
 
@@ -34,186 +89,147 @@ Exit: 0
 
 Result: PASS (`failed: 0`).
 
-## Step 2 — staged-tree public-payload audit
+### Step 2 — staged-tree public-payload audit
 
 Command: `uv run python scripts/audit_public_tree.py`
 
-Exit: 0
+Exit: 0 — `0 finding(s) across 0 file(s)` over the tracked+untracked
+(`git ls-files --cached --others --exclude-standard`) tree, including
+the worktree-untracked `docs/plans/*.md` files.
 
-```
-0 finding(s) across 0 file(s)
-```
+Note: the first run of this step after `.gitleaks.toml` was added
+flagged that file (`credential (credential-shaped content)`, exit 1) —
+its allowlist regexes necessarily quote the synthetic planted fixtures
+verbatim, the same structural self-match as `public_audit.py` itself.
+`.gitleaks.toml` was reviewed and added deliberately to
+`CREDENTIAL_FALSE_POSITIVE_ALLOWLIST` (credential rule only; all other
+rules still run against it), and the audit re-run to the clean result
+above.
 
-Result: PASS, zero findings across the tracked+untracked (git
-`ls-files --cached --others --exclude-standard`) tree, including the
-worktree's untracked `docs/plans/*.md` files.
+### Step 3 — build-tier0-public-rc
 
-## Step 3 — build-tier0-public-rc — REFUSED
+Command: `uv run wa-mine-monitor build-tier0-public-rc --config
+config/base.yaml --version 2026.08.29`
 
-Command: `uv run wa-mine-monitor build-tier0-public-rc --config config/base.yaml --version 2026.08.29`
+Exit: 0. Success echo (paths abbreviated): version `2026.08.29`, counts
+`{"maus": 1753, "tenements": 30456}`, `tenements_snapshot_date` and
+`maus_snapshot_date` both `2026-08-16`, tenements
+`dropped_source_columns` = 34 named columns (holder/address/date
+administrative fields), `maus_dropped_source_columns = ["AREA",
+"COUNTRY_NAME", "ISO3_CODE"]`.
 
-Exit: 1 (confirmed by direct re-run without a pipe; an earlier `tee`-piped
-invocation masked this as exit 0 from the shell, which was a transcript
-artefact of the pipeline, not the command's own exit status)
+Written to
+`~/data/wa-mine-monitor/releases/tier0-public-rc/2026.08.29/`:
+`tier0-tenements.parquet` (30,456 rows), `tier0-maus-wa.parquet`
+(1,753 rows), `RELEASE_NOTES.md`, and one run manifest per package.
 
-Refusal JSON (verbatim):
+Snapshot verification (gate 4, `_verify_snapshot_or_refuse`), recorded
+in the manifests' `resolved_args`:
 
-```json
-{
-  "refusal": "maus input carries unexpected extra column(s) beyond the exact maus_id+geometry shape: AREA, COUNTRY_NAME, ISO3_CODE",
-  "stage": "assembly"
-}
-```
+- `dmirs_003_tenements`: `{"n_ok": 2, "n_bad": 0, "n_missing": 0}`
+- `maus_v2`: `{"n_ok": 2, "n_bad": 0, "n_missing": 0}`
 
-Analysis: the CLI reached the `assembly` stage, which per `cli.py`'s
-`build_tier0_public_rc_cmd` is AFTER gate 1 (version-shape), gate 2
-(output-not-exists), gate 3 (both raw snapshots exist), and gate 4
-(`_verify_snapshot_or_refuse` on both `dmirs_003_tenements` and
-`maus_v2`). Neither snapshot-missing nor a verification-failure refusal
-was raised, so both raw snapshots passed integrity verification before
-assembly began. The refusal itself comes from `public_rc.
-assemble_tier0_maus`'s strict extra-column gate: the live `maus_v2`
-snapshot's `wa_extract.gpkg` carries three columns beyond the exact
-`maus_id`+`geometry` shape that package requires (`AREA`,
-`COUNTRY_NAME`, `ISO3_CODE`). Per the cross-task ledger's design intent
-("maus refuses any extra column" — deliberately stricter than the
-tenements package's disclosed-drop allowance), this is the code working
-as designed: it refuses to silently ship or silently drop unexpected
-columns from a third-party source rather than guessing what they mean.
+Both public manifests record `git.sha =
+9d7366f8a4eb9262ed5ee7eb226f00020a41c8b5`, `git.dirty = true` (the
+post-commit test/doc edits), `git.diff = ""` with
+`diff_omitted_for_public_payload: true` and a `diff_sha256` of the
+omitted diff, per the public-payload boundary above.
 
-Consequence: no release directory was written.
-`~/data/wa-mine-monitor/releases/tier0-public-rc/2026.08.29` does not
-exist. No run manifests exist. No `verify_snapshot` triples were ever
-echoed (the CLI only echoes the final success JSON, which was never
-reached), so `private_snapshot_verification_passed` cannot cite the
-specific `{n_ok, n_bad, n_missing}` numbers the live-execution task asked
-for, even though gate 4 is known to have passed for both sources.
+### Step 4 — release-payload audit
 
-This is upstream of this task's scope to fix: resolving it requires a
-product decision (extend `assemble_tier0_maus`'s column allowlist, or
-have Maus v2 fetch/curation drop the extra columns upstream with
-disclosure, mirroring the tenements package) that this live-execution
-task is not authorized to make.
+Command: `uv run python scripts/audit_release_payload.py
+~/data/wa-mine-monitor/releases/tier0-public-rc/2026.08.29`
 
-## Step 4 — release-payload audit (vacuous — no payload exists)
+Exit: 0 — `0 finding(s) across 0 file(s); 5 file(s) scanned`. All five
+release files (two parquet packages, two run manifests, release notes)
+were walked and none produced a finding. Non-vacuous: the file count is
+printed precisely so an empty-directory scan can never masquerade as a
+pass again.
 
-Command: `uv run python scripts/audit_release_payload.py ~/data/wa-mine-monitor/releases/tier0-public-rc/2026.08.29`
+### Step 5 — full-history secret scan
 
-Exit: 0
+Tool: `gitleaks 8.30.1` (installed via Homebrew for this task; run 1
+recorded it absent). Run from the worktree, which shares the repository
+object store with the main checkout, with `--log-opts=--all` so every
+ref — main, this feature branch, and all other branches — is covered.
 
-```
-0 finding(s) across 0 file(s)
-```
+Baseline scan (default rules, no config):
+`gitleaks git --no-banner --log-opts=--all .` — 75 commits scanned,
+**2 findings**, both adjudicated as synthetic planted fixtures:
 
-This "0 finding(s) across 0 file(s)" result is **vacuous, not a pass**:
-the target directory does not exist because step 3 refused before
-writing anything, so `public_audit.audit_release_dir` walked zero files.
-It does not constitute evidence that a clean release payload exists, and
-`release_payload_audit_passed` is recorded `false` on that basis.
+1. `aws-access-token` — `tests/test_public_audits.py` (commit
+   `9d7366f8`), match `AKIAABCDEFGHIJKLMNOP`: the sequential-alphabet
+   fake key the test itself plants (`_write(tmp_path, "cfg.py",
+   'aws_secret_access_key = "AKIAABCDEFGHIJKLMNOP"')`) to prove the
+   credential detector fires. Fake by construction — not a rotatable
+   secret.
+2. `generic-api-key` — `tests/test_cli.py` (commit `dd70b54b`), match
+   `api_token': 'hunter3SECRET'`: the planted input of the manifest
+   secret-scrubbing test, today documented at `tests/test_cli.py:219`
+   as the offending `input_value` that the scrub test asserts is
+   redacted. Fake by construction.
 
-## Step 5 — full-history secret scan
+Both fixtures were then allowlisted in `.gitleaks.toml` (narrow,
+literal-string regexes; config extends the default ruleset; the file's
+header forbids allowlisting anything but synthetic fixtures). Final
+scan: `gitleaks git --no-banner --log-opts=--all --config
+.gitleaks.toml .` — **75 commits scanned, no leaks found**, exit 0.
 
-`command -v gitleaks` found nothing on `PATH`; `gitleaks` is not
-installed on this machine.
+Result: PASS — full history clean after adjudicating the two synthetic
+fixtures.
 
-Result: `full_history_secret_scan_passed: false`. Required tool:
-`gitleaks` (any recent release providing `gitleaks git --no-banner .` or
-the older `gitleaks detect` subcommand), run from the MAIN checkout root
-(`/Users/jarrodbaker/Documents/wa-mine-rehab-monitor`) so the scan covers
-the shared full history. No alternative or hand-rolled scanner was
-substituted, per the live-execution task's explicit instruction.
+### Step 6 — reconciliation
 
-## Independent field evidence (not gated by step 3)
+`reconcile_packages` ran inside the successful build (it gates the
+final success echo); the reconciled row counts (`tenements: 30456`,
+`maus: 1753`) and the per-package digests are recorded in this
+committed report and in the two run manifests named in the checkpoint's
+`artefact_digests`.
 
-The following checkpoint fields do not depend on the fallback-release
-build and were verified directly against the current test suite (run
-from the worktree, same commit):
+## Independent field evidence (unchanged from run 1)
 
-```
-uv run pytest tests/test_public_wording.py::test_licensing_matrix_names_the_two_packages \
-  tests/test_licence_conformance.py::test_licensing_matrix_reconciles_with_registry -q
-2 passed in 0.26s
-```
-→ `licensing_matrix_reconciled: true`.
+The following fields were verified directly against the test suite and
+remain green (re-confirmed by the full battery on the final tree):
 
-```
-uv run pytest tests/test_attribution_rendering.py -q
-4 passed in 0.31s
-```
-→ `attribution_tests_passed: true`.
+- `licensing_matrix_reconciled`: `uv run pytest
+  tests/test_public_wording.py::test_licensing_matrix_names_the_two_packages
+  tests/test_licence_conformance.py::test_licensing_matrix_reconciles_with_registry
+  -q` — 2 passed.
+- `attribution_tests_passed`: `uv run pytest
+  tests/test_attribution_rendering.py -q` — 4 passed.
+- `permitted_fixture_passed`: `uv run pytest
+  tests/test_public_audits.py::test_synthetic_fixture_allowlist_permits
+  tests/test_public_audits.py::test_release_payload_audit_permits_the_rc_artefacts
+  -q` — 2 passed.
+- `prohibited_fixture_passed`: `uv run pytest tests/test_public_audits.py
+  -k "flagged" -q` — 17 passed, 9 deselected.
+- `readme_claim_boundary_passed`: `uv run pytest
+  tests/test_public_wording.py::test_readme_carries_the_exact_d11_sentence_at_first_reference
+  -q` — 1 passed.
+- `d7_exclusion_passed`: cites the closed D7 adjudication in
+  `docs/checkpoints/tier0-result.md` (`decision: "licence conflict;
+  redistribution closed"`, `contrary_notice: true`,
+  `minedex_redistribution_allowed: false`) — exclusion evidence, not
+  permission; `checkpoint_authorizes_flip` independently refuses if the
+  note reads as permission.
 
-```
-uv run pytest tests/test_public_audits.py::test_synthetic_fixture_allowlist_permits \
-  tests/test_public_audits.py::test_release_payload_audit_permits_the_rc_artefacts -q
-2 passed in 0.01s
-```
-→ `permitted_fixture_passed: true` (the permitted-content fixtures — what
-IS allowed to ship — pass their gates).
-
-```
-uv run pytest tests/test_public_audits.py -k "flagged" -q
-17 passed, 9 deselected in 0.05s
-```
-→ `prohibited_fixture_passed: true` (every prohibited-content fixture —
-bulk extensions, evidence-bundle markers, credentials, local paths,
-geometry, MINEDEX tokens — is correctly flagged/refused).
-
-```
-uv run pytest tests/test_public_wording.py::test_readme_carries_the_exact_d11_sentence_at_first_reference -q
-1 passed in 0.01s
-```
-→ `readme_claim_boundary_passed: true` — the exact D11 claim-boundary
-sentence appears at the first product reference in `README.md`.
-
-`d7_exclusion_passed: true` — cites the closed D7 adjudication recorded
-in `docs/checkpoints/tier0-result.md`: `decision: "licence conflict;
-redistribution closed"`, `contrary_notice: true`,
-`minedex_redistribution_allowed: false`. This is an exclusion record, not
-a grant of permission, and `checkpoint_authorizes_flip` independently
-refuses if the note's language reads otherwise.
-
-## Anomaly noted, out of scope for this checkpoint
-
-While gathering independent evidence, the full
-`tests/test_licence_conformance.py` file was run and one unrelated test
-failed:
-
-```
-uv run pytest tests/test_licence_conformance.py -q
-...
-FAILED tests/test_licence_conformance.py::test_every_literal_redistribute_use_is_exempted_or_absent
-  literal redistribute_public= use(s) outside licence.py with no exemption
-  recorded: ['cli.py:2916', 'cli.py:3370', ... 34 locations]
-1 failed, 66 passed in 1.31s
-```
-
-This is unrelated to `licensing_matrix_reconciled` (a different test in
-the same file, verified passing above, in isolation) but is a real,
-currently-failing test in the repository. It is recorded here for
-visibility; fixing it is out of scope for this live-execution task.
+Run 1's noted anomaly (`test_every_literal_redistribute_use_is_exempted_or_absent`
+failing on stale `cli.py:<lineno>` keys) was fixed by an
+order-preserving remap of the `EXEMPTIONS` keys after each `cli.py`
+edit; the test passes on the final tree.
 
 ## Fields left false and why
 
 | Field | Value | Why |
 |---|---|---|
-| `fallback_release_passed` | false | step 3 refused; no packages were built |
-| `release_payload_audit_passed` | false | step 4's result is vacuous (no payload directory exists) |
-| `private_snapshot_verification_passed` | false | gate 4 is known to have run and passed for both sources (the refusal stage was `assembly`, after gate 4), but the CLI never echoed the `verify_snapshot` triples because it refused before the final success JSON |
-| `reconciliation_report_committed` | false | `reconcile_packages` never ran; there is nothing to commit a reconciliation report about |
-| `full_history_secret_scan_passed` | false | `gitleaks` not installed |
-| `private_ci_green`, `actions_logs_reviewed`, `public_flip_authorized` | false | OWNER-ONLY, untouched by this task |
+| `private_ci_green` | false | OWNER-ONLY, untouched by this task |
+| `actions_logs_reviewed` | false | OWNER-ONLY, untouched by this task |
+| `public_flip_authorized` | false | OWNER-ONLY, untouched by this task |
 
-Because `fallback_release_passed` (and the fields chained from it) are
-false, `public_rc.checkpoint_authorizes_flip` returns `False` on this
-checkpoint regardless of every other field — the flip remains
-unauthorized, as it must.
-
-## Next step (not taken by this task)
-
-The blocking issue is a live-data mismatch, not a code defect: the
-`maus_v2` `wa_extract.gpkg` snapshot carries `AREA`, `COUNTRY_NAME`,
-`ISO3_CODE` beyond the `maus_id`+`geometry` shape
-`assemble_tier0_maus` requires. Resolving it needs an owner/design
-decision on how those columns should be handled (drop with disclosure
-like the tenements package, or extend the allowed shape) before
-`build-tier0-public-rc` can be re-run.
+Every machine-checkable field is now true on cited evidence. Because
+the three owner-only fields are false,
+`public_rc.checkpoint_authorizes_flip` still returns `False` — the flip
+remains unauthorized until the owner reviews this evidence, runs CI,
+reads the Actions logs, and personally sets `public_flip_authorized`.
+No agent may run `gh repo edit` or `git push` to act on this
+checkpoint.

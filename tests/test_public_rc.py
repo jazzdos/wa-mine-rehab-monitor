@@ -379,6 +379,45 @@ def _invoke_build_public_rc(cfg_file: Path, *, version: str):
     )
 
 
+def test_public_manifests_omit_dirty_tree_diff_with_disclosure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The two run manifests ship INSIDE the public payload; the internal
+    # convention of embedding the full working-tree diff (tracked AND
+    # untracked, provenance.collect_git_state) would ship arbitrary
+    # uncommitted bytes -- plan docs, local paths -- inside a public
+    # artefact. The public manifests must keep sha/dirty, empty the diff,
+    # and disclose the omission plus the omitted bytes' sha256.
+    cfg_file, data_root = _seed_public_rc_world(tmp_path, monkeypatch)
+    dirty_diff = "diff --git a/docs/plans/x.md b/docs/plans/x.md\n+/Users/someone/secret"
+    monkeypatch.setattr(
+        cli_module,
+        "collect_git_state",
+        lambda repo_root: {"sha": "testsha", "dirty": True, "diff": dirty_diff},
+    )
+    result = _invoke_build_public_rc(cfg_file, version="2026.08.29")
+    assert result.exit_code == 0, result.output
+
+    import hashlib as _hashlib
+
+    for name in ("tier0-tenements.parquet", "tier0-maus-wa.parquet"):
+        manifest_path = (
+            data_root / "releases" / "tier0-public-rc" / "2026.08.29" / f"{name}.run_manifest.json"
+        )
+        manifest = json.loads(manifest_path.read_text())
+        git = manifest["git"]
+        assert git["diff"] == ""
+        assert git["diff_omitted_for_public_payload"] is True
+        assert git["diff_sha256"] == _hashlib.sha256(dirty_diff.encode("utf-8")).hexdigest()
+        assert git["dirty"] is True
+        assert "secret" not in manifest_path.read_text()
+
+    audit_findings = public_audit.audit_release_dir(
+        data_root / "releases" / "tier0-public-rc" / "2026.08.29"
+    )
+    assert audit_findings == []
+
+
 def test_build_tier0_public_rc_happy_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg_file, data_root = _seed_public_rc_world(tmp_path, monkeypatch)
 

@@ -35,7 +35,7 @@ MATRIX_PATH = REPO_ROOT / "docs" / "licensing-matrix.md"
 #: explicitly rather than leaving the mapping unexplained.
 EXEMPTIONS: dict[str, tuple[tuple[str, ...], str]] = {
     # -- wa_rdc_regions: fetched directly, matches the registry's PUBLIC state.
-    "cli.py:5257": (
+    "cli.py:5279": (
         ("wa_rdc_regions",),
         (
             "fetch-rdc-regions' own SourceAsset for the freshly captured download; "
@@ -45,7 +45,7 @@ EXEMPTIONS: dict[str, tuple[tuple[str, ...], str]] = {
     # -- register.parquet input assets: register mixes MINEDEX (gated) with
     # tenements (public); every run-manifest entry for register_path is
     # pinned closed because dmirs_001_minedex is in its lineage.
-    "cli.py:2916": (
+    "cli.py:2917": (
         ("dmirs_001_minedex",),
         (
             "register_path input asset to build-crosswalk; register's lineage "
@@ -53,28 +53,28 @@ EXEMPTIONS: dict[str, tuple[tuple[str, ...], str]] = {
             "field left None here."
         ),
     ),
-    "cli.py:3370": (
+    "cli.py:3371": (
         ("dmirs_001_minedex",),
         (
             "register_path input asset to build-climate-context; licence is read "
             "directly from SOURCES['dmirs_001_minedex'].licence_id."
         ),
     ),
-    "cli.py:3781": (
+    "cli.py:3782": (
         ("dmirs_001_minedex",),
         (
             "register_path input asset to build-fire-context; licence is read "
             "directly from SOURCES['dmirs_001_minedex'].licence_id."
         ),
     ),
-    "cli.py:4745": (
+    "cli.py:4767": (
         ("dmirs_001_minedex",),
         (
             "register_path input asset to build-register's own manifest; licence "
             "is read directly from SOURCES['dmirs_001_minedex'].licence_id."
         ),
     ),
-    "cli.py:5108": (
+    "cli.py:5130": (
         ("dmirs_001_minedex",),
         (
             "register_path input asset to build-d3-inputs; register's lineage "
@@ -82,7 +82,7 @@ EXEMPTIONS: dict[str, tuple[tuple[str, ...], str]] = {
             "field left None here."
         ),
     ),
-    "cli.py:6449": (
+    "cli.py:6471": (
         ("dmirs_001_minedex",),
         (
             "register_path input asset to build-d3-threshold; register's lineage "
@@ -90,7 +90,7 @@ EXEMPTIONS: dict[str, tuple[tuple[str, ...], str]] = {
             "field left None here."
         ),
     ),
-    "cli.py:7265": (
+    "cli.py:7287": (
         ("dmirs_001_minedex",),
         (
             "register_path input asset re-recorded in build-register's own "
@@ -98,7 +98,7 @@ EXEMPTIONS: dict[str, tuple[tuple[str, ...], str]] = {
             "SOURCES['dmirs_001_minedex'].licence_id."
         ),
     ),
-    "cli.py:7839": (
+    "cli.py:7861": (
         ("dmirs_001_minedex",),
         (
             "register_path input asset to the D3 extraction loop; licence is "
@@ -107,35 +107,35 @@ EXEMPTIONS: dict[str, tuple[tuple[str, ...], str]] = {
     ),
     # -- crosswalk.parquet input assets: crosswalk is register x maus, so it
     # inherits MINEDEX's gated state.
-    "cli.py:3378": (
+    "cli.py:3379": (
         ("dmirs_001_minedex",),
         (
             "crosswalk_path input asset to build-climate-context; crosswalk is "
             "derived from register (MINEDEX-bearing) x maus, so it stays closed."
         ),
     ),
-    "cli.py:3789": (
+    "cli.py:3790": (
         ("dmirs_001_minedex",),
         (
             "crosswalk_path input asset to build-fire-context; crosswalk is "
             "derived from register (MINEDEX-bearing) x maus, so it stays closed."
         ),
     ),
-    "cli.py:5116": (
+    "cli.py:5138": (
         ("dmirs_001_minedex",),
         (
             "crosswalk_path input asset to build-d3-inputs; crosswalk is derived "
             "from register (MINEDEX-bearing) x maus, so it stays closed."
         ),
     ),
-    "cli.py:6457": (
+    "cli.py:6479": (
         ("dmirs_001_minedex",),
         (
             "crosswalk_path input asset to build-d3-threshold; crosswalk is "
             "derived from register (MINEDEX-bearing) x maus, so it stays closed."
         ),
     ),
-    "cli.py:7273": (
+    "cli.py:7295": (
         ("dmirs_001_minedex",),
         (
             "crosswalk_path input asset re-recorded in build-register's own "
@@ -143,7 +143,7 @@ EXEMPTIONS: dict[str, tuple[tuple[str, ...], str]] = {
             "closed."
         ),
     ),
-    "cli.py:7847": (
+    "cli.py:7869": (
         ("dmirs_001_minedex",),
         (
             "crosswalk_path input asset to the D3 extraction loop; crosswalk is "
@@ -157,7 +157,7 @@ EXEMPTIONS: dict[str, tuple[tuple[str, ...], str]] = {
     # folds into another export, so these run manifests (climate-context,
     # fire-context, d3-inputs, d3 extraction) never claim it open even
     # though SOURCES['maus_v2'].redistribute_public is True.
-    "cli.py:3386": (
+    "cli.py:3387": (
         ("maus_v2",),
         (
             "maus_path (raw Maus GPKG) recorded as an input to build-climate-"
@@ -166,7 +166,7 @@ EXEMPTIONS: dict[str, tuple[tuple[str, ...], str]] = {
             "SOURCES['maus_v2'].redistribute_public is True."
         ),
     ),
-    "cli.py:3797": (
+    "cli.py:3798": (
         ("maus_v2",),
         (
             "maus_path (raw Maus GPKG) recorded as an input to build-fire-"
@@ -174,7 +174,7 @@ EXEMPTIONS: dict[str, tuple[tuple[str, ...], str]] = {
             "licence.py's ShareAlike-package note."
         ),
     ),
-    "cli.py:7863": (
+    "cli.py:7885": (
         ("maus_v2",),
         (
             "maus_path (raw Maus GPKG) recorded as an input to the D3 extraction "
@@ -182,7 +182,7 @@ EXEMPTIONS: dict[str, tuple[tuple[str, ...], str]] = {
             "licence.py's ShareAlike-package note."
         ),
     ),
-    "cli.py:5124": (
+    "cli.py:5146": (
         ("maus_v2",),
         (
             "footprints_path (Maus-derived footprints) input asset to "
@@ -190,7 +190,7 @@ EXEMPTIONS: dict[str, tuple[tuple[str, ...], str]] = {
             "per licence.py's ShareAlike-package note."
         ),
     ),
-    "cli.py:6465": (
+    "cli.py:6487": (
         ("maus_v2",),
         (
             "footprints_path (Maus-derived footprints) input asset to "
@@ -198,7 +198,7 @@ EXEMPTIONS: dict[str, tuple[tuple[str, ...], str]] = {
             "conservatively per licence.py's ShareAlike-package note."
         ),
     ),
-    "cli.py:7855": (
+    "cli.py:7877": (
         ("maus_v2",),
         (
             "footprints_path (Maus-derived footprints) input asset to the D3 "
@@ -209,7 +209,7 @@ EXEMPTIONS: dict[str, tuple[tuple[str, ...], str]] = {
     # -- catalogue_sums_path: the whole DEA STAC catalogue capture
     # (`raw/dea_stac/<date>/SHA256SUMS.txt`), spanning every DEA geomedian
     # collection plus Fractional Cover Percentiles, all CC-BY-4.0/True.
-    "cli.py:4753": (
+    "cli.py:4775": (
         ("dea_gm_ls5t", "dea_gm_ls7e", "dea_gm_ls8cls9c", "dea_fc_pc"),
         (
             "catalogue_sums_path covers the whole raw/dea_stac catalogue "
@@ -217,7 +217,7 @@ EXEMPTIONS: dict[str, tuple[tuple[str, ...], str]] = {
             "CC-BY-4.0/True, matching the literal."
         ),
     ),
-    "cli.py:5132": (
+    "cli.py:5154": (
         ("dea_gm_ls5t", "dea_gm_ls7e", "dea_gm_ls8cls9c", "dea_fc_pc"),
         (
             "catalogue_sums_path covers the whole raw/dea_stac catalogue "
@@ -225,7 +225,7 @@ EXEMPTIONS: dict[str, tuple[tuple[str, ...], str]] = {
             "the literal."
         ),
     ),
-    "cli.py:6489": (
+    "cli.py:6511": (
         ("dea_gm_ls5t", "dea_gm_ls7e", "dea_gm_ls8cls9c", "dea_fc_pc"),
         (
             "catalogue_dir/SHA256SUMS.txt covers the whole raw/dea_stac "
@@ -233,7 +233,7 @@ EXEMPTIONS: dict[str, tuple[tuple[str, ...], str]] = {
             "matching the literal."
         ),
     ),
-    "cli.py:7871": (
+    "cli.py:7893": (
         ("dea_gm_ls5t", "dea_gm_ls7e", "dea_gm_ls8cls9c", "dea_fc_pc"),
         (
             "catalogue_dir/SHA256SUMS.txt covers the whole raw/dea_stac "
@@ -245,21 +245,21 @@ EXEMPTIONS: dict[str, tuple[tuple[str, ...], str]] = {
     # so they carry no source_id. Each is a file this project generated
     # itself (a config, a derived table, a validation fixture), always
     # pinned closed because there is no external licence grant to point to.
-    "cli.py:5347": (
+    "cli.py:5369": (
         (),
         (
             "protocol_config is a project-authored D3 protocol config file, not "
             "an external source; no SOURCES entry applies."
         ),
     ),
-    "cli.py:6441": (
+    "cli.py:6463": (
         (),
         (
             "protocol_artifact_path (build-d3-protocol's own output) is a "
             "project-internal derived artefact, not an external source."
         ),
     ),
-    "cli.py:6878": (
+    "cli.py:6900": (
         (),
         (
             "protocol_artifact_path (build-d3-protocol's own output) recorded "
@@ -267,7 +267,7 @@ EXEMPTIONS: dict[str, tuple[tuple[str, ...], str]] = {
             "external source."
         ),
     ),
-    "cli.py:7879": (
+    "cli.py:7901": (
         (),
         (
             "protocol_artifact_path (build-d3-protocol's own output) recorded "
@@ -275,21 +275,21 @@ EXEMPTIONS: dict[str, tuple[tuple[str, ...], str]] = {
             "external source."
         ),
     ),
-    "cli.py:7281": (
+    "cli.py:7303": (
         (),
         (
             "threshold_path (build-d3-threshold's own output) is a "
             "project-internal derived artefact, not an external source."
         ),
     ),
-    "cli.py:7289": (
+    "cli.py:7311": (
         (),
         (
             "footprint_support_path (build-d3-inputs' own output table) is a "
             "project-internal derived artefact, not an external source."
         ),
     ),
-    "cli.py:6887": (
+    "cli.py:6909": (
         (),
         (
             "table_paths[name] iterates build-d3-inputs' own five output "
@@ -297,14 +297,14 @@ EXEMPTIONS: dict[str, tuple[tuple[str, ...], str]] = {
             "derived artefacts, not external sources."
         ),
     ),
-    "cli.py:8346": (
+    "cli.py:8368": (
         (),
         (
             "reference_cube is a Huntly validation fixture supplied for "
             "cross-checking, not an external registered source."
         ),
     ),
-    "cli.py:8354": (
+    "cli.py:8376": (
         (),
         (
             "site_meta is a Huntly validation fixture supplied for "

@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import csv
 import functools
+import hashlib
 import io
 import json
 import os
@@ -4582,6 +4583,27 @@ def build_tier0_public_rc_cmd(
     # is passed here, never the full internal config.
     public_manifest_config: dict[str, Any] = {"run": {"data_root": str(data_root)}}
 
+    # Same public-payload boundary, applied to `git_state`: the internal
+    # manifest convention embeds the FULL working-tree diff (tracked and
+    # untracked, `provenance.collect_git_state`) so a dirty-tree run can be
+    # reconstructed -- but shipping arbitrary uncommitted working-tree bytes
+    # inside a public artefact is exactly the leak class `public_audit`
+    # refuses (local paths, plan documents, anything the tree happens to
+    # hold). The public manifests keep `sha`/`dirty` and DISCLOSE the
+    # omission: `diff` is emptied, `diff_omitted_for_public_payload` says
+    # why, and `diff_sha256` pins the omitted bytes so the private record
+    # remains verifiable against them without shipping them.
+    public_git_state: dict[str, Any] = dict(git_state)
+    omitted_diff = public_git_state.get("diff")
+    if isinstance(omitted_diff, str) and omitted_diff:
+        public_git_state["diff_sha256"] = hashlib.sha256(
+            omitted_diff.encode("utf-8", errors="replace")
+        ).hexdigest()
+    else:
+        public_git_state["diff_sha256"] = None
+    public_git_state["diff"] = ""
+    public_git_state["diff_omitted_for_public_payload"] = True
+
     try:
         manifests.write_run_manifest(
             output=tenements_path,
@@ -4596,7 +4618,7 @@ def build_tier0_public_rc_cmd(
                 ),
             ],
             config=public_manifest_config,
-            git_state=git_state,
+            git_state=public_git_state,
             resolved_args={
                 "version": version,
                 "tenements_snapshot_date": tenements_date,
@@ -4618,7 +4640,7 @@ def build_tier0_public_rc_cmd(
                 ),
             ],
             config=public_manifest_config,
-            git_state=git_state,
+            git_state=public_git_state,
             resolved_args={
                 "version": version,
                 "tenements_snapshot_date": tenements_date,
