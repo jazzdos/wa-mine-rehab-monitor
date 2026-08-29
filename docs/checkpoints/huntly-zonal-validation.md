@@ -86,19 +86,14 @@ ndvi`). Both live runs therefore used `--no-require-pixel-counts`, recorded
 here as the checkpoint requires. The Batch E plan's blocker-3 note claiming
 counts "exist on both sides" described the monitor's sampled side only.
 
-## Still pending for a passing curated verdict
+## Official run (authorised 2026-08-29)
 
-1. The `compare()` missing-row fix merged (branch above).
-2. Owner authorisation of the reference-window correction (w1 → w3), since
-   it changes what the pre-registered gate compares — see the draft
-   decision record.
-3. The official re-run. `curated/huntly-validation/2026-08-29/` is occupied
-   by run 1's honest failing verdict and `validate-huntly` refuses same-date
-   re-runs; the owner chooses between removing that mis-specified verdict to
-   re-run under 2026-08-29 or recording the official run under a later date.
-   `require_huntly_gate` reads the LATEST dated verdict, so until then
-   statewide extraction stays correctly locked.
+The w1 → w3 correction and the pixel-count waiver were authorised by the
+owner 2026-08-29 (A9,
+`docs/decisions/2026-08-29-e5-reference-window-correction.md`), with run
+1's mis-specified verdict deleted and the official run recorded under
+2026-08-29. Figures to be recorded here from the official verdict once it
+is run and inspected.
 
 - **`require_huntly_gate` outcome for `extract-trajectories --scope
-  statewide`:** refusal (latest verdict `passed: false`) — correct and
-  intended until the official re-run passes.
+  statewide`:** to be recorded from the official verdict.

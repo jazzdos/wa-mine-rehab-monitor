@@ -1,8 +1,9 @@
-# E5: the reference series is w3, not w1 (2026-08-29) — DRAFT, pending owner authorisation
+# E5: the reference series is w3, not w1 (2026-08-29)
 
-**Status: DRAFT.** This corrects what the pre-registered E5 gate compares,
-so it binds only once the owner authorises it; until then the 2026-08-25
-rescope decision stands as written and the gate stays failing.
+**Status: authorised by the owner 2026-08-29** (drafted and authorised the
+same day, after the first live run). This corrects what the pre-registered
+E5 gate compares; it is amendment **A9** in
+`docs/amendments-and-limitations.md`.
 
 **Trigger.** First live `validate-huntly` run (2026-08-29, verdict at
 `curated/huntly-validation/2026-08-29/validation.json`): 38,707 of 38,714
@@ -55,10 +56,11 @@ change: values, tolerances, and coverage checking are untouched.
 reference variants verified 2026-08-29: no count columns); that is what
 makes item 2 above a decision rather than a footnote.
 
-**On authorisation.** This becomes amendment A9 in
-`docs/amendments-and-limitations.md`; the owner also chooses how the
-official re-run is recorded, given `validate-huntly` refuses same-date
-re-runs and `curated/huntly-validation/2026-08-29/` holds run 1's failing
-verdict: (a) delete that mis-specified verdict and re-run under
-2026-08-29, or (b) leave it and record the official run under a later
-date. `require_huntly_gate` reads the latest dated verdict either way.
+**Owner choices, 2026-08-29.** Pixel counts: option (a) — the official
+run uses `--no-require-pixel-counts`, recorded in its manifest; value
+agreement at `1e-6`/`0.1 pp` over every comparable row stands as the
+parity evidence. Verdict directory: run 1's mis-specified failing verdict
+at `curated/huntly-validation/2026-08-29/` is deleted (its full figures
+and root cause stay recorded in `docs/checkpoints/huntly-zonal-
+validation.md`) and the official run is recorded under 2026-08-29.
+`require_huntly_gate` reads the latest dated verdict.

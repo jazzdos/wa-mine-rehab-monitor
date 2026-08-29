@@ -31,6 +31,7 @@ for the batches not yet run, with the measurements behind it, is in
 | A6 | 2026-08-23 | MINEDEX commodity codes + valid-member fraction | **new lineage** | `decisions/2026-08-23-d3-commodity-codes-and-valid-fraction.md` |
 | A7 | 2026-08-25 | E5 Huntly gate re-scoped to engine parity on the jarrah pilot cube | none | `decisions/2026-08-25-e5-engine-parity-rescope.md` |
 | A8 | 2026-08-25 | Public web page withdrawn; output re-scoped to GeoParquet + private QGIS project | none | `decisions/2026-08-25-public-web-page-descope.md` |
+| A9 | 2026-08-29 | E5 reference corrected to `w3`; pixel-count check waived against a countless reference | none | `decisions/2026-08-29-e5-reference-window-correction.md` |
 
 **A1 — execution host.** Batch C's measured volume re-derivation
 (597.1 GB windowed, 3.30 TB whole-tile upper bound) excluded the
@@ -123,6 +124,20 @@ Batch G task as an `export-release` command. The L17 sharing disclosure
 attaches to the `shared_footprint_site_count` schema field, data
 dictionary, and QGIS styling instead of rendered pages. The Tier 0
 public-RC lane (repository flip) is unaffected. Closes O5.
+
+**A9 — E5 reference window corrected.** A7's re-scope named
+`series_incumbent_w1.parquet` as the 3×3 reference; the first live run
+(2026-08-29) showed jarrah's `w<N>` suffix is the window size, so `w1`
+is a single-pixel series and the decided comparison (window-3 sampling
+against it) was unpassable for a non-engine reason. Corrected to
+`series_incumbent_w3.parquet`; the method A7 decided (3×3, mean over
+non-NaN, jarrah's own points, D13 value tolerances, verdict as sole
+unlock) is unchanged. Also authorised: `--no-require-pixel-counts` on
+official runs, because no real jarrah reference variant carries count
+columns — value agreement over every comparable row is the recorded
+parity evidence. Run 1's failing verdict is superseded and its
+directory deleted; figures preserved in
+`checkpoints/huntly-zonal-validation.md`. No protocol digest affected.
 
 ### What was deliberately not amended
 
