@@ -35,6 +35,7 @@ import yaml
 from pydantic import ValidationError
 
 from wa_mine_monitor import (
+    climate_context,
     crosswalk,
     d3_inputs,
     d3_protocol,
@@ -65,7 +66,7 @@ from wa_mine_monitor.http import (
 from wa_mine_monitor.provenance import SourceAsset, collect_git_state, sha256_file
 from wa_mine_monitor.secrets import redact_secrets, scrub_string_leaves
 from wa_mine_monitor.source_catalogue import DEA_COLLECTIONS, SourceSpec
-from wa_mine_monitor.sources import wa_regions
+from wa_mine_monitor.sources import silo, wa_regions
 from wa_mine_monitor.sources.dea import (
     DEA_RETRY_POLICY,
     CatalogueValidationError,
@@ -98,6 +99,13 @@ from wa_mine_monitor.sources.minedex import (
 )
 from wa_mine_monitor.sources.minedex import (
     SnapshotValidationError as MinedexSnapshotValidationError,
+)
+from wa_mine_monitor.sources.silo import (
+    SiloError,
+    annual_object_name,
+    annual_object_url,
+    download_annual_file,
+    validate_daily_rain_file,
 )
 from wa_mine_monitor.sources.tenements import (
     DASC_TENEMENTS_SHP_URL,
@@ -138,6 +146,13 @@ ConfigOption = typer.Option(
 #: commit history, the same convention `tests/test_provenance.py` documents
 #: for git-state tests generally.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+
+#: Production `fetch-silo` asserts the downloaded grid spans WA (see
+#: `silo.validate_daily_rain_file`). CLI tests monkeypatch this to False
+#: so their fixtures can be a few cells rather than a continental grid;
+#: the coverage rule itself is tested at unit level in
+#: `tests/sources/test_silo.py`.
+_SILO_REQUIRE_STATEWIDE = True
 
 
 def _collect_git_state_disclosing_gaps(repo_root: Path) -> dict[str, Any]:
@@ -480,6 +495,44 @@ def _refuse_if_snapshot_already_finalized(
     if conflict is not None:
         typer.echo(json.dumps({"refusal": conflict}, indent=2, sort_keys=True))
         raise typer.Exit(1)
+
+
+def _refuse_if_unexpected_files(
+    snapshot_dir: Path,
+    *,
+    expected_names: set[str],
+    closing_clause: str,
+) -> None:
+    """Refuse when `snapshot_dir` holds file(s) not accounted for by
+    `expected_names`.
+
+    Shared by `fetch_silo_cmd`'s two unexpected-file gates: a pre-download
+    gate (BEFORE any bytes are fetched -- each annual SILO object is ~410 MB
+    and this command is built to run off a metered connection) and a
+    pre-finalize gate (catching anything that appeared during the run,
+    before `finalize_snapshot` hashes the directory's contents into
+    `SHA256SUMS.txt`). `closing_clause` names which point in the run the
+    refusal message trails off into (e.g. "before fetching" or "before
+    finalizing").
+    """
+    actual_names = {p.name for p in snapshot_dir.iterdir() if p.is_file()}
+    unexpected = sorted(actual_names - expected_names)
+    if unexpected:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        "snapshot directory holds unexpected file(s) not accounted for "
+                        f"by this run's year range: {unexpected} -- delete them, or "
+                        f"re-run over the year range that covers them, {closing_clause}"
+                    ),
+                    "unexpected_files": unexpected,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
 
 
 def _refuse_if_curated_output_already_exists(
@@ -1648,6 +1701,239 @@ def fetch_maus_extract(
     )
 
 
+@app.command("fetch-silo")
+def fetch_silo_cmd(
+    config: Path = ConfigOption,
+    date: str = DateOption,
+    start_year: int = typer.Option(1987, "--start-year", help="First year to fetch (inclusive)."),
+    end_year: int = typer.Option(
+        ..., "--end-year", help="Last year to fetch (inclusive). Required, never defaulted."
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Print the planned objects and destination, then exit without network or disk I/O.",
+    ),
+) -> None:
+    """Fetch a dated SILO gridded daily-rainfall snapshot (CC BY 4.0).
+
+    Downloads one `daily_rain` annual NetCDF object per year in
+    `[start_year, end_year]` from the anonymous AWS open-data bucket
+    (`s3://silo-open-data`, no credential -- see `sources/silo.py`'s module
+    docstring), into `<data_root>/raw/silo/<date>/`.
+
+    `--end-year` is REQUIRED and never defaults to the current year: the
+    house rule against `date.today()` in artefact-shaping arguments applies
+    to a rolling upper bound just as much as to `snapshot_date` itself --
+    two runs of "the same" command on different days would otherwise fetch
+    a different set of years, which is exactly the kind of silent drift
+    `_validate_snapshot_date`'s docstring warns against. The caller states
+    the range explicitly, every time.
+
+    Each annual object is ~410 MB, so this command is deliberately careful
+    on a metered connection: `--dry-run` discloses the full object list and
+    destination with zero network and zero disk writes (before even
+    `create_snapshot_dir`); an already-valid file at the destination is
+    validated and SKIPPED rather than re-pulled (a resume, not a retry);
+    and, per file, a fresh download lands at a sibling `.part` path and is
+    renamed onto the real name only after `validate_daily_rain_file`
+    passes, so a truncated transfer never sits at the real filename for a
+    later run to (wrongly) treat as already-fetched.
+
+    `_SILO_REQUIRE_STATEWIDE` gates whether validation asserts WA coverage
+    -- see that module-level constant's own docstring.
+
+    Because `finalize_snapshot` hashes EVERY file under the snapshot
+    directory regardless of whether this run's loop wrote or looked at it
+    (`snapshots.py:182-186`), this command also refuses if the directory
+    holds anything outside the exact expected set (`metadata.txt` plus one
+    named object per requested year) BEFORE finalizing -- a stray `.part`
+    from an earlier interrupted download, or a file left by a previous run
+    over a different year range, would otherwise be swept into
+    `SHA256SUMS.txt` and verify clean: a finalized snapshot silently
+    carrying a truncated or unrelated file.
+
+    The manifest carries one `SourceAsset` per file this run's loop
+    resolved (fetched or resumed), each with the bucket URL as `uri` and
+    this source's CC-BY-4.0 licence fields from `licence.SOURCES["silo"]`.
+    """
+    resolved: ProjectConfig = _load_config_or_exit(config)
+    resolved_config = resolved.model_dump(mode="json")
+
+    if start_year > end_year:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"--start-year {start_year} is after --end-year {end_year} -- "
+                        "refusing an inverted year range"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+    if start_year < 1889:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"--start-year {start_year} is before 1889 -- SILO rainfall "
+                        "grids begin in 1889"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+
+    years = list(range(start_year, end_year + 1))
+    urls = [annual_object_url("daily_rain", year) for year in years]
+
+    if dry_run:
+        typer.echo(
+            json.dumps(
+                {
+                    "dry_run": True,
+                    "objects": urls,
+                    "destination": str(resolved.run.data_root / "raw" / "silo" / date),
+                    "note": "each annual object is ~410 MB; run off a metered connection",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
+
+    source = licence.SOURCES["silo"]
+    snapshot_dir = snapshots.create_snapshot_dir(resolved.run.data_root, "silo", date)
+    git_state = _collect_git_state_disclosing_gaps(_REPO_ROOT)
+    _refuse_if_snapshot_already_finalized(snapshot_dir, config=resolved_config, git_state=git_state)
+
+    expected_names = {"metadata.txt"} | {annual_object_name("daily_rain", year) for year in years}
+    _refuse_if_unexpected_files(
+        snapshot_dir, expected_names=expected_names, closing_clause="before fetching"
+    )
+
+    n_fetched = 0
+    n_resumed = 0
+    assets: list[SourceAsset] = []
+    for year, url in zip(years, urls, strict=True):
+        dest = snapshot_dir / annual_object_name("daily_rain", year)
+        if dest.exists():
+            try:
+                validate_daily_rain_file(dest, year=year, require_statewide=_SILO_REQUIRE_STATEWIDE)
+            except SiloError as exc:
+                typer.echo(
+                    json.dumps(
+                        {
+                            "refusal": (
+                                f"{dest.name} already exists but failed validation: {exc} -- "
+                                "delete the partial file and re-run"
+                            ),
+                            "stage": "validation",
+                            "file": dest.name,
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+                raise typer.Exit(1) from None
+            n_resumed += 1
+        else:
+            part_path = dest.with_suffix(dest.suffix + ".part")
+            try:
+                download_annual_file(url, part_path)
+            except Exception as exc:  # noqa: BLE001 -- surfaced as a structured refusal
+                typer.echo(
+                    json.dumps(
+                        {
+                            "refusal": f"SILO annual object download failed: {exc}",
+                            "stage": "download",
+                            "url": url,
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+                raise typer.Exit(1) from None
+            part_path.replace(dest)
+            try:
+                validate_daily_rain_file(dest, year=year, require_statewide=_SILO_REQUIRE_STATEWIDE)
+            except SiloError as exc:
+                typer.echo(
+                    json.dumps(
+                        {
+                            "refusal": f"{dest.name} failed validation: {exc}",
+                            "stage": "validation",
+                            "file": dest.name,
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+                raise typer.Exit(1) from None
+            n_fetched += 1
+        assets.append(
+            SourceAsset(
+                uri=url,
+                sha256=sha256_file(dest),
+                collection=None,
+                snapshot_date=dt_date.fromisoformat(date),
+                licence=source.licence_id,
+                redistribute_public=source.redistribute_public,
+            )
+        )
+
+    snapshots.write_snapshot_metadata(
+        snapshot_dir,
+        source=f"{source.title} (gridded daily_rain, annual NetCDF)",
+        endpoint=annual_object_url("daily_rain", start_year),
+        licence_note=f"{source.licence_id} -- {source.licence_url}",
+        purpose="SILO gridded daily rainfall for Batch F climate context.",
+    )
+
+    expected_names = {"metadata.txt"} | {annual_object_name("daily_rain", year) for year in years}
+    _refuse_if_unexpected_files(
+        snapshot_dir, expected_names=expected_names, closing_clause="before finalizing"
+    )
+
+    sums_path = snapshots.finalize_snapshot(snapshot_dir)
+    n_ok, n_bad, n_missing = snapshots.verify_snapshot(snapshot_dir)
+
+    manifests.write_run_manifest(
+        output=sums_path,
+        inputs=assets,
+        config=resolved_config,
+        git_state=git_state,
+        resolved_args={
+            "date": date,
+            "start_year": start_year,
+            "end_year": end_year,
+            "variable": "daily_rain",
+            "fetched": n_fetched,
+            "resumed": n_resumed,
+        },
+    )
+
+    typer.echo(
+        json.dumps(
+            {
+                "snapshot_dir": str(snapshot_dir),
+                "fetched": n_fetched,
+                "resumed": n_resumed,
+                "verify": {"ok": n_ok, "bad": n_bad, "missing": n_missing},
+                "manifest_path": str(sums_path) + manifests.MANIFEST_SUFFIX,
+            },
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+    )
+
+
 def _csv_zip_member_row_count(zip_path: Path, member_name: str) -> int:
     """The number of DATA rows (excluding the header) `member_name` carries
     inside the zip at `zip_path`, counted via `csv.reader` -- deliberately
@@ -2356,6 +2642,474 @@ def build_crosswalk_cmd(config: Path = ConfigOption, date: str = DateOption) -> 
                 "counts": disclosed_counts,
                 "crosswalk_population": crosswalk_population_counts,
                 "manifest_path": str(crosswalk_path) + manifests.MANIFEST_SUFFIX,
+            },
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+    )
+
+
+@app.command("build-climate-context")
+def build_climate_context_cmd(
+    config: Path = ConfigOption,
+    date: str = DateOption,
+    start_year: int = typer.Option(..., "--start-year"),
+    end_year: int = typer.Option(..., "--end-year"),
+) -> None:
+    """Build SILO rainfall context rows (D13 F5) for every D3-eligible site,
+    one row per `(site_id, year)` for `year` in `[start_year, end_year]`.
+
+    Reads the LATEST verified `raw/silo/<date>/` snapshot (`fetch-silo`'s
+    output), the LATEST curated D3-eligibility-annotated register
+    (`apply-d3-threshold`'s output), the LATEST curated Tier 1 crosswalk,
+    and the raw Maus snapshot the crosswalk was built from -- the same
+    resolution and integrity discipline `extract-trajectories` applies to
+    each. Context rows are context only (see `climate_context.py`'s
+    docstring): this command never joins climate to trajectory rows and
+    never states a cause.
+    """
+    resolved: ProjectConfig = _load_config_or_exit(config)
+    resolved_config = resolved.model_dump(mode="json")
+    git_state = _collect_git_state_disclosing_gaps(_REPO_ROOT)
+    data_root = resolved.run.data_root
+
+    # GATE 1 -- year range, BEFORE any I/O. Without this, `range(start_year,
+    # end_year + 1)` is empty while the baseline union stays populated, so
+    # every gate below passes, `assemble_rows` honestly emits zero rows, and
+    # this command writes a schema-valid, finalized `climate_context.parquet`
+    # holding no site-years at all -- an empty curated artefact that
+    # verifies clean is worse than a refusal, because the next run of
+    # `_refuse_if_curated_output_already_exists` then defends it forever.
+    if start_year > end_year:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"--start-year {start_year} is after --end-year {end_year} -- "
+                        "refusing an inverted year range"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+
+    output_dir = data_root / "curated" / "climate-context" / date
+    output_path = output_dir / "climate_context.parquet"
+    _refuse_if_curated_output_already_exists(
+        output_path, config=resolved_config, git_state=git_state
+    )
+
+    requested_years = list(range(start_year, end_year + 1))
+    # Never a silently narrower baseline (D13 F5): a missing baseline year
+    # and a missing requested year are both refused by the SAME gate below,
+    # naming every missing year, so a caller can never mistake "some SILO
+    # files present" for "the whole baseline is present".
+    needed_years = sorted(
+        set(range(climate_context.BASELINE_START_YEAR, climate_context.BASELINE_END_YEAR + 1))
+        | set(requested_years)
+    )
+
+    # GATE 2 -- the latest SILO snapshot: digest-verified, and must carry
+    # every needed year's daily_rain object (the full 1991-2020 baseline
+    # PLUS every requested year).
+    try:
+        silo_snapshot_dir = register.latest_snapshot(data_root, "silo")
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    silo_verification = _verify_snapshot_or_refuse(
+        silo_snapshot_dir,
+        source_id="silo",
+        required_files=tuple(annual_object_name("daily_rain", year) for year in needed_years),
+    )
+
+    # GATE 3 -- latest curated register: digest-verified, and must be the
+    # D3-eligibility-annotated register `apply-d3-threshold` writes -- the
+    # same two column checks `extract-trajectories` GATE 2 applies.
+    try:
+        register_dir = _latest_curated_dated_dir(
+            data_root / "curated" / "register", label="curated/register"
+        )
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    register_path = register_dir / "register.parquet"
+    register_manifest = _digest_verified_manifest(register_path)
+    register_df = read_table(register_path)
+    if "trajectory_status" not in register_df.columns:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        "latest curated register is not D3-eligibility-annotated -- run "
+                        "apply-d3-threshold first"
+                    ),
+                    "register_path": str(register_path),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    if "d3_forced_threshold" not in register_df.columns:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        "latest curated register predates the d3_forced_threshold column -- "
+                        "run apply-d3-threshold to re-write it"
+                    ),
+                    "register_path": str(register_path),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+
+    eligible = trajectory_extract.select_eligible_sites(register_df)
+
+    # GATE 4 -- crosswalk + Maus snapshot, resolved and sha256-tied exactly
+    # as `extract-trajectories` GATE 4 does.
+    try:
+        crosswalk_dir = _latest_curated_dated_dir(
+            data_root / "curated" / "crosswalk", label="curated/crosswalk"
+        )
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    crosswalk_path = crosswalk_dir / "crosswalk.parquet"
+    crosswalk_manifest = _digest_verified_manifest(crosswalk_path)
+    crosswalk_df = read_table(crosswalk_path)
+    tier1_df = crosswalk.tier1_population(crosswalk_df)
+
+    maus_licence_id = licence.SOURCES["maus_v2"].licence_id
+    crosswalk_maus_input = next(
+        (
+            asset
+            for asset in crosswalk_manifest.get("inputs", [])
+            if asset.get("licence") == maus_licence_id
+        ),
+        None,
+    )
+    if crosswalk_maus_input is None:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"{crosswalk_path}'s manifest carries no Maus input (licence "
+                        f"{maus_licence_id!r}) -- cannot verify which Maus snapshot it "
+                        "was built from"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    crosswalk_maus_sha256 = crosswalk_maus_input["sha256"]
+
+    try:
+        maus_snapshot_dir = register.latest_snapshot(data_root, "maus_v2")
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    _verify_snapshot_or_refuse(
+        maus_snapshot_dir, source_id="maus_v2", required_files=("wa_extract.gpkg",)
+    )
+    maus_path = maus_snapshot_dir / "wa_extract.gpkg"
+    maus_gpkg_sha256 = sha256_file(maus_path)
+    if maus_gpkg_sha256 != crosswalk_maus_sha256:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"latest maus_v2 raw snapshot ({maus_path}) hashes "
+                        f"{maus_gpkg_sha256[:12]}..., but the crosswalk's manifest records "
+                        f"Maus sha256 {crosswalk_maus_sha256[:12]}... -- the latest raw Maus "
+                        "snapshot is not the one the crosswalk was built from"
+                    ),
+                    "maus_gpkg_sha256": maus_gpkg_sha256,
+                    "crosswalk_maus_gpkg_sha256": crosswalk_maus_sha256,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    try:
+        maus_source_gdf = gpd.read_file(maus_path)
+        maus_gdf = maus_source_gdf[["maus_id", "geometry"]].to_crs(crosswalk.TARGET_CRS)
+    except (pyogrio.errors.DataSourceError, OSError) as exc:
+        typer.echo(
+            json.dumps({"refusal": str(exc), "maus_gpkg": str(maus_path)}, indent=2, sort_keys=True)
+        )
+        raise typer.Exit(1) from None
+    except KeyError as exc:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": f"wa_extract.gpkg is missing the expected column {exc}",
+                    "maus_gpkg": str(maus_path),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+    maus_geom_by_id: dict[str, Any] = dict(
+        zip(maus_gdf["maus_id"].astype(str), maus_gdf.geometry, strict=True)
+    )
+
+    # Site->Maus tie-break, reproduced EXACTLY from `extract-trajectories`
+    # (mirrors `register.py`'s own eligibility tie-break, ~1373: stable sort
+    # by `["site_id", "maus_id"]`, `drop_duplicates(keep="first")` -- the
+    # lexicographically SMALLEST `maus_id` per site) -- a site CAN carry more
+    # than one `confidence == "high"` crosswalk row (overlapping Maus
+    # polygons), and this ensures the same footprint is picked here as was
+    # picked for that site's own D3 eligibility judgement.
+    tier1_dedup = tier1_df.sort_values(
+        ["site_id", "maus_id"], na_position="last", kind="stable"
+    ).drop_duplicates(subset="site_id", keep="first")
+    maus_id_by_site: dict[str, str] = dict(
+        zip(tier1_dedup["site_id"].astype(str), tier1_dedup["maus_id"].astype(str), strict=True)
+    )
+
+    # An eligible site absent from the Tier 1 crosswalk population is
+    # refused by name, not silently dropped: `assemble_rows`' row-count
+    # guarantee reconciles against `site_maus_pairs`, which by then has
+    # already excluded the missing site, so it cannot catch this itself.
+    site_maus_pairs: list[tuple[str, str]] = []
+    for site in eligible:
+        maus_id = maus_id_by_site.get(site)
+        if maus_id is None:
+            typer.echo(
+                json.dumps(
+                    {
+                        "refusal": (
+                            f"eligible site {site!r} is not in the Tier 1 crosswalk "
+                            f"population ({crosswalk_path}) -- an eligible site must have a "
+                            "high-confidence Maus match"
+                        )
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            raise typer.Exit(1)
+        site_maus_pairs.append((site, maus_id))
+
+    missing_geometry = sorted({m for _s, m in site_maus_pairs} - set(maus_geom_by_id))
+    if missing_geometry:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"maus_id(s) {missing_geometry} (from eligible sites) are absent "
+                        f"from the latest Maus snapshot ({maus_path})"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+
+    # Centroids in EQUAL-AREA, then to geographic. `maus_gdf` is already
+    # reprojected to `crosswalk.TARGET_CRS` (EPSG:3577) above, so `.centroid`
+    # is taken there -- a centroid taken directly in degrees is not the
+    # footprint's areal centre, and taking it in this project's own
+    # equal-area CRS keeps it consistent with the footprint areas the rest
+    # of the pipeline reports. Only THEN is the point reprojected to
+    # EPSG:4326 for the SILO grid lookup, which is indexed in degrees.
+    distinct_maus_ids = sorted({m for _s, m in site_maus_pairs})
+    centroids_3577 = gpd.GeoSeries(
+        [maus_geom_by_id[m] for m in distinct_maus_ids], crs=crosswalk.TARGET_CRS
+    ).centroid
+    centroids_4326 = centroids_3577.to_crs("EPSG:4326")
+
+    grid = silo.read_grid(
+        silo_snapshot_dir / annual_object_name("daily_rain", climate_context.BASELINE_START_YEAR)
+    )
+
+    cell_id_by_maus: dict[str, str] = {}
+    # (lat_i, lon_i) per REAL (in-grid) occupied cell -- rainfall is read
+    # once per cell, not once per site or per maus_id, since sites/footprints
+    # sharing a location share a cell.
+    real_cell_indices: dict[str, tuple[int, int]] = {}
+    baseline_gap_by_cell: dict[str, str] = {}
+    for maus_id, centroid in zip(distinct_maus_ids, centroids_4326, strict=True):
+        lon, lat = float(centroid.x), float(centroid.y)
+        try:
+            lat_i, lon_i = grid.cell_index_for_point(lat=lat, lon=lon)
+        except SiloError as exc:
+            # A footprint outside the grid becomes a per-cell not-computable
+            # entry, not a run abort (D13 F5) -- and never snaps to an edge
+            # cell. The pseudo-cell id is point-derived (not a real grid
+            # cell centre) purely so this maus_id still has SOME cell to
+            # carry on its rows; `baseline_gap_by_cell` makes every year for
+            # it `not_computable` unconditionally, so nothing ever tries to
+            # read rainfall for it.
+            pseudo_cell = silo.cell_id(lat=lat, lon=lon)
+            cell_id_by_maus[maus_id] = pseudo_cell
+            baseline_gap_by_cell[pseudo_cell] = f"footprint outside the SILO grid: {exc}"
+            continue
+        cell = silo.cell_id(lat=grid.lats[lat_i], lon=grid.lons[lon_i])
+        cell_id_by_maus[maus_id] = cell
+        real_cell_indices[cell] = (lat_i, lon_i)
+
+    metrics_by_cell_year: dict[tuple[str, int], silo.AnnualMetrics] = {}
+    not_computable_by_cell_year: dict[tuple[str, int], str] = {}
+    baseline_annuals_by_cell: dict[str, list[float]] = {}
+    silo_files_read: set[int] = set()
+    # One `cells_daily_series` call per year, not one `cell_daily_series`
+    # call per (cell, year): it opens `path` once, verifies that year's own
+    # lat/lon coordinate arrays against `grid` (the BASELINE_START_YEAR
+    # reference) BEFORE reading any cell, and only then reads every real
+    # cell needed from it. A year whose file has a flipped or shifted grid
+    # is refused here rather than silently indexed against the wrong cell.
+    for year in needed_years:
+        path = silo_snapshot_dir / annual_object_name("daily_rain", year)
+        silo_files_read.add(year)
+        try:
+            series_by_cell = silo.cells_daily_series(path, indices=real_cell_indices, grid=grid)
+        except SiloError as exc:
+            typer.echo(
+                json.dumps(
+                    {
+                        "refusal": (
+                            f"{path} failed grid verification against the "
+                            f"{climate_context.BASELINE_START_YEAR} reference grid: {exc}"
+                        )
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            raise typer.Exit(1) from None
+        for cell, series in series_by_cell.items():
+            try:
+                metrics_by_cell_year[(cell, year)] = silo.annual_metrics(series)
+            except silo.SiloNotComputableError as exc:
+                not_computable_by_cell_year[(cell, year)] = str(exc)
+
+    baseline_years = range(
+        climate_context.BASELINE_START_YEAR, climate_context.BASELINE_END_YEAR + 1
+    )
+    for cell in real_cell_indices:
+        missing_baseline_years = [
+            year for year in baseline_years if (cell, year) not in metrics_by_cell_year
+        ]
+        if missing_baseline_years:
+            baseline_gap_by_cell[cell] = (
+                f"baseline missing year(s) {missing_baseline_years} (of "
+                f"{climate_context.BASELINE_START_YEAR}-{climate_context.BASELINE_END_YEAR})"
+            )
+        else:
+            baseline_annuals_by_cell[cell] = [
+                metrics_by_cell_year[(cell, year)].annual_rainfall_mm for year in baseline_years
+            ]
+
+    try:
+        rows_df = climate_context.assemble_rows(
+            site_maus_pairs=site_maus_pairs,
+            cell_id_by_maus=cell_id_by_maus,
+            metrics_by_cell_year=metrics_by_cell_year,
+            not_computable_by_cell_year=not_computable_by_cell_year,
+            baseline_annuals_by_cell=baseline_annuals_by_cell,
+            baseline_gap_by_cell=baseline_gap_by_cell,
+            years=requested_years,
+            snapshot_date=silo_snapshot_dir.name,
+            source_version=licence.SOURCES["silo"].title,
+        )
+    except climate_context.ClimateContextError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _write_table_or_refuse(rows_df, output_path, climate_context.CLIMATE_CONTEXT_SCHEMA)
+
+    silo_source = licence.SOURCES["silo"]
+    input_assets = [
+        SourceAsset(
+            uri=str(register_path),
+            sha256=register_manifest["output"]["sha256"],
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(register_dir.name),
+            licence=licence.SOURCES["dmirs_001_minedex"].licence_id,
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(crosswalk_path),
+            sha256=crosswalk_manifest["output"]["sha256"],
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(crosswalk_dir.name),
+            licence=None,
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(maus_path),
+            sha256=maus_gpkg_sha256,
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(maus_snapshot_dir.name),
+            licence=maus_licence_id,
+            redistribute_public=False,
+        ),
+        *(
+            SourceAsset(
+                uri=str(silo_snapshot_dir / annual_object_name("daily_rain", year)),
+                sha256=sha256_file(silo_snapshot_dir / annual_object_name("daily_rain", year)),
+                collection=None,
+                snapshot_date=dt_date.fromisoformat(silo_snapshot_dir.name),
+                licence=silo_source.licence_id,
+                redistribute_public=silo_source.redistribute_public,
+            )
+            for year in sorted(silo_files_read)
+        ),
+    ]
+
+    try:
+        manifests.write_run_manifest(
+            output=output_path,
+            inputs=input_assets,
+            config=resolved_config,
+            git_state=git_state,
+            resolved_args={
+                "date": date,
+                "start_year": start_year,
+                "end_year": end_year,
+                "register_dir": str(register_dir),
+                "crosswalk_dir": str(crosswalk_dir),
+                "maus_snapshot_dir": str(maus_snapshot_dir),
+                "silo_snapshot_dir": str(silo_snapshot_dir),
+                "silo_snapshot_verification": silo_verification,
+                "n_eligible_sites": len(eligible),
+                "n_cells": len(cell_id_by_maus),
+            },
+        )
+    except FileExistsError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    n_computed = int((rows_df["climate_status"] == climate_context.CLIMATE_STATUS_COMPUTED).sum())
+    n_not_computable = int(
+        (rows_df["climate_status"] == climate_context.CLIMATE_STATUS_NOT_COMPUTABLE).sum()
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "output_path": str(output_path),
+                "manifest_path": str(output_path) + manifests.MANIFEST_SUFFIX,
+                "rows": len(rows_df),
+                "n_computed": n_computed,
+                "n_not_computable": n_not_computable,
+                "n_cells": len(cell_id_by_maus),
+                "n_sites": len({s for s, _m in site_maus_pairs}),
+                "start_year": start_year,
+                "end_year": end_year,
             },
             indent=2,
             sort_keys=True,

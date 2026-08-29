@@ -290,7 +290,7 @@ misread the nulls.
 | O4 | Tolerance-gated concordance not evaluated | Nothing; deferred by choice |
 | ~~O5~~ | ~~D5 Pages gate is pre-registered as recordable-failed~~ | **Closed 2026-08-25: `decisions/2026-08-25-public-web-page-descope.md`** |
 | ~~O6~~ | ~~Shared-footprint product framing (L17) undecided~~ | **Closed 2026-08-25: `decisions/2026-08-25-tier1-product-framing.md`** |
-| O7 | No SILO account or snapshot exists on either data root | Batch F F5 |
+| ~~O7~~ | ~~No SILO account or snapshot exists on either data root~~ | **Closed 2026-08-26: the gridded product is anonymous (no account exists on this route); `decisions/2026-08-26-silo-gridded-feed.md`** |
 | ~~O8~~ | ~~Why the eligibility replay buckets 933 never-judged sites differently from the register build~~ | **Closed 2026-08-25: replay now calls the production function (`tests/test_diag_replay_parity.py`)** |
 
 **O8 — closed 2026-08-25.** Replaying the eligibility join against

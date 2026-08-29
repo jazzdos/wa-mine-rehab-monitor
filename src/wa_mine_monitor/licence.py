@@ -284,18 +284,21 @@ SOURCES: dict[str, SourceLicence] = {
         source_id="silo",
         title="SILO Climate Database",
         source_url="https://www.longpaddock.qld.gov.au/silo/",
-        licence_id="open-with-account",
-        licence_url="https://www.longpaddock.qld.gov.au/silo/access-data/",
+        licence_id="CC-BY-4.0",
+        licence_url="https://creativecommons.org/licenses/by/4.0/",
         attribution_text=(
             "Contains climate data sourced from the Queensland Government's "
             "SILO climate database (longpaddock.qld.gov.au/silo)."
         ),
         redistribute_public=True,
         notes=(
-            "Open access, but each fetch is gated behind a registered email "
-            "address (an API-key-shaped account credential, not a payment or "
-            "a use restriction) rather than being anonymous. Derived rainfall "
-            "context is redistributable."
+            "Consumed as the GRIDDED product from the anonymous AWS "
+            "open-data bucket (s3://silo-open-data, ap-southeast-2): "
+            "CC BY 4.0, no account and no credential on this route. The "
+            "account-gated point/Data Drill API is NOT used by this "
+            "project -- the earlier 'open-with-account' record described "
+            "that route. Derived rainfall context is redistributable "
+            "with attribution."
         ),
     ),
     "wa_rdc_regions": SourceLicence(
