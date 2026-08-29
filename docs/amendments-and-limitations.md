@@ -301,7 +301,7 @@ misread the nulls.
 |---|---|---|
 | ~~O1~~ | ~~Outside-RDC fraction against `n_for_ceiling`~~ | **Closed 2026-08-25: 20/1,252 = 1.60%** |
 | ~~O2~~ | ~~Batch E entry under the L4 disclosure needs an owner decision~~ | **Closed 2026-08-25: `decisions/2026-08-25-batch-e-forced-threshold-entry.md`** |
-| O3 | Huntly validation verdict does not exist | Statewide extraction (`require_huntly_gate`) |
+| ~~O3~~ | ~~Huntly validation verdict does not exist~~ | **Closed 2026-08-29: official verdict passed (A9; `checkpoints/huntly-zonal-validation.md`); statewide extraction unlocked** |
 | O4 | Tolerance-gated concordance not evaluated | Nothing; deferred by choice |
 | ~~O5~~ | ~~D5 Pages gate is pre-registered as recordable-failed~~ | **Closed 2026-08-25: `decisions/2026-08-25-public-web-page-descope.md`** |
 | ~~O6~~ | ~~Shared-footprint product framing (L17) undecided~~ | **Closed 2026-08-25: `decisions/2026-08-25-tier1-product-framing.md`** |

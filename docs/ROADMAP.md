@@ -14,16 +14,18 @@ pre-registered fallback: no candidate support passed the Spearman
 criterion, so n\* = 144 px stands with `criteria_passed=false` and the
 L4 disclosure travelling on every downstream row. Under the
 forced-threshold owner decision, 10,372 sites across 989 Maus
-footprints are eligible for Tier 1 extraction. Verification battery:
-ruff, format, mypy, 737 tests green.
+footprints are eligible for Tier 1 extraction, and the forced-144
+register exists at `curated/register/2026-08-29/`. E5 engine parity
+passed 2026-08-29, so statewide extraction is unlocked. Verification
+battery: ruff, format, mypy, 910 tests green.
 
 ## Build sequence
 
 | # | Step | Gate / blocker | Record |
 |---|---|---|---|
-| 1 | **E5 engine parity**: monitor's zonal engine reproduces the jarrah pilot-cube reference series (NBR/NDMI ≤ 1e-6, FC ≤ 0.1 pp). First live run 2026-08-29: engine parity PROVEN against the true 3×3 reference (`series_incumbent_w3.parquet`, 204,060 comparisons, zero outside tolerance); the curated verdict failed only because the rescope decision misnamed the single-pixel `w1` series as the 3×3 reference | Passing verdict artefact under `curated/huntly-validation/<date>/` is still the sole unlock for statewide extraction (O3); pending owner authorisation of the w1→w3 correction (`decisions/2026-08-29-e5-reference-window-correction.md`, DRAFT) and the official re-run | `checkpoints/huntly-zonal-validation.md`; `decisions/2026-08-25-e5-engine-parity-rescope.md` |
+| 1 | ~~**E5 engine parity**~~ **PASSED 2026-08-29**: official verdict `curated/huntly-validation/2026-08-29/validation.json`, `passed: true`, zero failures (204,060 rows accounted, 196,560 value-compared, all within `1e-6`/`0.1 pp`); reference corrected w1→w3 with pixel-count waiver (A9) | None — `require_huntly_gate` accepts the verdict; statewide extraction UNLOCKED, O3 closed | `checkpoints/huntly-zonal-validation.md`; A7, A9 |
 | 2 | ~~**Task 0 forced-threshold path**~~ **Done 2026-08-29**: code landed in `c463a0a`; six-count replay verified (`diag_batch_e_readiness.py --check eligibility`); forced-144 register built at `curated/register/2026-08-29/` — 10,372 eligible / 538 insufficient / 30,833 / 8,421 / 0, total 50,164, `criteria_passed=false` preserved, decision record in the manifest | None — O8 closed 2026-08-25 (replay calls the production function) | `decisions/2026-08-25-batch-e-forced-threshold-entry.md` |
-| 3 | **E4 statewide extraction**: site × year × metric GeoParquet; footprint-keyed reads fanned out to sites; `shared_footprint_site_count` and `valid_support_px` on every row | Requires 1 and 2 | `plans/2026-08-22-batch-e-e4-e5.md` (FINAL) |
+| 3 | **E4 statewide extraction**: site × year × metric GeoParquet; footprint-keyed reads fanned out to sites; `shared_footprint_site_count` and `valid_support_px` on every row | Unblocked 2026-08-29 (1 and 2 both done); next critical-path step | `plans/2026-08-22-batch-e-e4-e5.md` (FINAL) |
 | 4 | **Batch F context**: DBCA-060 fire overlap (three-state, never inferred absence) and SILO climate joined to trajectories. `fetch-silo` (owner-run, not yet run against the real bucket) downloads the SILO open-data grids; `build-climate-context` builds the curated climate context from those grids | DBCA mirror route blocked pending evidence adjudication | D13 §5 |
 | 5 | **Batch G, re-scoped**: versioned releases, `export-release` command wiring `export_gate.export_public` (closes L10/L11), private QGIS project | Requires accepted Tier 1; web page withdrawn | `decisions/2026-08-25-public-web-page-descope.md` |
 | 6 | **Tier 2 deep-dive** (conditional): region chosen by pre-registered ranking; runs only if hard gates pass (≥30 eligible high-confidence sites, calibration cases, compute budget) | May legitimately not run | design §8 D4 |
@@ -54,7 +56,7 @@ needs no account, which is what closed O7 (A7).
 1. `docs/decisions/` — binding owner/director decisions.
 2. `docs/checkpoints/` — accepted batch results.
 3. `docs/amendments-and-limitations.md` — every post-freeze change
-   (A1–A8), every disclosed limitation (L1–L17), open items (O1–O8).
+   (A1–A9), every disclosed limitation (L1–L17), open items (O1–O8).
 4. `docs/plans/` — the design (`2026-08-15-...-design.md`), the Batch D
    implementation plan (kept: cited by amendments A3/A5), and the live
    Batch E plan (`2026-08-22-batch-e-e4-e5.md`, FINAL 2026-08-25).

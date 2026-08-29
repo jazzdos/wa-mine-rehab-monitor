@@ -1,9 +1,11 @@
 # Huntly Zonal Validation Checkpoint — D13 E5
 
-**Status:** _first live run executed 2026-08-29; verdict `passed: false` for
-two identified non-engine reasons; official passing verdict still pending._
-Every figure below is from real runs against the real jarrah data, inspected
-after the fact. Nothing is extrapolated from fixture tests.
+**Status:** **PASSED 2026-08-29.** The official verdict at
+`curated/huntly-validation/2026-08-29/validation.json` is `passed: true`
+with zero failures; `require_huntly_gate` digest-verifies it and unlocks
+`extract-trajectories --scope statewide` (O3 closed). Every figure below is
+from real runs against the real jarrah data, inspected after the fact.
+Nothing is extrapolated from fixture tests.
 
 ## What this gate is
 
@@ -49,8 +51,9 @@ sampling against a window-1 reference — cannot pass at any tolerance, and
 the per-site failure magnitudes (median |Δnbr| 1.9e-2, max 2.4e-1, larger
 where the window is more heterogeneous) are exactly the signature of that
 window mismatch. Correction record:
-`docs/decisions/2026-08-29-e5-reference-window-correction.md` (draft,
-pending owner authorisation).
+`docs/decisions/2026-08-29-e5-reference-window-correction.md` (authorised
+2026-08-29, A9). Run 1's verdict directory was deleted under that
+authorisation; this section is its surviving record.
 
 ## Run 2 (diagnostic, scratch data_root, 2026-08-29): the intended 3×3-vs-3×3
 
@@ -92,8 +95,20 @@ The w1 → w3 correction and the pixel-count waiver were authorised by the
 owner 2026-08-29 (A9,
 `docs/decisions/2026-08-29-e5-reference-window-correction.md`), with run
 1's mis-specified verdict deleted and the official run recorded under
-2026-08-29. Figures to be recorded here from the official verdict once it
-is run and inspected.
+2026-08-29. Run with the merged `compare()` fix (`d7bdc26` tree) and
+inspected:
 
+- **passed:** `true`; **n_failures:** 0
+- **n_compared:** 204,060 extracted rows accounted for;
+  **n_reference_rows:** 39,312 (196,560 rows value-compared; the
+  remaining 1,500 site-years × 5 metrics are the agreed all-NaN no-data
+  rows)
+- **n_sites:** 1,074; **window:** 3
+- **Tolerances used:** `spectral_abs=1e-6`, `fc_abs=0.1`,
+  `require_pixel_counts=False` (A9 waiver, recorded in the manifest)
+- **Output artefact:**
+  `curated/huntly-validation/2026-08-29/validation.json` +
+  `.run_manifest.json`
 - **`require_huntly_gate` outcome for `extract-trajectories --scope
-  statewide`:** to be recorded from the official verdict.
+  statewide`:** verdict digest-verified against its manifest and
+  accepted — statewide extraction UNLOCKED. O3 closed 2026-08-29.
