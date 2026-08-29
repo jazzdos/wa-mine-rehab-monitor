@@ -17,7 +17,7 @@ forced-threshold owner decision, 10,372 sites across 989 Maus
 footprints are eligible for Tier 1 extraction, and the forced-144
 register exists at `curated/register/2026-08-29/`. E5 engine parity
 passed 2026-08-29, so statewide extraction is unlocked. Verification
-battery: ruff, format, mypy, 910 tests green.
+battery: ruff, format, mypy, 1152 tests green (2026-08-29).
 
 ## Build sequence
 
@@ -30,9 +30,13 @@ battery: ruff, format, mypy, 910 tests green.
 | 5 | **Batch G, re-scoped**: versioned releases, `export-release` command wiring `export_gate.export_public` (closes L10/L11), private QGIS project | Requires accepted Tier 1; web page withdrawn | `decisions/2026-08-25-public-web-page-descope.md` |
 | 6 | **Tier 2 deep-dive** (conditional): region chosen by pre-registered ranking; runs only if hard gates pass (≥30 eligible high-confidence sites, calibration cases, compute budget) | May legitimately not run | design §8 D4 |
 
-Parallel items: the Tier 0 public-RC lane (repository flip, independent
-of this sequence, gated on a MINEDEX-free payload audit). O8 closed
-2026-08-25, so it no longer blocks anything.
+Parallel items: the Tier 0 public-RC lane completed 2026-08-29 — the
+D13 §8 P1-P6 build (licence states, evidence ledger, Tier 0 fallback
+packages, public tree/payload audits, flip checkpoint) merged to main,
+CI green, full-history secret scan clean, and the repository flipped
+public on the owner's explicit authorization
+(`checkpoints/tier0-public-rc.md`, all 16 fields true;
+`reviews/2026-08-29-public-rc-audit.md`).
 SILO registration is no longer one of them: the anonymous gridded route
 needs no account, which is what closed O7 (A7).
 
