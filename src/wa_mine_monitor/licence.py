@@ -262,8 +262,8 @@ SOURCES: dict[str, SourceLicence] = {
         source_id="dbca_060_fire",
         title="DBCA-060 Fire History",
         source_url="https://catalogue.data.wa.gov.au/dataset/fire-history-dbca-060",
-        licence_id="open",
-        licence_url="",
+        licence_id="CC-BY-4.0",
+        licence_url="https://creativecommons.org/licenses/by/4.0/",
         attribution_text=(
             "Contains fire history data from the Department of Biodiversity, "
             "Conservation and Attractions (DBCA), Fire History (DBCA-060)."
@@ -277,7 +277,11 @@ SOURCES: dict[str, SourceLicence] = {
             "establishes absence of fire, per CLAUDE.md's absence-of-a-record "
             "rule. Every site-year this project derives from DBCA-060 carries "
             "`fire_status in {recorded, not_recorded, unknown}`, never a bare "
-            "boolean."
+            "boolean. Licence corrected from the provisional 'open' "
+            "2026-08-29: CKAN dataset 3ce8a891-b050-4c38-952b-c40ca8bdc042 "
+            "records license_id cc-by (jarrah-verified 2026-07-20); the "
+            "staged snapshot carries a digested capture of the catalogue "
+            "page (see decisions/2026-08-29-dbca-mirror-declined.md)."
         ),
     ),
     "silo": SourceLicence(

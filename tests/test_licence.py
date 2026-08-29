@@ -433,3 +433,12 @@ def test_silo_licence_records_the_anonymous_gridded_route() -> None:
     assert "anonymous" in entry.notes.lower()
     assert entry.redistribute_public is True
     assert "SILO" in entry.attribution_text
+
+
+def test_dbca_060_fire_entry_is_cc_by_with_catalogue_evidence() -> None:
+    entry = SOURCES["dbca_060_fire"]
+    assert entry.licence_id == "CC-BY-4.0"
+    assert entry.licence_url == "https://creativecommons.org/licenses/by/4.0/"
+    assert entry.redistribute_public is True
+    assert "3ce8a891-b050-4c38-952b-c40ca8bdc042" in entry.notes
+    assert "NEVER a known-negative" in entry.notes

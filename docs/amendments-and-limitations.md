@@ -32,6 +32,7 @@ for the batches not yet run, with the measurements behind it, is in
 | A7 | 2026-08-25 | E5 Huntly gate re-scoped to engine parity on the jarrah pilot cube | none | `decisions/2026-08-25-e5-engine-parity-rescope.md` |
 | A8 | 2026-08-25 | Public web page withdrawn; output re-scoped to GeoParquet + private QGIS project | none | `decisions/2026-08-25-public-web-page-descope.md` |
 | A9 | 2026-08-29 | E5 reference corrected to `w3`; pixel-count check waived against a countless reference | none | `decisions/2026-08-29-e5-reference-window-correction.md` |
+| A10 | 2026-08-29 | D13 §6 F1 dissolved; mirror declined; authoritative route only | none | `decisions/2026-08-29-dbca-mirror-declined.md` |
 
 **A1 — execution host.** Batch C's measured volume re-derivation
 (597.1 GB windowed, 3.30 TB whole-tile upper bound) excluded the
@@ -138,6 +139,22 @@ columns — value agreement over every comparable row is the recorded
 parity evidence. Run 1's failing verdict is superseded and its
 directory deleted; figures preserved in
 `checkpoints/huntly-zonal-validation.md`. No protocol digest affected.
+
+**A10 — DBCA-060 mirror declined; D13 §6 F1 dissolved.** D13 §6 called
+F1 ("adjudicate DBCA-060 mirror provenance and licence evidence") a
+hard precondition on the mirror route. The mirror is never used: an
+AUTHORITATIVE Data WA package for DBCA-060 is already on disk
+(`~/data/jarrah-rehab/raw/dbca-060/2026-07-20/`, zip digests recorded).
+F1 exists solely to authorise the mirror, so with the authoritative
+route taken instead, F1 has nothing left to adjudicate and is
+dissolved, following the 2026-08-26 SILO precedent for dissolving a
+D13 Batch F precondition the actual route made objectless. F3 inherits
+two obligations from the dissolved F1: hash the unzipped `.gpkg`
+(the source digest file covers only the zips), and correct
+`licence.py`'s `dbca_060_fire` entry from a bare `"open"` to
+`CC-BY-4.0` with the CKAN catalogue URL, with a captured evidence file.
+The F4 coverage window is frozen at `[1937, snapshot_year - 1]`. Adds
+limitation L18. No protocol digest affected.
 
 ### What was deliberately not amended
 
@@ -294,6 +311,14 @@ flagged.** `n_tenements_intersecting` is nullable: 49,811 computed
 counts reconcile the same way. A zero and a not-computed are never
 conflated, but a reader who treats the column as a plain integer will
 misread the nulls.
+
+**L18 — DBCA-060 fire records are DBCA's own scope, not statewide
+coverage.** DBCA-060's own scope is fires on DBCA-managed land or
+where DBCA incurred costs; known gaps exist and spatial completeness
+is not modelled. `not_recorded` is therefore a statement about the
+RECORD for a covered year, never about the ground. No output ever
+treats it as a known-negative.
+`decisions/2026-08-29-dbca-mirror-declined.md`.
 
 ## 3. Open items
 
