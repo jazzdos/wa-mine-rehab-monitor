@@ -135,11 +135,14 @@ def test_data_root_artefacts_skip_with_disclosure_when_root_absent(tmp_path):
     assert result["failed"] == 0
 
 
-def test_committed_checkpoint_parses_verifies_and_does_not_yet_authorize():
+def test_committed_checkpoint_parses_verifies_and_authorizes():
+    # The three OWNER-ONLY fields were set on the owner's explicit
+    # 2026-08-29 instruction (evidence notes in the checkpoint), so the
+    # committed checkpoint now authorizes the flip.
     doc = public_rc.load_checkpoint(REPO_ROOT / "docs" / "checkpoints" / "tier0-public-rc.md")
     result = public_rc.verify_checkpoint_digests(doc, REPO_ROOT)
     assert result["failed"] == 0
-    assert public_rc.checkpoint_authorizes_flip(doc) is False
+    assert public_rc.checkpoint_authorizes_flip(doc) is True
 
 
 def test_load_checkpoint_refuses_missing_or_extra_fields(tmp_path):

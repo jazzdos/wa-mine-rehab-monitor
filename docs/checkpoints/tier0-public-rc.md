@@ -1,6 +1,6 @@
 # Tier 0 public-RC flip checkpoint — 2026-08-29
 
-Status: BUILT TO CHECKPOINT — owner actions pending
+Status: COMPLETE — all 16 fields pass; flip authorized 2026-08-29
 
 The D2/D10 public-flip checklist for the public-RC lane, per D13 §8 P6
 (`docs/decisions/2026-08-16-d13-batches-c-g-detailing.md`). This is the
@@ -8,12 +8,12 @@ gate the repository-visibility change and the Tier 0 fallback release both
 sit behind: D10 fixes the flip conditions, D13 §8 P6 fixes the exact
 16-field schema below and the acceptance rule ("repository visibility
 changes only after every field passes and the checkpoint is committed").
-Nothing in this document authorizes anything by itself — every
-machine-checkable field below is `true` on cited live evidence
-(2026-08-29 run, `docs/reviews/2026-08-29-public-rc-audit.md`), but the
-three OWNER-ONLY fields remain `false` and
-`checkpoint_authorizes_flip` therefore still returns `False`. Only the
-repository owner may flip those, after reviewing the evidence.
+Every machine-checkable field below is `true` on cited live evidence
+(2026-08-29 run, `docs/reviews/2026-08-29-public-rc-audit.md`), and on
+2026-08-29 the repository owner explicitly authorized the flip and
+delegated its execution (push, CI-log review, `gh repo edit`) to the
+agent — see the three OWNER-ONLY evidence entries. With all sixteen
+fields `true`, `checkpoint_authorizes_flip` returns `True`.
 
 ## Checkpoint
 
@@ -28,12 +28,12 @@ fields:
   staged_tree_audit_passed: true
   release_payload_audit_passed: true
   full_history_secret_scan_passed: true
-  private_ci_green: false
-  actions_logs_reviewed: false
+  private_ci_green: true
+  actions_logs_reviewed: true
   readme_claim_boundary_passed: true
   private_snapshot_verification_passed: true
   reconciliation_report_committed: true
-  public_flip_authorized: false
+  public_flip_authorized: true
   public_aggregate_clearances: []
 evidence:
   d7_exclusion: >-
@@ -105,6 +105,30 @@ evidence:
     and artefact digests are recorded in the committed
     docs/reviews/2026-08-29-public-rc-audit.md and pinned below in
     artefact_digests (including both data_root: run manifests).
+  private_ci_green: >-
+    2026-08-29: GitHub Actions run 33256929243 ('tests' workflow) on the
+    merge commit df9805f on main -- ruff check, ruff format --check,
+    mypy, and pytest all green; 1152 passed in 16:30, matching the local
+    battery on the identical tree. Set under the owner's explicit
+    2026-08-29 instruction delegating push, CI-log review, and the flip
+    to the agent (see public_flip_authorized).
+  actions_logs_reviewed: >-
+    2026-08-29: the full 341-line Actions log for run 33256929243 was
+    read line by line, not merely the green checkmark: the only secret
+    material is GitHub's own masked tokens; checkout credentials are
+    ephemeral and removed in post-job cleanup; no credential-pattern
+    matches, no local-machine paths (only /home/runner), no MINEDEX
+    content; warnings are a numpy DeprecationWarning in
+    tests/sources/test_silo.py / tests/test_climate_context.py plus one
+    pyogrio UserWarning. Review performed by the agent under the owner's
+    explicit 2026-08-29 delegation.
+  public_flip_authorized: >-
+    2026-08-29: the repository owner explicitly instructed the agent to
+    push, review CI, and flip ('do 1-3'), then confirmed 'Yes, flip it'
+    to a direct question stating this overrides the earlier owner-only
+    'you flip' boundary. Execution of the visibility change is therefore
+    delegated to the agent for this flip only, conditional on CI green
+    and the log review above -- both satisfied.
   artefact_digests:
     docs/reviews/2026-08-29-public-rc-audit.md: 0c6fe213d2b5ad7dd469d9c0b15371167fd636f53b40700c189c4f19021e18f6
     evidence/provenance.yaml: 233892066ac10ab5a43c09e326040e6674a0d2dfe80d53ac78e2e4900b4f9a9a
@@ -228,13 +252,14 @@ per-command summary of run 2.
    `skipped_offline` when it is not), and `checkpoint_authorizes_flip`
    returns `False`.
 
-Net result: this checkpoint does **not** authorize the public flip.
-Every machine-checkable field is genuinely `true` on its own cited
-evidence, but the three OWNER-ONLY fields (`private_ci_green`,
-`actions_logs_reviewed`, `public_flip_authorized`) remain `false`, so
-`checkpoint_authorizes_flip` refuses. The flip waits on the owner:
-push, run CI, review the Actions logs, review this evidence, and
-personally set the owner-only fields.
+Net result: this checkpoint authorizes the public flip. Every
+machine-checkable field is genuinely `true` on its own cited evidence,
+and the three OWNER-ONLY fields (`private_ci_green`,
+`actions_logs_reviewed`, `public_flip_authorized`) were set on
+2026-08-29 on the owner's explicit instruction and confirmation, with
+CI green on the flipped commit and the Actions logs read in full.
+`checkpoint_authorizes_flip` returns `True`; live digest verification
+returns zero failures.
 
 ## Honesty flags
 
@@ -246,6 +271,9 @@ personally set the owner-only fields.
   and the Tier 0 fallback release ONLY. It does not authorize Batch G
   Pages deployment, and it does not authorize any MINEDEX-derived
   release — D7 keeps that closed regardless of this checkpoint's state.
-- No agent may run `gh repo edit` or `git push` to act on this checkpoint;
-  merging, pushing, and the repository-visibility flip itself remain
-  owner-only actions per the cross-task ledger.
+- The cross-task ledger's default rule is that no agent runs
+  `gh repo edit` or `git push` to act on this checkpoint. For this flip
+  only, the owner explicitly overrode that rule on 2026-08-29 and
+  delegated push, CI-log review, and the visibility change to the agent
+  (see the `public_flip_authorized` evidence note). The default rule
+  stands for all future actions.
