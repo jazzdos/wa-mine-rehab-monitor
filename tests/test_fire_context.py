@@ -363,7 +363,7 @@ def _seed_dbca_snapshot(
     snapshots.write_snapshot_metadata(
         snapshot_dir,
         source="DBCA-060 Fire History",
-        endpoint="https://catalogue.data.wa.gov.au/dataset/fire-history-dbca-060",
+        endpoint="https://catalogue.data.wa.gov.au/dataset/dbca-fire-history",
         licence_note="CC-BY-4.0",
         purpose="test fixture",
     )

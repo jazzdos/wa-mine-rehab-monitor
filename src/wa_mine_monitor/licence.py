@@ -261,7 +261,7 @@ SOURCES: dict[str, SourceLicence] = {
     "dbca_060_fire": SourceLicence(
         source_id="dbca_060_fire",
         title="DBCA-060 Fire History",
-        source_url="https://catalogue.data.wa.gov.au/dataset/fire-history-dbca-060",
+        source_url="https://catalogue.data.wa.gov.au/dataset/dbca-fire-history",
         licence_id="CC-BY-4.0",
         licence_url="https://creativecommons.org/licenses/by/4.0/",
         attribution_text=(
