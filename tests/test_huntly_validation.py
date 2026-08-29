@@ -423,12 +423,70 @@ def test_comparison_compares_fc_metrics_unscaled():
 
 def test_comparison_fails_when_the_reference_has_no_row_for_a_site_year():
     report = huntly_validation.compare(
-        _extracted(year=1987),
+        _extracted(year=1987, computable=True),
         _reference(),
         huntly_validation.Tolerances(require_pixel_counts=False),
     )
     assert report.passed is False
     assert report.failures[0]["reason"] == "reference_row_missing"
+
+
+def test_comparison_agrees_when_a_not_computable_row_has_no_reference_row():
+    # The jarrah series contract drops a site-year row only when EVERY
+    # metric is NaN. A not-computable extracted row (an all-NaN window)
+    # whose (site_id, year) is absent from the reference is therefore
+    # AGREEMENT, not a defect: both sides found no data. It must not be
+    # reported as `reference_row_missing`, and it still counts toward
+    # `n_compared`. `_full_extracted()` covers `_reference()`'s own row so
+    # the only thing this comparison can fail on is the not-computable row
+    # under test.
+    extracted = pd.concat(
+        [
+            _full_extracted(),
+            _extracted(
+                year=1987, value=None, computable=False, not_computable_reason="zero_valid_pixels"
+            ),
+        ],
+        ignore_index=True,
+    )
+    report = huntly_validation.compare(
+        extracted,
+        _reference(),
+        huntly_validation.Tolerances(require_pixel_counts=False),
+    )
+    assert report.passed is True
+    assert report.failures == []
+    assert report.n_compared == 6
+
+
+def test_comparison_mixed_computability_only_flags_the_computable_row_as_missing():
+    # Same absent (site_id, year) key, two metric rows -- one computable,
+    # one not. Only the computable one is a real defect; the not-computable
+    # one is agreement under the reference's all-NaN drop contract.
+    extracted = pd.concat(
+        [
+            _extracted(year=1987, metric="nbr", computable=True),
+            _extracted(
+                year=1987,
+                metric="ndmi",
+                value=None,
+                computable=False,
+                not_computable_reason="zero_valid_pixels",
+            ),
+        ],
+        ignore_index=True,
+    )
+    report = huntly_validation.compare(
+        extracted,
+        _reference(),
+        huntly_validation.Tolerances(require_pixel_counts=False),
+    )
+    assert report.passed is False
+    year_1987_failures = [f for f in report.failures if f["year"] == 1987]
+    assert len(year_1987_failures) == 1
+    assert year_1987_failures[0]["metric"] == "nbr"
+    assert year_1987_failures[0]["reason"] == "reference_row_missing"
+    assert report.n_compared == 2
 
 
 def test_comparison_fails_a_not_computable_row_the_reference_does_carry():

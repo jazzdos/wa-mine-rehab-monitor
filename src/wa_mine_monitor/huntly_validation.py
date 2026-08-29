@@ -414,8 +414,16 @@ def compare(
     Every extracted row is accounted for: it either matches inside
     tolerance or appears in `failures` with a named `reason`
     (`reference_row_missing`, `pixel_count_mismatch`, `computability_mismatch`,
-    `value_outside_tolerance`). A row is never dropped for being
-    inconvenient, and `passed` is `False` the moment any failure exists.
+    `value_outside_tolerance`) -- with ONE exception. The jarrah reference
+    generator's contract (`series.py`, jarrah-rehab) drops a site-year row
+    only when EVERY metric is NaN for it; a site-year whose sampled window
+    is fully masked therefore has no reference row at all, by design. So
+    when an extracted row is NOT computable (an all-NaN window for that
+    metric) AND its `(site_id, year)` has no reference row, that is
+    AGREEMENT -- both sides found no data for that site-year -- and it is
+    not appended to `failures`, though it still counts toward
+    `n_compared`. A row is never otherwise dropped for being inconvenient,
+    and `passed` is `False` the moment any failure exists.
 
     COVERAGE (the other direction): the `validate-huntly` verdict is the
     SOLE unlock for statewide extraction
@@ -491,7 +499,8 @@ def compare(
         try:
             reference_row = indexed.loc[key]
         except KeyError:
-            failures.append({**base, "reason": "reference_row_missing"})
+            if bool(row["computable"]):
+                failures.append({**base, "reason": "reference_row_missing"})
             continue
         if tolerances.require_pixel_counts:
             mismatched = {
