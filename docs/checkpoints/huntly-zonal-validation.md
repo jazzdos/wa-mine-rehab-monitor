@@ -13,9 +13,12 @@ Per the 2026-08-25 owner decision
 test: the monitor's own zonal engine (`huntly_validation.sample_pilot_cube`)
 samples jarrah's own pilot-cube composite COGs at jarrah's own site points,
 and the result is compared against jarrah's own reference series at the D13
-tolerances. Same rasters, same pixels, same formula — a failure is a real
-defect in the monitor's zonal reduction, the only thing this gate can
-usefully protect.
+tolerances. Same rasters, same pixels, same formula — under which a failure
+is a real defect in the monitor's zonal reduction, the only thing this gate
+can usefully protect. Run 1 below shows the comparison AS DECIDED did not
+have that property: the decision named a reference built from different
+pixels (window=1), so its failures say nothing about the engine. The
+framing holds only for the corrected w3 comparison run 2 performs.
 
 ## Run 1 (curated, 2026-08-29): the run as decided, and why it failed
 
@@ -54,11 +57,15 @@ pending owner authorisation).
 Same command against `series_incumbent_w3.parquet` (window=3 both sides),
 written to a scratch `data_root`, never to the curated tree:
 
-- **n_compared:** 204,060; **n_reference_rows:** 39,312
-- **`value_outside_tolerance`: 0. `computability_mismatch`: 0.** Every one
-  of the 204,060 value comparisons agrees within `1e-6` (nbr/ndmi) and
-  `0.1` (FC). The monitor's zonal reduction reproduces jarrah's to
-  tolerance across the full cube.
+- **n_compared:** 204,060 extracted rows accounted for;
+  **n_reference_rows:** 39,312, so 196,560 rows had a reference row to
+  compare against (the other 1,500 site-years × 5 metrics are the agreed
+  no-data rows below — `n_compared` counts accounted-for rows, not
+  performed value comparisons)
+- **`value_outside_tolerance`: 0. `computability_mismatch`: 0.** Every row
+  with a reference value agrees within `1e-6` (nbr/ndmi) and `0.1` (FC).
+  The monitor's zonal reduction reproduces jarrah's to tolerance on every
+  comparable row of the cube.
 - **n_failures:** 7,500 — all `reference_row_missing`: 1,500 site-years
   × 5 metrics, clustered in known gap years (1993, 1999, 2001, 2013, …).
   All 1,500 were re-sampled independently and every band's 3×3 window is
