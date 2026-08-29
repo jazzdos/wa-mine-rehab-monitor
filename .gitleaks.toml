@@ -1,0 +1,21 @@
+# gitleaks config for the full-history secret scan required by the Tier 0
+# public-RC flip checkpoint (docs/checkpoints/tier0-public-rc.md,
+# full_history_secret_scan_passed). Extends the default ruleset; the
+# allowlist below names ONLY known synthetic detector fixtures -- fake
+# credentials planted by the tests themselves -- each adjudicated in
+# docs/reviews/2026-08-29-public-rc-audit.md. Never allowlist a real
+# credential here: rotate it and rewrite history instead.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Synthetic planted fixtures in tests (fake by construction)"
+regexes = [
+  # tests/test_public_audits.py: sequential-alphabet fake AWS key id used
+  # to test public_audit's credential detector.
+  '''AKIAABCDEFGHIJKLMNOP''',
+  # tests/test_cli.py: fake token in a comment documenting the
+  # manifest secret-scrubbing test's planted input.
+  '''hunter3SECRET''',
+]

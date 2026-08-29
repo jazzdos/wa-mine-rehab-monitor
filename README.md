@@ -1,5 +1,7 @@
 # WA Mine Rehabilitation Spectral Monitor
 
+Descriptive spectral change chronologies; not a compliance or performance assessment.
+
 A statewide, descriptive spectral-chronology monitor for mine sites carried
 in the Western Australian MINEDEX register, built on Digital Earth
 Australia's Fractional Cover and SWIR-based indices.
@@ -20,13 +22,30 @@ This project publishes descriptive spectral chronologies for MINEDEX sites
 in the monitoring frame. Every onset reported by the monitor is a spectral
 detection, presented as a detection year or interval — it is never
 presented as an event date, never as an operational rehabilitation date,
-and never as a compliance or performance finding. A spectral detection
+and never as a finding about compliance or performance. A spectral detection
 records that an optical metric changed in the observed time series; it does
 not record what caused the change, when any physical or operational
 activity occurred on the ground, or whether a site meets any regulatory or
 performance standard. Readers who need an operational rehabilitation date
 or a compliance determination should consult the primary regulatory record
 for the site in question, not this monitor.
+
+## Public fallback layers
+
+This project's internal MINEDEX monitoring frame is private and D7-closed
+(`docs/decisions/2026-08-16-d6-d8-dasc-acquisition-and-minedex-licence.md`):
+MINEDEX-derived rows are not distributed, in this repository or in any
+public release built from it. The public repository ships only two
+licence-clean reference-layer fallbacks in place of that frame:
+
+- `tier0-tenements` — the DMIRS-003 Mining Tenements extract, CC-BY-4.0.
+- `tier0-maus-wa` — the Maus et al. v2 global mining-polygons WA extract,
+  CC-BY-SA-4.0 with a modification statement.
+
+Owners recorded against these fallback layers are recorded as owners, not
+operators: this project never asserts who operates a site, only who is
+named as an owner in the source register (D8,
+`docs/decisions/2026-08-16-d6-d8-dasc-acquisition-and-minedex-licence.md`).
 
 ## Status
 
