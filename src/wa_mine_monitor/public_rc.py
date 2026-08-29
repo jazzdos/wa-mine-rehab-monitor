@@ -486,6 +486,16 @@ def checkpoint_authorizes_flip(doc: dict[str, Any]) -> bool:
     stays closed -- never evidence of a licence clearing), and
     `public_aggregate_clearances` must actually be a list, not merely
     truthy.
+
+    This function is HALF of the authorization story, never the whole of
+    it: a True here says only that the checkpoint document's fields and
+    wording pass. The evidence behind those fields must independently
+    verify via `verify_checkpoint_digests(doc, repo_root,
+    data_root=...)` with `failed == 0` and no `skipped_offline` gaps left
+    unexplained -- an all-true checkpoint whose cited artefacts are
+    missing, tampered with, or unverifiable authorizes nothing. Both
+    checks are required by the checkpoint doc and D13 §8 P6; no caller
+    may treat this boolean alone as authorization.
     """
     try:
         fields = doc["fields"]

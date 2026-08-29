@@ -157,12 +157,67 @@ _SNIFF_BYTES = 65536
 #: version directory is authorised to ship. Extension/evidence-name rules
 #: are skipped for a matching filename; content rules (credential, local
 #: path, geometry, MINEDEX lineage) still apply -- an authorised filename
-#: does not authorise leaked content inside it.
+#: does not authorise leaked content inside it. The two parquet entries
+#: are EXACT package filenames, never a `tier0-*` glob: a
+#: `tier0-anything-else.parquet` dropped into the release directory is a
+#: bulk-format finding, not an authorised artefact.
 _RELEASE_ALLOWED_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"^tier0-.*\.parquet$"),
+    re.compile(r"^tier0-tenements\.parquet$"),
+    re.compile(r"^tier0-maus-wa\.parquet$"),
     re.compile(r"^RELEASE_NOTES\.md$"),
     re.compile(r".*\.run_manifest\.json$"),
 )
+
+#: The two authorised Tier-0 package files, mapped to the name of the
+#: `public_rc` field tuple holding their exact, ordered column schema.
+#: `audit_file` opens each one's Parquet schema in release mode and
+#: refuses any mismatch: an authorised *filename* proves nothing about
+#: the columns written inside it, and a substituted package smuggling
+#: e.g. MINEDEX columns would otherwise pass an audit whose content
+#: sniff never opens binary payloads.
+_RELEASE_PACKAGE_SCHEMA_ATTRS: dict[str, str] = {
+    "tier0-tenements.parquet": "TIER0_TENEMENTS_FIELDS",
+    "tier0-maus-wa.parquet": "TIER0_MAUS_FIELDS",
+}
+
+
+def _package_schema_findings(rel_path: str, full_path: Path) -> list[Finding]:
+    """Check an authorised Tier-0 package parquet's column schema, fail
+    closed: unreadable-as-parquet and schema-mismatch are both findings.
+
+    Imports are deferred -- `public_rc` (the schema source of truth) pulls
+    in geopandas, which the tree-audit path never needs. The note text
+    stays fixed: a substituted package's actual column names are exactly
+    the kind of content this audit must not copy into its own output.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from wa_mine_monitor import public_rc
+
+    expected: tuple[str, ...] = getattr(
+        public_rc, _RELEASE_PACKAGE_SCHEMA_ATTRS[Path(rel_path).name]
+    )
+    try:
+        names = tuple(pq.read_schema(full_path).names)
+    except (OSError, pa.ArrowException):
+        return [
+            Finding(
+                rel_path,
+                "package_schema",
+                "authorised package filename is not readable as parquet",
+            )
+        ]
+    if names != expected:
+        return [
+            Finding(
+                rel_path,
+                "package_schema",
+                "parquet column schema does not match the authorised Tier-0 package schema",
+            )
+        ]
+    return []
+
 
 #: Fixture paths this audit permits despite looking data-shaped: committed
 #: DEA STAC collection/item JSON stubs used by `tests/sources`. Each is a
@@ -367,6 +422,9 @@ def audit_file(
             findings.append(
                 Finding(rel_path, "evidence_bundle", "licence/provenance evidence artefact")
             )
+
+    if release_mode and name in _RELEASE_PACKAGE_SCHEMA_ATTRS:
+        findings.extend(_package_schema_findings(rel_path, full_path))
 
     findings.extend(
         _content_findings(rel_path, full_path, skip_credential=rel_path in credential_allowlist)

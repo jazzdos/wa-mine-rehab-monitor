@@ -74,7 +74,7 @@ evidence:
     2026-08-29 live run (run 2): gitleaks 8.30.1, gitleaks git
     --no-banner --log-opts=--all (all refs), 75 commits scanned.
     Baseline default-rules scan found 2 findings, both adjudicated as
-    synthetic planted test fixtures (AKIAABCDEFGHIJKLMNOP in
+    synthetic planted test fixtures (the fake AKIA-prefixed key in
     tests/test_public_audits.py; a fake api_token in tests/test_cli.py's
     scrub test) and allowlisted narrowly in .gitleaks.toml; final scan
     with that config: no leaks found, exit 0. Full adjudication in
@@ -106,7 +106,7 @@ evidence:
     docs/reviews/2026-08-29-public-rc-audit.md and pinned below in
     artefact_digests (including both data_root: run manifests).
   artefact_digests:
-    docs/reviews/2026-08-29-public-rc-audit.md: a1241296a82af448fd37dc877a1be8f5c719593e74cf9d28ac286a2f38448645
+    docs/reviews/2026-08-29-public-rc-audit.md: 0c6fe213d2b5ad7dd469d9c0b15371167fd636f53b40700c189c4f19021e18f6
     evidence/provenance.yaml: 233892066ac10ab5a43c09e326040e6674a0d2dfe80d53ac78e2e4900b4f9a9a
     data_root:releases/tier0-public-rc/2026.08.29/tier0-tenements.parquet.run_manifest.json: ea0a7c7078735c90cc0b4ee1958d6880bb8b4a42bf816484dc7e7e7308d9d8a8
     data_root:releases/tier0-public-rc/2026.08.29/tier0-maus-wa.parquet.run_manifest.json: 1568b9745952674f1b863223a783ec713fb522fd579b66369004f5d4580c04ab

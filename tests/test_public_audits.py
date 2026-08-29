@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from wa_mine_monitor import public_audit
+from wa_mine_monitor import public_audit, public_rc
 from wa_mine_monitor.public_audit import (
     EmptyReleaseDirError,
     Finding,
@@ -296,10 +296,21 @@ def test_audit_output_redacts_matches(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _write_parquet(version_dir: Path, name: str, columns: tuple[str, ...]) -> None:
+    """Write a real (minimal) parquet file whose column names are exactly
+    `columns`, in order -- the schema gate reads names only, so one string
+    row per column suffices."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    version_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.table({column: ["x"] for column in columns}), version_dir / name)
+
+
 def test_release_payload_audit_permits_the_rc_artefacts(tmp_path: Path) -> None:
     version_dir = tmp_path / "v0.1.0"
-    _write(version_dir, "tier0-tenements.parquet", b"\x00\x01")
-    _write(version_dir, "tier0-maus-wa.parquet", b"\x00\x01")
+    _write_parquet(version_dir, "tier0-tenements.parquet", public_rc.TIER0_TENEMENTS_FIELDS)
+    _write_parquet(version_dir, "tier0-maus-wa.parquet", public_rc.TIER0_MAUS_FIELDS)
     _write(version_dir, "RELEASE_NOTES.md", "# Release notes\n")
     _write(version_dir, "tier0-tenements.parquet.run_manifest.json", "{}")
 
@@ -309,6 +320,34 @@ def test_release_payload_audit_permits_the_rc_artefacts(tmp_path: Path) -> None:
     _write(version_dir, "Sites.csv", "SiteCode,Foo\n1,2\n")
     findings_with_leak = audit_release_dir(version_dir)
     assert "minedex_lineage" in _rules(findings_with_leak)
+
+
+def test_release_payload_audit_flags_unauthorised_tier0_parquet(tmp_path: Path) -> None:
+    version_dir = tmp_path / "v0.1.0"
+    _write_parquet(version_dir, "tier0-private.parquet", ("anything",))
+
+    findings = audit_release_dir(version_dir)
+    assert "bulk_format" in _rules(findings)
+
+
+def test_release_payload_audit_flags_package_schema_mismatch(tmp_path: Path) -> None:
+    version_dir = tmp_path / "v0.1.0"
+    smuggled = (*public_rc.TIER0_TENEMENTS_FIELDS, "SiteCode")
+    _write_parquet(version_dir, "tier0-tenements.parquet", smuggled)
+
+    findings = audit_release_dir(version_dir)
+    assert "package_schema" in _rules(findings)
+    # The safe fixed note must not copy the substituted package's actual
+    # column names into the audit's own output.
+    assert all("SiteCode" not in finding.note for finding in findings)
+
+
+def test_release_payload_audit_flags_unreadable_package_parquet(tmp_path: Path) -> None:
+    version_dir = tmp_path / "v0.1.0"
+    _write(version_dir, "tier0-maus-wa.parquet", b"\x00\x01")
+
+    findings = audit_release_dir(version_dir)
+    assert "package_schema" in _rules(findings)
 
 
 def test_release_payload_audit_refuses_missing_version_dir(tmp_path: Path) -> None:

@@ -158,16 +158,17 @@ Baseline scan (default rules, no config):
 **2 findings**, both adjudicated as synthetic planted fixtures:
 
 1. `aws-access-token` — `tests/test_public_audits.py` (commit
-   `9d7366f8`), match `AKIAABCDEFGHIJKLMNOP`: the sequential-alphabet
-   fake key the test itself plants (`_write(tmp_path, "cfg.py",
-   'aws_secret_access_key = "AKIAABCDEFGHIJKLMNOP"')`) to prove the
-   credential detector fires. Fake by construction — not a rotatable
-   secret.
-2. `generic-api-key` — `tests/test_cli.py` (commit `dd70b54b`), match
-   `api_token': 'hunter3SECRET'`: the planted input of the manifest
-   secret-scrubbing test, today documented at `tests/test_cli.py:219`
-   as the offending `input_value` that the scrub test asserts is
-   redacted. Fake by construction.
+   `9d7366f8`): the planted fake key in the AWS-key credential-detector
+   test — an AKIA-prefixed, sequential-alphabet 16-letter string the
+   test writes into a fixture file to prove the detector fires. Fake by
+   construction — not a rotatable secret. (Neither the literal nor the
+   test's own name is repeated here, since both match the credential
+   sniff; see the test file and `.gitleaks.toml`.)
+2. `generic-api-key` — `tests/test_cli.py` (commit `dd70b54b`): the
+   planted `api_token` value of the manifest secret-scrubbing test
+   (a "hunter2"-style joke token), today documented at
+   `tests/test_cli.py:219` as the offending `input_value` the scrub
+   test asserts is redacted. Fake by construction.
 
 Both fixtures were then allowlisted in `.gitleaks.toml` (narrow,
 literal-string regexes; config extends the default ruleset; the file's
@@ -217,6 +218,37 @@ Run 1's noted anomaly (`test_every_literal_redistribute_use_is_exempted_or_absen
 failing on stale `cli.py:<lineno>` keys) was fixed by an
 order-preserving remap of the `EXEMPTIONS` keys after each `cli.py`
 edit; the test passes on the final tree.
+
+## Post-review hardening (codex diff review, 2026-08-29)
+
+The pre-merge codex review of the branch diff returned three findings;
+disposition:
+
+1. **Confirmed and fixed** — the release-payload audit accepted any
+   `tier0-*.parquet` filename and never opened parquet content, so a
+   substituted or extra package (e.g. carrying MINEDEX columns) passed
+   unexamined. Fixed in `public_audit.py`: the release allowlist now
+   names the two authorised package files exactly (any other
+   `tier0-*.parquet` is a `bulk_format` finding), and each authorised
+   package's parquet schema is read and must equal the exact ordered
+   `public_rc` field tuple — unreadable-as-parquet and schema mismatch
+   are both `package_schema` findings with fixed, content-free notes.
+   Covered by three new tests in `tests/test_public_audits.py`; the
+   permitted-fixture test now writes real parquet with the authorised
+   schemas. The live payload audit re-run passes (0 findings, 5 files).
+2. **Refuted (spec-consistent)** — "`licence_state` not wired into
+   `export_public`". The approved design fixes `export_public`'s
+   runtime column gate as the controlling gate (D13 P1 acceptance) and
+   enforces state/boolean consistency via the conformance invariant
+   `entry.redistribute_public is (entry.licence_state is
+   LicenceState.PUBLIC)` over every registered source, so the divergent
+   row the finding posits cannot exist without a failing test.
+3. **Refuted as designed, docstring hardened** — "`
+   checkpoint_authorizes_flip` doesn't verify digests". The two-call
+   design (booleans+wording vs digest verification) is the plan's
+   explicit authorization story; the docstring now states that the
+   boolean check is half of authorization and must be paired with
+   `verify_checkpoint_digests(...)["failed"] == 0`.
 
 ## Fields left false and why
 
