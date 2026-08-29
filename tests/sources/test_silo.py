@@ -551,6 +551,11 @@ def test_fetch_silo_refuses_a_stray_part_file_left_by_an_earlier_range(
     run's per-year loop, so without the pre-finalize gate it would be
     checksummed into SHA256SUMS.txt and verify clean -- a finalized
     snapshot carrying a truncated file.
+
+    The gate runs BEFORE the fetch loop, not just before finalize: each
+    annual object is ~410 MB and this command exists to be run off a
+    metered connection, so a stray file must cost nothing to discover.
+    `n_downloads == 0` is the assertion that keeps it there.
     """
     data_root = tmp_path / "data"
     cfg_file = _write_config(tmp_path, data_root)
@@ -559,7 +564,11 @@ def test_fetch_silo_refuses_a_stray_part_file_left_by_an_earlier_range(
     snapshot_dir = snapshots.create_snapshot_dir(data_root, "silo", "2026-08-30")
     (snapshot_dir / "2005.daily_rain.nc.part").write_bytes(b"truncated")
 
+    n_downloads = 0
+
     def fake_download(url: str, dest_path: Path, **kwargs: object) -> Path:
+        nonlocal n_downloads
+        n_downloads += 1
         return _write_statewide_year_nc(Path(dest_path), 2001)
 
     monkeypatch.setattr(cli_module, "download_annual_file", fake_download)
@@ -581,4 +590,6 @@ def test_fetch_silo_refuses_a_stray_part_file_left_by_an_earlier_range(
     payload = json.loads(result.output)
     assert "refusal" in payload
     assert "2005.daily_rain.nc.part" in json.dumps(payload)
+    assert "before fetching" in payload["refusal"]
+    assert n_downloads == 0
     assert not (snapshot_dir / "SHA256SUMS.txt").exists()
