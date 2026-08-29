@@ -1,6 +1,6 @@
 # Road map
 
-Current to 2026-08-25. This file is derivative, like the amendments
+Current to 2026-08-29. This file is derivative, like the amendments
 register: the decision and checkpoint records it cites remain
 authoritative and win on any disagreement.
 
@@ -28,10 +28,11 @@ ruff, format, mypy, 737 tests green.
 | 5 | **Batch G, re-scoped**: versioned releases, `export-release` command wiring `export_gate.export_public` (closes L10/L11), private QGIS project | Requires accepted Tier 1; web page withdrawn | `decisions/2026-08-25-public-web-page-descope.md` |
 | 6 | **Tier 2 deep-dive** (conditional): region chosen by pre-registered ranking; runs only if hard gates pass (≥30 eligible high-confidence sites, calibration cases, compute budget) | May legitimately not run | design §8 D4 |
 
-Parallel items: SILO registration (lead time for step 4); O8
-eligibility-replay bucketing (blocks only Task 0's six-count
-assertion); the Tier 0 public-RC lane (repository flip, independent of
-this sequence, gated on a MINEDEX-free payload audit).
+Parallel items: O8 eligibility-replay bucketing (blocks only Task 0's
+six-count assertion); the Tier 0 public-RC lane (repository flip,
+independent of this sequence, gated on a MINEDEX-free payload audit).
+SILO registration is no longer one of them: the anonymous gridded route
+needs no account, which is what closed O7 (A7).
 
 ## Architectural decisions, justified
 
