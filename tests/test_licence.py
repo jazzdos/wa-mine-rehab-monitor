@@ -415,3 +415,21 @@ def test_wa_rdc_regions_licence_notes_record_the_2026_08_21_repin():
     record = SOURCES["wa_rdc_regions"]
     assert "public-services.slip.wa.gov.au" in record.notes
     assert "2026-08-21" in record.notes
+
+
+def test_silo_licence_records_the_anonymous_gridded_route() -> None:
+    """This project consumes SILO's GRIDDED product from the anonymous
+    AWS open-data bucket (CC BY 4.0), not the account-gated point/Data
+    Drill API. The licence entry must say so: a reader deciding whether
+    an export is redistributable reasons from these fields, and
+    "open-with-account" would send them chasing a credential that does
+    not exist on this route. O7 closes on this fact rather than on a
+    registration -- see docs/decisions/2026-08-26-silo-gridded-feed.md.
+    """
+    entry = SOURCES["silo"]
+    assert entry.licence_id == "CC-BY-4.0"
+    assert entry.licence_url == "https://creativecommons.org/licenses/by/4.0/"
+    assert "silo-open-data" in entry.notes
+    assert "anonymous" in entry.notes.lower()
+    assert entry.redistribute_public is True
+    assert "SILO" in entry.attribution_text

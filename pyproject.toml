@@ -16,6 +16,7 @@ dependencies = [
     "requests>=2.32",
     "pyproj>=3.6",
     "rasterio>=1.5,<2",
+    "netcdf4>=1.7",
 ]
 
 [project.scripts]
@@ -50,7 +51,9 @@ check_untyped_defs = true
 # a py.typed marker -- and are imported by `sources/tenements.py`. shapely
 # carries the identical gap too -- no py.typed marker -- and is imported by
 # `sources/maus.py` (`shapely.geometry.box`, the WA_BBOX clip mask).
-module = ["pandas.*", "pyarrow.*", "geopandas.*", "pyogrio.*", "shapely.*"]
+# netCDF4 carries the identical gap -- no py.typed marker -- and is
+# imported by `sources/silo.py`.
+module = ["pandas.*", "pyarrow.*", "geopandas.*", "pyogrio.*", "shapely.*", "netCDF4.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

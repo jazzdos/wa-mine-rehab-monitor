@@ -13,8 +13,11 @@ Every knob lives in a frozen ``RetryPolicy`` a source declares once. The
 session, the sleep function and the clock are all injectable so tests drive
 the full retry loop without a network or a real wait. Exhausted-attempt
 errors carry the URL with userinfo and query string REMOVED -- query values
-can carry credentials (SILO's API key travels as a query param), and an
-exception message ends up in logs and structured refusals.
+can carry credentials (an API key travels as a query param on some sources),
+and an exception message ends up in logs and structured refusals. SILO is
+fetched anonymously from its open-data bucket in this project, so no
+credential of its own is at risk here, but the redaction is unconditional
+because the client is shared across sources that do carry one.
 """
 
 from __future__ import annotations

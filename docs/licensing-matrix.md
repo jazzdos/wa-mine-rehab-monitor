@@ -44,7 +44,7 @@ gate itself can enforce.
 | Maus et al. global mining polygons, v2 | https://doi.pangaea.de/10.1594/PANGAEA.942325 | CC-BY-SA-4.0 | **True**, share-alike package | "Contains data derived from Maus, V. et al., \"An update on global mining land use\" (PANGAEA.942325), licensed under CC-BY-SA-4.0. This derived work is licensed under CC-BY-SA-4.0." |
 | Hansen/UMD/Google/USGS/NASA Global Forest Change (`GFC-2024-v1.12`) | https://glad.earthengine.app/view/global-forest-change | CC-BY-4.0, conditional | **True**, conditional on both credit strings | see "Hansen credit strings" below — both required, not interchangeable |
 | DBCA-060 Fire History | https://catalogue.data.wa.gov.au/dataset/fire-history-dbca-060 | open | **True**, context-only | "Contains fire history data from the Department of Biodiversity, Conservation and Attractions (DBCA), Fire History (DBCA-060)." |
-| SILO Climate Database | https://www.longpaddock.qld.gov.au/silo/ | open, account-gated | **True** | "Contains climate data sourced from the Queensland Government's SILO climate database (longpaddock.qld.gov.au/silo)." |
+| SILO Climate Database | https://www.longpaddock.qld.gov.au/silo/ | CC BY 4.0 (gridded, anonymous) | **True** | "Contains climate data sourced from the Queensland Government's SILO climate database (longpaddock.qld.gov.au/silo)." |
 
 ## Snapshot policy
 
@@ -57,7 +57,8 @@ DEA collections are versioned STAC collections read at fetch time; DMIRS-001,
 DMIRS-003 and DBCA-060 are Data WA catalogue extracts pinned to the extract
 date; Maus v2 is the fixed PANGAEA DOI above (no rolling "latest" pointer);
 Hansen GFC is pinned to the named product version (`GFC-2024-v1.12`); SILO is
-fetched per date range under the account-gated API.
+fetched as whole annual gridded NetCDF objects (`<year>.daily_rain.nc`) from
+the anonymous open-data bucket.
 
 ## Transformation notice
 
@@ -75,6 +76,11 @@ rather than presenting them as an unmodified copy.
   collections, DEA Fractional Cover Percentiles, DMIRS-003 Mining Tenements.
   Read from each source's own licence field (a STAC collection's `license`
   key, or Data WA's `license_id`), never inferred from the operating agency.
+  SILO Climate Database is also in this group: this project consumes SILO's
+  GRIDDED product as whole annual NetCDF objects from the anonymous AWS
+  open-data bucket (`s3://silo-open-data`, ap-southeast-2), CC BY 4.0, no
+  account and no credential on that route. The account-gated point/Data
+  Drill API is a different SILO product and is not used here.
 - **Fail-closed (`redistribute_public=False`):** DMIRS-001 MINEDEX. Data WA's
   catalogue record for `minedex-dmirs-001` states `license_id: cc-nc`
   (CC-BY-NC-4.0). WA's Digital Atlas of Sustainability and Conservation
@@ -167,9 +173,6 @@ rather than presenting them as an unmodified copy.
   "not recorded" is never treated as a known-negative fire label — every
   site-year this project derives from it carries `fire_status ∈ {recorded,
   not_recorded, unknown}`, never a bare boolean.
-- **Open, account-gated (`redistribute_public=True`):** SILO. Access requires
-  a registered email address (an account credential, not a payment or a use
-  restriction); derived rainfall context is redistributable.
 
 ## Hansen credit strings
 
