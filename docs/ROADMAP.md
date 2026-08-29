@@ -21,16 +21,16 @@ ruff, format, mypy, 737 tests green.
 
 | # | Step | Gate / blocker | Record |
 |---|---|---|---|
-| 1 | **E5 engine parity**: monitor's zonal engine reproduces the jarrah pilot-cube reference series (NBR/NDMI ≤ 1e-6, FC ≤ 0.1 pp). Runnable now; touches no DEA data. | Verdict artefact under `curated/huntly-validation/<date>/` is the sole unlock for statewide extraction (O3) | `decisions/2026-08-25-e5-engine-parity-rescope.md` |
-| 2 | **Task 0 forced-threshold path**: `d3_forced_threshold` column, `--forced-threshold`/`--decision-record` CLI flags, `criteria_passed=false` preserved | Code path does not exist yet; O8 replay assertion pending | `decisions/2026-08-25-batch-e-forced-threshold-entry.md` |
+| 1 | **E5 engine parity**: monitor's zonal engine reproduces the jarrah pilot-cube reference series (NBR/NDMI ≤ 1e-6, FC ≤ 0.1 pp). First live run 2026-08-29: engine parity PROVEN against the true 3×3 reference (`series_incumbent_w3.parquet`, 204,060 comparisons, zero outside tolerance); the curated verdict failed only because the rescope decision misnamed the single-pixel `w1` series as the 3×3 reference | Passing verdict artefact under `curated/huntly-validation/<date>/` is still the sole unlock for statewide extraction (O3); pending owner authorisation of the w1→w3 correction (`decisions/2026-08-29-e5-reference-window-correction.md`, DRAFT) and the official re-run | `checkpoints/huntly-zonal-validation.md`; `decisions/2026-08-25-e5-engine-parity-rescope.md` |
+| 2 | ~~**Task 0 forced-threshold path**~~ **Done 2026-08-29**: code landed in `c463a0a`; six-count replay verified (`diag_batch_e_readiness.py --check eligibility`); forced-144 register built at `curated/register/2026-08-29/` — 10,372 eligible / 538 insufficient / 30,833 / 8,421 / 0, total 50,164, `criteria_passed=false` preserved, decision record in the manifest | None — O8 closed 2026-08-25 (replay calls the production function) | `decisions/2026-08-25-batch-e-forced-threshold-entry.md` |
 | 3 | **E4 statewide extraction**: site × year × metric GeoParquet; footprint-keyed reads fanned out to sites; `shared_footprint_site_count` and `valid_support_px` on every row | Requires 1 and 2 | `plans/2026-08-22-batch-e-e4-e5.md` (FINAL) |
 | 4 | **Batch F context**: DBCA-060 fire overlap (three-state, never inferred absence) and SILO climate joined to trajectories. `fetch-silo` (owner-run, not yet run against the real bucket) downloads the SILO open-data grids; `build-climate-context` builds the curated climate context from those grids | DBCA mirror route blocked pending evidence adjudication | D13 §5 |
 | 5 | **Batch G, re-scoped**: versioned releases, `export-release` command wiring `export_gate.export_public` (closes L10/L11), private QGIS project | Requires accepted Tier 1; web page withdrawn | `decisions/2026-08-25-public-web-page-descope.md` |
 | 6 | **Tier 2 deep-dive** (conditional): region chosen by pre-registered ranking; runs only if hard gates pass (≥30 eligible high-confidence sites, calibration cases, compute budget) | May legitimately not run | design §8 D4 |
 
-Parallel items: O8 eligibility-replay bucketing (blocks only Task 0's
-six-count assertion); the Tier 0 public-RC lane (repository flip,
-independent of this sequence, gated on a MINEDEX-free payload audit).
+Parallel items: the Tier 0 public-RC lane (repository flip, independent
+of this sequence, gated on a MINEDEX-free payload audit). O8 closed
+2026-08-25, so it no longer blocks anything.
 SILO registration is no longer one of them: the anonymous gridded route
 needs no account, which is what closed O7 (A7).
 
