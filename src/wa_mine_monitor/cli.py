@@ -40,6 +40,7 @@ from pydantic import ValidationError
 
 from wa_mine_monitor import (
     climate_context,
+    context_join,
     crosswalk,
     d3_inputs,
     d3_protocol,
@@ -61,6 +62,7 @@ from wa_mine_monitor import (
     spectral_metrics,
     trajectories,
     trajectory_extract,
+    trajectory_qa,
 )
 from wa_mine_monitor.config import ProjectConfig, load_config
 from wa_mine_monitor.http import (
@@ -8402,6 +8404,455 @@ def validate_huntly_cmd(
     typer.echo(
         json.dumps(
             {**payload, "output_path": str(output_path), "manifest_path": manifest_path},
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+ExpectedPartitionsOption = typer.Option(
+    trajectory_qa.EXPECTED_STATEWIDE_PARTITIONS,
+    "--expected-partitions",
+    help="Exact partition count the extraction must hold (D13 statewide shape: 99).",
+)
+
+
+@app.command("accept-trajectories")
+def accept_trajectories_cmd(
+    config: Path = ConfigOption,
+    date: str = DateOption,
+    expected_partitions: int = ExpectedPartitionsOption,
+) -> None:
+    """Run the E4 acceptance battery against the LATEST curated
+    trajectories tree and write the verdict
+    `curated/trajectories-acceptance/<date>/acceptance.json` that
+    `build-context-join` gates on.
+
+    The command writes a `passed: false` verdict just as readily as a
+    `passed: true` one -- a failing acceptance is a RESULT with a manifest,
+    never a crash (the `validate-huntly` precedent). Only unusable inputs
+    (`trajectory_qa.TrajectoryQaError` -- e.g. an uninventoriable partition
+    tree, a summary missing its keys) are a refusal.
+    """
+    resolved: ProjectConfig = _load_config_or_exit(config)
+    resolved_config = resolved.model_dump(mode="json")
+    git_state = _collect_git_state_disclosing_gaps(_REPO_ROOT)
+    data_root = resolved.run.data_root
+
+    out_dir = data_root / "curated" / "trajectories-acceptance" / date
+    output_path = out_dir / "acceptance.json"
+    _refuse_if_curated_output_already_exists(
+        output_path, config=resolved_config, git_state=git_state
+    )
+
+    try:
+        trajectories_dir = _latest_curated_dated_dir(
+            data_root / "curated" / "trajectories", label="curated/trajectories"
+        )
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    summary_path = trajectories_dir / "extraction_summary.json"
+    summary_manifest = _digest_verified_manifest(summary_path)
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+
+    try:
+        register_dir = _latest_curated_dated_dir(
+            data_root / "curated" / "register", label="curated/register"
+        )
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    register_path = register_dir / "register.parquet"
+    register_manifest = _digest_verified_manifest(register_path)
+    register_df = read_table(register_path)
+
+    try:
+        report = trajectory_qa.accept_trajectories(
+            trajectories_dir,
+            summary=summary,
+            register_df=register_df,
+            expected_partition_count=expected_partitions,
+        )
+        parts_binding = trajectory_qa.parts_digest(trajectories_dir)
+    except (trajectory_qa.TrajectoryQaError, trajectory_extract.TrajectoryExtractError) as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    payload: dict[str, object] = {
+        **report.as_dict(),
+        "date": date,
+        "trajectories_dir": str(trajectories_dir),
+        "extraction_summary_sha256": summary_manifest["output"]["sha256"],
+        "parts_digest": parts_binding,
+        "register_dir": str(register_dir),
+    }
+    out_dir.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+    input_assets = [
+        SourceAsset(
+            uri=str(summary_path),
+            sha256=summary_manifest["output"]["sha256"],
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(trajectories_dir.name),
+            licence=None,
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(register_path),
+            sha256=register_manifest["output"]["sha256"],
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(register_dir.name),
+            licence=licence.SOURCES["dmirs_001_minedex"].licence_id,
+            redistribute_public=False,
+        ),
+    ]
+    try:
+        manifests.write_run_manifest(
+            output=output_path,
+            inputs=input_assets,
+            config=resolved_config,
+            git_state=git_state,
+            resolved_args={
+                "date": date,
+                "expected_partitions": expected_partitions,
+                "trajectories_dir": str(trajectories_dir),
+                "register_dir": str(register_dir),
+            },
+        )
+    except FileExistsError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    typer.echo(
+        json.dumps(
+            {
+                **payload,
+                "output_path": str(output_path),
+                "manifest_path": str(output_path) + manifests.MANIFEST_SUFFIX,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("build-context-join")
+def build_context_join_cmd(config: Path = ConfigOption, date: str = DateOption) -> None:
+    """Build the F6 site-year context-join product (D13 §6): fire and
+    climate context beside the trajectory site-year domain, one row per
+    Tier 1 site-year, `curated/context-join/<date>/context_join.parquet`.
+
+    First downstream consumer of `curated/trajectories`: every partition
+    is digest- and schema-re-verified, and the build REFUSES unless the
+    latest `accept-trajectories` verdict passed AND covers the exact
+    extraction summary AND part bytes being consumed (D13 §6: Batch F
+    follows accepted Batch E extraction -- the `require_huntly_gate`
+    discipline applied one stage downstream). Context only, never causes:
+    see `context_join.py`'s claim boundary.
+    """
+    resolved: ProjectConfig = _load_config_or_exit(config)
+    resolved_config = resolved.model_dump(mode="json")
+    git_state = _collect_git_state_disclosing_gaps(_REPO_ROOT)
+    data_root = resolved.run.data_root
+
+    output_dir = data_root / "curated" / "context-join" / date
+    output_path = output_dir / "context_join.parquet"
+    _refuse_if_curated_output_already_exists(
+        output_path, config=resolved_config, git_state=git_state
+    )
+
+    # GATE 1 -- the latest curated trajectories tree: summary digest-
+    # verified, every partition's every part digest- and schema-verified.
+    try:
+        trajectories_dir = _latest_curated_dated_dir(
+            data_root / "curated" / "trajectories", label="curated/trajectories"
+        )
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    summary_path = trajectories_dir / "extraction_summary.json"
+    summary_manifest = _digest_verified_manifest(summary_path)
+    summary_sha256 = summary_manifest["output"]["sha256"]
+
+    traj_frames: list[pd.DataFrame] = []
+    try:
+        partitions = trajectory_extract.existing_partitions(trajectories_dir)
+        for collection_id, year in sorted(partitions):
+            partition = trajectory_extract.partition_dir(trajectories_dir, collection_id, year)
+            for part in trajectory_extract.verified_parts(
+                partition, expected_schema=trajectories.TRAJECTORY_SCHEMA
+            ):
+                traj_frames.append(
+                    pq.read_table(part, columns=["site_id", "maus_id", "year"]).to_pandas()
+                )
+    except trajectory_extract.TrajectoryExtractError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    traj = pd.concat(traj_frames, ignore_index=True)
+
+    # GATE 2 -- the acceptance verdict: latest, digest-verified, passed,
+    # and covering the SAME extraction summary AND part bytes this build
+    # consumes.
+    try:
+        acceptance_dir = _latest_curated_dated_dir(
+            data_root / "curated" / "trajectories-acceptance",
+            label="curated/trajectories-acceptance",
+        )
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"{exc} -- run accept-trajectories first: Batch F follows "
+                        "ACCEPTED Batch E extraction (D13 §6)"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+    verdict_path = acceptance_dir / "acceptance.json"
+    verdict_manifest = _digest_verified_manifest(verdict_path)
+    verdict = json.loads(verdict_path.read_text(encoding="utf-8"))
+    if not bool(verdict.get("passed")):
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"the trajectory acceptance at {verdict_path} did not pass -- "
+                        "the context join is refused until the extraction is accepted"
+                    ),
+                    "failures": verdict.get("failures", []),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    if verdict.get("extraction_summary_sha256") != summary_sha256:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"the acceptance verdict at {verdict_path} covers extraction "
+                        f"summary sha256 {str(verdict.get('extraction_summary_sha256'))[:12]}"
+                        f"..., but this build consumes {summary_sha256[:12]}... -- run "
+                        "accept-trajectories against the current extraction first"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    try:
+        actual_parts_digest = trajectory_qa.parts_digest(trajectories_dir)
+    except trajectory_qa.TrajectoryQaError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    if verdict.get("parts_digest") != actual_parts_digest:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"the acceptance verdict at {verdict_path} accepted different part "
+                        "bytes (parts_digest mismatch) -- a trajectory part changed after "
+                        "acceptance; run accept-trajectories again against the current tree"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+
+    # GATE 3 -- latest fire and climate context products, digest-verified.
+    context_inputs: dict[str, tuple[Path, Path, dict[str, Any]]] = {}
+    for kind, filename in (
+        ("fire-context", "fire_context.parquet"),
+        ("climate-context", "climate_context.parquet"),
+    ):
+        try:
+            dated_dir = _latest_curated_dated_dir(
+                data_root / "curated" / kind, label=f"curated/{kind}"
+            )
+        except register.NoSnapshotFoundError as exc:
+            typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+            raise typer.Exit(1) from None
+        artefact = dated_dir / filename
+        context_inputs[kind] = (dated_dir, artefact, _digest_verified_manifest(artefact))
+    fire_df = read_table(context_inputs["fire-context"][1])
+    climate_df = read_table(context_inputs["climate-context"][1])
+
+    # GATE 4 -- cross-input identity: one site set, one maus_id per site,
+    # across trajectories, fire and climate.
+    traj_sites = set(traj["site_id"].astype(str))
+    fire_sites = set(fire_df["site_id"].astype(str))
+    climate_sites = set(climate_df["site_id"].astype(str))
+    if not (traj_sites == fire_sites == climate_sites):
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        "site sets differ across inputs: "
+                        f"{len(traj_sites)} trajectory site(s), {len(fire_sites)} fire, "
+                        f"{len(climate_sites)} climate -- e.g. only-trajectory "
+                        f"{sorted(traj_sites - fire_sites)[:5]}, only-fire "
+                        f"{sorted(fire_sites - traj_sites)[:5]}"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    traj_maus = (
+        traj[["site_id", "maus_id"]].astype(str).drop_duplicates().set_index("site_id")["maus_id"]
+    )
+    if traj_maus.index.duplicated().any():
+        typer.echo(
+            json.dumps(
+                {"refusal": "trajectories carry more than one maus_id for a site"},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    fire_maus = fire_df[["site_id", "maus_id"]].astype(str).drop_duplicates()
+    disagreeing = sorted(
+        site
+        for site, maus in zip(fire_maus["site_id"], fire_maus["maus_id"], strict=True)
+        if traj_maus.get(site) != maus
+    )
+    if disagreeing:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"maus_id disagrees between trajectories and fire context for "
+                        f"site(s) {disagreeing[:5]} ({len(disagreeing)} total)"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+
+    # GATE 5 -- year-domain shape: the only trajectory years without
+    # context are the pre-context ones (derived, never hard-coded).
+    traj_years = sorted(set(traj["year"].astype(int)))
+    context_years = sorted(set(fire_df["year"].astype(int)))
+    uncovered = sorted(set(traj_years) - set(context_years))
+    context_start = context_years[0] if context_years else None
+    holes = [y for y in uncovered if context_start is not None and y >= context_start]
+    if holes:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"trajectory year(s) {holes} inside the context coverage "
+                        f"(from {context_start}) have no context rows -- a hole in the "
+                        "middle of context coverage is an integrity failure, not an "
+                        "absent-state year"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+
+    try:
+        joined = context_join.assemble_rows(
+            fire_df=fire_df, climate_df=climate_df, years=traj_years
+        )
+        context_join.validate_context_join(
+            joined,
+            site_ids=sorted(traj_sites),
+            years=traj_years,
+            fire_status_counts=fire_df["fire_status"].value_counts().to_dict(),
+            climate_status_counts=climate_df["climate_status"].value_counts().to_dict(),
+        )
+    except context_join.ContextJoinError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _write_table_or_refuse(joined, output_path, context_join.CONTEXT_JOIN_SCHEMA)
+
+    fire_dir, fire_path, fire_manifest = context_inputs["fire-context"]
+    climate_dir, climate_path, climate_manifest = context_inputs["climate-context"]
+    input_assets = [
+        SourceAsset(
+            uri=str(summary_path),
+            sha256=summary_sha256,
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(trajectories_dir.name),
+            licence=None,
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(verdict_path),
+            sha256=verdict_manifest["output"]["sha256"],
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(acceptance_dir.name),
+            licence=None,
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(fire_path),
+            sha256=fire_manifest["output"]["sha256"],
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(fire_dir.name),
+            licence=licence.SOURCES["dbca_060_fire"].licence_id,
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(climate_path),
+            sha256=climate_manifest["output"]["sha256"],
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(climate_dir.name),
+            licence=licence.SOURCES["silo"].licence_id,
+            redistribute_public=False,
+        ),
+    ]
+    try:
+        manifests.write_run_manifest(
+            output=output_path,
+            inputs=input_assets,
+            config=resolved_config,
+            git_state=git_state,
+            resolved_args={
+                "date": date,
+                "trajectories_dir": str(trajectories_dir),
+                "acceptance_dir": str(acceptance_dir),
+                "fire_context_dir": str(fire_dir),
+                "climate_context_dir": str(climate_dir),
+                "n_trajectory_partitions": len(partitions),
+            },
+        )
+    except FileExistsError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    n_no_context = int((joined["context_row_status"] == context_join.CONTEXT_ROW_NO_CONTEXT).sum())
+    typer.echo(
+        json.dumps(
+            {
+                "output_path": str(output_path),
+                "manifest_path": str(output_path) + manifests.MANIFEST_SUFFIX,
+                "rows": len(joined),
+                "n_sites": len(traj_sites),
+                "n_years": len(traj_years),
+                "n_no_context_rows": n_no_context,
+                "n_context_complete": int(joined["context_complete"].astype(bool).sum()),
+                "year_min": traj_years[0],
+                "year_max": traj_years[-1],
+            },
             indent=2,
             sort_keys=True,
         )
