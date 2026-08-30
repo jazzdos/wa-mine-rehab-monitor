@@ -146,3 +146,29 @@ def test_second_run_refuses_the_existing_output(tmp_path: Path) -> None:
     result = _build(cfg)
     assert result.exit_code == 1
     assert "refusal" in result.output
+
+
+def test_refuses_a_truthy_but_non_boolean_passed_verdict(tmp_path: Path) -> None:
+    # The gate demands the literal boolean True (design section 2; codex
+    # diff review, 2026-08-30): a digest-valid verdict whose "passed" is
+    # a truthy non-boolean (e.g. the string "true") must refuse, not
+    # authorize the summary.
+    from wa_mine_monitor.provenance import SourceAsset
+
+    cfg, data_root = _seed_world_with_join(tmp_path)
+    verdict_path = (
+        data_root / "curated" / "trajectories-acceptance" / "2026-08-29" / "acceptance.json"
+    )
+    verdict = json.loads(verdict_path.read_text(encoding="utf-8"))
+    verdict["passed"] = "true"
+    verdict_path.write_text(json.dumps(verdict, indent=2, sort_keys=True), encoding="utf-8")
+    Path(str(verdict_path) + manifests.MANIFEST_SUFFIX).unlink()
+    manifests.write_run_manifest(
+        output=verdict_path,
+        inputs=[SourceAsset(uri="test://fixture", sha256=None)],
+        config={"run": {"data_root": str(data_root)}},
+        git_state={"sha": "testsha", "dirty": False, "diff": ""},
+    )
+    result = _build(cfg)
+    assert result.exit_code == 1
+    assert "did not pass" in result.output

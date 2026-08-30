@@ -8684,7 +8684,7 @@ def build_context_join_cmd(config: Path = ConfigOption, date: str = DateOption) 
     verdict_path = acceptance_dir / "acceptance.json"
     verdict_manifest = _digest_verified_manifest(verdict_path)
     verdict = json.loads(verdict_path.read_text(encoding="utf-8"))
-    if not bool(verdict.get("passed")):
+    if verdict.get("passed") is not True:
         typer.echo(
             json.dumps(
                 {
@@ -9065,7 +9065,7 @@ def build_trajectory_summary_cmd(config: Path = ConfigOption, date: str = DateOp
     verdict_path = acceptance_dir / "acceptance.json"
     verdict_manifest = _digest_verified_manifest(verdict_path)
     verdict = json.loads(verdict_path.read_text(encoding="utf-8"))
-    if not bool(verdict.get("passed")):
+    if verdict.get("passed") is not True:
         typer.echo(
             json.dumps(
                 {
