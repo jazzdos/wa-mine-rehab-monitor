@@ -17,6 +17,7 @@ import pytest
 from typer.testing import CliRunner
 
 from tests.test_trajectory_qa import (
+    _seed_crosswalk,
     _seed_register,
     _seed_trajectories,
     _write_config,
@@ -316,6 +317,7 @@ def _seed_full_world(tmp_path: Path, *, accept: bool = True) -> tuple[Path, Path
     cfg = _write_config(tmp_path, data_root)
     _seed_trajectories(data_root, "2026-08-29", tmp_path)
     _seed_register(data_root, "2026-08-29", [("S1", True), ("S2", True), ("S3", True)])
+    _seed_crosswalk(data_root, "2026-08-29", [("S1", "M1"), ("S2", "M1"), ("S3", "M2")])
     if accept:
         result = runner.invoke(
             app,

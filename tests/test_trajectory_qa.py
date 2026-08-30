@@ -15,6 +15,7 @@ import pandas as pd
 import pytest
 from typer.testing import CliRunner
 
+from wa_mine_monitor import crosswalk as crosswalk_mod
 from wa_mine_monitor import manifests, tables, trajectories, trajectory_extract, trajectory_qa
 from wa_mine_monitor import register as register_mod
 from wa_mine_monitor.cli import app
@@ -386,6 +387,32 @@ def _seed_register(data_root: Path, date_str: str, sites_forced: list[tuple[str,
     )
 
 
+def _seed_crosswalk(data_root: Path, date_str: str, site_maus: list[tuple[str, str]]) -> None:
+    output_dir = data_root / "curated" / "crosswalk" / date_str
+    output_dir.mkdir(parents=True)
+    n = len(site_maus)
+    df = pd.DataFrame(
+        {
+            "site_id": [s for s, _m in site_maus],
+            "maus_id": [m for _s, m in site_maus],
+            "match_method": ["point_in_polygon"] * n,
+            "distance_m": [0.0] * n,
+            "confidence": ["high"] * n,
+            "ambiguity_n": [1] * n,
+            "shared_by_n": [1] * n,
+            "manual_review_status": ["not_required"] * n,
+        }
+    )
+    path = output_dir / "crosswalk.parquet"
+    tables.write_table(df, path, crosswalk_mod.CROSSWALK_SCHEMA)
+    manifests.write_run_manifest(
+        output=path,
+        inputs=[SourceAsset(uri="test://fixture", sha256=None)],
+        config={"run": {"data_root": str(data_root)}},
+        git_state={"sha": "testsha", "dirty": False, "diff": ""},
+    )
+
+
 def _seed_trajectories(data_root: Path, date_str: str, tmp_path: Path) -> dict:
     """Seed a good two-partition trajectories tree under the data root and
     write its digest-manifested extraction summary."""
@@ -408,6 +435,7 @@ def test_accept_trajectories_cli_writes_a_passing_verdict(tmp_path: Path) -> Non
     cfg = _write_config(tmp_path, data_root)
     _seed_trajectories(data_root, "2026-08-29", tmp_path)
     _seed_register(data_root, "2026-08-29", [("S1", True), ("S2", True), ("S3", True)])
+    _seed_crosswalk(data_root, "2026-08-29", [("S1", "M1"), ("S2", "M1"), ("S3", "M2")])
     result = runner.invoke(
         app,
         [
@@ -440,6 +468,9 @@ def test_accept_trajectories_cli_writes_a_failing_verdict_not_a_crash(tmp_path: 
     _seed_register(
         data_root, "2026-08-29", [("S1", True), ("S2", True), ("S3", True), ("S9", True)]
     )
+    _seed_crosswalk(
+        data_root, "2026-08-29", [("S1", "M1"), ("S2", "M1"), ("S3", "M2"), ("S9", "M9")]
+    )
     result = runner.invoke(
         app,
         [
@@ -466,6 +497,7 @@ def test_accept_trajectories_cli_refuses_a_second_run(tmp_path: Path) -> None:
     cfg = _write_config(tmp_path, data_root)
     _seed_trajectories(data_root, "2026-08-29", tmp_path)
     _seed_register(data_root, "2026-08-29", [("S1", True), ("S2", True), ("S3", True)])
+    _seed_crosswalk(data_root, "2026-08-29", [("S1", "M1"), ("S2", "M1"), ("S3", "M2")])
     first = runner.invoke(
         app,
         [
@@ -526,3 +558,162 @@ def test_eligible_site_with_null_forced_flag_is_a_refusal(tmp_path: Path) -> Non
         trajectory_qa.accept_trajectories(
             root, summary=summary, register_df=register, expected_partition_count=2
         )
+
+
+def test_expected_statewide_domain_is_the_protocol_tuple_set() -> None:
+    """The protocol pins the exact 99 (collection_id, year) tuples, not just
+    their count -- a count alone cannot detect a required collection-year
+    swapped for a stray one (codex diff-gate finding 1)."""
+    domain = trajectory_qa.EXPECTED_STATEWIDE_DOMAIN
+    assert len(domain) == trajectory_qa.EXPECTED_STATEWIDE_PARTITIONS == 99
+    # 1986 exists ONLY as an ls5 geomedian year -- losing it silently
+    # shrinks F6's explicit no_context_row state out of existence.
+    assert ("ga_ls5t_gm_cyear_3", 1986) in domain
+    assert ("ga_ls_fc_pc_cyear_3", 1986) not in domain
+    # The ls5 geomedian catalogue hole (2001-2002) is part of the pinned
+    # domain, never papered over as a contiguous range.
+    assert ("ga_ls5t_gm_cyear_3", 2001) not in domain
+    assert ("ga_ls5t_gm_cyear_3", 2002) not in domain
+    assert ("ga_ls5t_gm_cyear_3", 2003) in domain
+    assert ("ga_ls_fc_pc_cyear_3", 1987) in domain
+    assert ("ga_ls_fc_pc_cyear_3", 2025) in domain
+
+
+def test_partition_domain_substitution_is_a_reported_failure(tmp_path: Path) -> None:
+    """A tree with the RIGHT partition count but a swapped collection-year
+    must fail the domain check even though every count-based check passes."""
+    root, summary, register = _good_world(tmp_path)
+    report = trajectory_qa.accept_trajectories(
+        root,
+        summary=summary,
+        register_df=register,
+        expected_partition_count=2,
+        expected_domain=frozenset({(GM_COLLECTION, 1999), (FC_COLLECTION, 2001)}),
+    )
+    assert report.passed is False
+    domain_check = next(c for c in report.checks if c.name == "partition_domain")
+    assert domain_check.passed is False
+    assert "1999" in domain_check.detail and "2000" in domain_check.detail
+    assert any(c.name == "partition_count" and c.passed for c in report.checks)
+
+
+def test_partition_domain_match_passes(tmp_path: Path) -> None:
+    root, summary, register = _good_world(tmp_path)
+    report = trajectory_qa.accept_trajectories(
+        root,
+        summary=summary,
+        register_df=register,
+        expected_partition_count=2,
+        expected_domain=frozenset({(GM_COLLECTION, 2000), (FC_COLLECTION, 2001)}),
+    )
+    assert report.passed is True
+    assert any(c.name == "partition_domain" and c.passed for c in report.checks)
+
+
+def test_consistent_maus_reassignment_fails_the_crosswalk_anchor(tmp_path: Path) -> None:
+    """L17 alone is blind to a SELF-CONSISTENT wrong footprint assignment
+    (codex diff-gate finding 2): move S3 onto M1 everywhere, with matching
+    values and sharing counts, and shared_footprint_consistency still
+    passes. The crosswalk anchor must catch it."""
+    swapped = [("S1", "M1"), ("S2", "M1"), ("S3", "M1")]
+    gm = _trajectory_rows(
+        sites_maus=swapped, year=2000, collection_id=GM_COLLECTION, metrics=["nbr", "ndmi"]
+    )
+    fc = _trajectory_rows(
+        sites_maus=swapped,
+        year=2001,
+        collection_id=FC_COLLECTION,
+        metrics=["bare_soil", "photosynthetic_vegetation", "non_photosynthetic_vegetation"],
+    )
+    _write_partition(tmp_path, GM_COLLECTION, 2000, gm)
+    _write_partition(tmp_path, FC_COLLECTION, 2001, fc)
+    summary = _summary_for(
+        tmp_path,
+        [(GM_COLLECTION, 2000), (FC_COLLECTION, 2001)],
+        inserted=15,
+        not_computable=0,
+        site_ids=["S1", "S2", "S3"],
+    )
+    register = _register_frame([("S1", True), ("S2", True), ("S3", True)])
+    report = trajectory_qa.accept_trajectories(
+        tmp_path,
+        summary=summary,
+        register_df=register,
+        expected_partition_count=2,
+        maus_id_by_site={"S1": "M1", "S2": "M1", "S3": "M2"},
+    )
+    assert report.passed is False
+    assert any(c.name == "shared_footprint_consistency" and c.passed for c in report.checks)
+    anchor = next(c for c in report.checks if c.name == "maus_crosswalk_consistency")
+    assert anchor.passed is False
+    assert "S3" in anchor.detail
+
+
+def test_maus_crosswalk_agreement_passes(tmp_path: Path) -> None:
+    root, summary, register = _good_world(tmp_path)
+    report = trajectory_qa.accept_trajectories(
+        root,
+        summary=summary,
+        register_df=register,
+        expected_partition_count=2,
+        maus_id_by_site={"S1": "M1", "S2": "M1", "S3": "M2"},
+    )
+    assert report.passed is True
+    assert any(c.name == "maus_crosswalk_consistency" and c.passed for c in report.checks)
+
+
+def test_accept_trajectories_cli_refuses_a_mid_battery_part_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The verdict digest must bind the SAME bytes the battery inspected
+    (codex diff-gate finding 3): a part rewritten -- with a fresh,
+    self-consistent sidecar -- between the battery's read and the digest
+    computation must refuse the run, never write a verdict describing
+    bytes it did not inspect."""
+    data_root = tmp_path / "data"
+    cfg = _write_config(tmp_path, data_root)
+    _seed_trajectories(data_root, "2026-08-29", tmp_path)
+    _seed_register(data_root, "2026-08-29", [("S1", True), ("S2", True), ("S3", True)])
+    _seed_crosswalk(data_root, "2026-08-29", [("S1", "M1"), ("S2", "M1"), ("S3", "M2")])
+    root = data_root / "curated" / "trajectories" / "2026-08-29"
+    real_accept = trajectory_qa.accept_trajectories
+
+    def swapping_accept(*args: object, **kwargs: object) -> trajectory_qa.AcceptanceReport:
+        report = real_accept(*args, **kwargs)  # type: ignore[arg-type]
+        replacement = _trajectory_rows(
+            sites_maus=[("S1", "M1"), ("S2", "M1"), ("S3", "M2")],
+            year=2000,
+            collection_id=GM_COLLECTION,
+            metrics=["nbr", "ndmi"],
+            value=0.9,
+        )
+        # An EXTERNAL replacement, the way the race would actually happen:
+        # the production writers refuse to overwrite (immutable manifests),
+        # so the swap deletes the old part and sidecar first.
+        old_part = trajectory_extract.partition_dir(root, GM_COLLECTION, 2000) / (
+            trajectory_extract.PART_FILENAME_TEMPLATE.format(version=0)
+        )
+        old_part.unlink()
+        Path(str(old_part) + manifests.MANIFEST_SUFFIX).unlink()
+        _write_partition(root, GM_COLLECTION, 2000, replacement)
+        return report
+
+    monkeypatch.setattr(trajectory_qa, "accept_trajectories", swapping_accept)
+    result = runner.invoke(
+        app,
+        [
+            "accept-trajectories",
+            "--config",
+            str(cfg),
+            "--date",
+            "2026-08-30",
+            "--expected-partitions",
+            "2",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "refusal" in result.output
+    verdict_path = (
+        data_root / "curated" / "trajectories-acceptance" / "2026-08-30" / "acceptance.json"
+    )
+    assert not verdict_path.exists()

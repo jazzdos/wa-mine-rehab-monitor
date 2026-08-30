@@ -313,7 +313,7 @@ EXEMPTIONS: dict[str, tuple[tuple[str, ...], str]] = {
     ),
     # -- accept-trajectories (E4) and build-context-join (F6) input assets,
     # added 2026-08-30.
-    "cli.py:8494": (
+    "cli.py:8551": (
         (),
         (
             "summary_path (extraction_summary.json) input asset to "
@@ -321,7 +321,7 @@ EXEMPTIONS: dict[str, tuple[tuple[str, ...], str]] = {
             "external source."
         ),
     ),
-    "cli.py:8502": (
+    "cli.py:8559": (
         ("dmirs_001_minedex",),
         (
             "register_path input asset to accept-trajectories; register's "
@@ -329,7 +329,15 @@ EXEMPTIONS: dict[str, tuple[tuple[str, ...], str]] = {
             "the licence field left None here."
         ),
     ),
-    "cli.py:8790": (
+    "cli.py:8567": (
+        (),
+        (
+            "crosswalk_path input asset to accept-trajectories (the Tier 1 "
+            "maus_id lineage anchor, added by the 2026-08-30 diff-gate fix); "
+            "project-internal derived artefact, not an external source."
+        ),
+    ),
+    "cli.py:8856": (
         (),
         (
             "summary_path (extraction_summary.json) input asset to "
@@ -337,7 +345,7 @@ EXEMPTIONS: dict[str, tuple[tuple[str, ...], str]] = {
             "external source."
         ),
     ),
-    "cli.py:8798": (
+    "cli.py:8864": (
         (),
         (
             "verdict_path (accept-trajectories' acceptance.json) input asset "
@@ -345,7 +353,7 @@ EXEMPTIONS: dict[str, tuple[tuple[str, ...], str]] = {
             "an external source."
         ),
     ),
-    "cli.py:8806": (
+    "cli.py:8872": (
         ("dbca_060_fire",),
         (
             "fire_path input asset to build-context-join; licence is read "
@@ -357,7 +365,7 @@ EXEMPTIONS: dict[str, tuple[tuple[str, ...], str]] = {
             "pass since it touches licence-gate code."
         ),
     ),
-    "cli.py:8814": (
+    "cli.py:8880": (
         ("silo",),
         (
             "climate_path input asset to build-context-join; licence is read "

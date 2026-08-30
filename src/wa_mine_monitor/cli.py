@@ -8467,17 +8467,73 @@ def accept_trajectories_cmd(
     register_manifest = _digest_verified_manifest(register_path)
     register_df = read_table(register_path)
 
+    # The Tier 1 crosswalk is the INDEPENDENT lineage anchor for every
+    # trajectory row's maus_id (and, through it, the L17 sharing
+    # disclosure) -- the extractor's own column cannot vouch for itself.
+    # The dedup mirrors build-trajectories' eligibility tie-break EXACTLY
+    # (stable sort by ["site_id", "maus_id"], keep first -- register.py's
+    # own rule), so acceptance judges rows against the same footprint the
+    # site's eligibility was judged against.
     try:
+        crosswalk_dir = _latest_curated_dated_dir(
+            data_root / "curated" / "crosswalk", label="curated/crosswalk"
+        )
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    crosswalk_path = crosswalk_dir / "crosswalk.parquet"
+    crosswalk_manifest = _digest_verified_manifest(crosswalk_path)
+    tier1_dedup = (
+        crosswalk.tier1_population(read_table(crosswalk_path))
+        .sort_values(["site_id", "maus_id"], na_position="last", kind="stable")
+        .drop_duplicates(subset="site_id", keep="first")
+    )
+    maus_id_by_site: dict[str, str] = dict(
+        zip(tier1_dedup["site_id"].astype(str), tier1_dedup["maus_id"].astype(str), strict=True)
+    )
+
+    try:
+        # The digest is computed BEFORE and AFTER the battery: the two
+        # traversals bracket every read the checks perform, so a part
+        # replaced mid-run (even with a fresh, self-consistent sidecar)
+        # can never leave a verdict bound to bytes the battery did not
+        # inspect.
+        parts_binding_before = trajectory_qa.parts_digest(trajectories_dir)
         report = trajectory_qa.accept_trajectories(
             trajectories_dir,
             summary=summary,
             register_df=register_df,
             expected_partition_count=expected_partitions,
+            # A non-default --expected-partitions is an explicit operator
+            # override for a NON-protocol tree; the pinned statewide
+            # domain only applies to the protocol shape it describes.
+            expected_domain=(
+                trajectory_qa.EXPECTED_STATEWIDE_DOMAIN
+                if expected_partitions == trajectory_qa.EXPECTED_STATEWIDE_PARTITIONS
+                else None
+            ),
+            maus_id_by_site=maus_id_by_site,
         )
         parts_binding = trajectory_qa.parts_digest(trajectories_dir)
     except (trajectory_qa.TrajectoryQaError, trajectory_extract.TrajectoryExtractError) as exc:
         typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
         raise typer.Exit(1) from None
+    if parts_binding != parts_binding_before:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        "the trajectories tree changed while the acceptance battery "
+                        f"was running (parts digest {parts_binding_before[:12]}... before, "
+                        f"{parts_binding[:12]}... after) -- a verdict must describe the "
+                        "exact bytes it inspected; re-run against a quiescent tree"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
 
     payload: dict[str, object] = {
         **report.as_dict(),
@@ -8486,6 +8542,7 @@ def accept_trajectories_cmd(
         "extraction_summary_sha256": summary_manifest["output"]["sha256"],
         "parts_digest": parts_binding,
         "register_dir": str(register_dir),
+        "crosswalk_dir": str(crosswalk_dir),
     }
     out_dir.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
@@ -8507,6 +8564,14 @@ def accept_trajectories_cmd(
             licence=licence.SOURCES["dmirs_001_minedex"].licence_id,
             redistribute_public=False,
         ),
+        SourceAsset(
+            uri=str(crosswalk_path),
+            sha256=crosswalk_manifest["output"]["sha256"],
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(crosswalk_dir.name),
+            licence=None,
+            redistribute_public=False,
+        ),
     ]
     try:
         manifests.write_run_manifest(
@@ -8519,6 +8584,7 @@ def accept_trajectories_cmd(
                 "expected_partitions": expected_partitions,
                 "trajectories_dir": str(trajectories_dir),
                 "register_dir": str(register_dir),
+                "crosswalk_dir": str(crosswalk_dir),
             },
         )
     except FileExistsError as exc:

@@ -60,3 +60,17 @@ a single trajectory.
   `d3_forced_threshold` by design; the forced-threshold checks are
   defined against the eligible set only (a null on an ELIGIBLE row is a
   refusal, regression-tested).
+- The written verdict of 2026-08-30 predates the diff-gate strengthening
+  of the battery (same day): the codex review found that (1) the
+  partition COUNT cannot detect a required collection-year swapped for a
+  stray one, (2) the L17 check compared the trajectory product only
+  against itself, and (3) the verdict digest was computed in a separate
+  traversal from the checks it binds. The battery now pins the exact
+  99-tuple `(collection_id, year)` protocol domain
+  (`EXPECTED_STATEWIDE_DOMAIN`), anchors every row's `maus_id` to the
+  Tier 1 crosswalk (`maus_crosswalk_consistency`), and brackets the
+  battery with a before/after parts digest. The strengthened battery was
+  re-run post-hoc against the SAME digest-bound tree (parts digest
+  matches the written verdict's binding) and passed all 16 checks; the
+  written verdict itself is unchanged because curated outputs are
+  immutable snapshots.

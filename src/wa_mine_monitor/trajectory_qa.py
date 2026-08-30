@@ -45,12 +45,26 @@ class TrajectoryQaError(ValueError):
     """The acceptance inputs are unusable -- never a failed check."""
 
 
-#: The D13 statewide extraction shape: 39 FC year-partitions + 60 geomedian
-#: collection-year partitions. A protocol constant (like the climate
-#: baseline years), not derivable from code -- the acceptance CLI defaults
-#: to it so an extraction that silently dropped a whole collection-year
-#: cannot pass merely by agreeing with its own summary.
-EXPECTED_STATEWIDE_PARTITIONS = 99
+#: The D13 statewide extraction shape, pinned as the EXACT
+#: (collection_id, year) tuples, not merely their count: 39 FC
+#: year-partitions (1987-2025) + 60 geomedian collection-years, including
+#: the real ls5 catalogue hole at 2001-2002. A protocol constant (like the
+#: climate baseline years), not derivable from code -- a count alone
+#: cannot detect a required collection-year swapped for a stray one that
+#: the summary agrees with, so the acceptance CLI checks the tuple set.
+_EXPECTED_STATEWIDE_YEARS: dict[str, tuple[range, ...]] = {
+    "ga_ls_fc_pc_cyear_3": (range(1987, 2026),),
+    "ga_ls5t_gm_cyear_3": (range(1986, 2001), range(2003, 2012)),
+    "ga_ls7e_gm_cyear_3": (range(1999, 2022),),
+    "ga_ls8cls9c_gm_cyear_3": (range(2013, 2026),),
+}
+EXPECTED_STATEWIDE_DOMAIN: frozenset[tuple[str, int]] = frozenset(
+    (collection_id, year)
+    for collection_id, spans in _EXPECTED_STATEWIDE_YEARS.items()
+    for span in spans
+    for year in span
+)
+EXPECTED_STATEWIDE_PARTITIONS = len(EXPECTED_STATEWIDE_DOMAIN)
 
 
 @dataclass(frozen=True)
@@ -117,6 +131,8 @@ def accept_trajectories(
     summary: Mapping[str, Any],
     register_df: pd.DataFrame,
     expected_partition_count: int,
+    expected_domain: frozenset[tuple[str, int]] | None = None,
+    maus_id_by_site: Mapping[str, str] | None = None,
 ) -> AcceptanceReport:
     """Run every E4 acceptance check against `trajectories_dir`.
 
@@ -124,9 +140,16 @@ def accept_trajectories(
     `summary` and the register before calling; this function trusts neither
     beyond shape (missing keys/columns raise `TrajectoryQaError`).
     `expected_partition_count` is the protocol's fixed partition count
-    (`EXPECTED_STATEWIDE_PARTITIONS` for the live run) -- checked against
-    BOTH the on-disk tree and the summary, because they can agree with each
-    other while both missing a collection-year.
+    (`EXPECTED_STATEWIDE_PARTITIONS` for the live run), checked against
+    BOTH the on-disk tree and the summary. The count alone cannot detect a
+    required collection-year swapped for a stray one the summary agrees
+    with, so `expected_domain` (`EXPECTED_STATEWIDE_DOMAIN` for the live
+    run; None only for non-protocol fixture trees) pins the exact tuple
+    set. `maus_id_by_site` is the Tier 1 crosswalk's per-site footprint
+    assignment (None only for fixture trees without a crosswalk): the
+    independent lineage anchor for every row's `maus_id`, without which
+    the L17 check could only compare the trajectory product against
+    itself.
     """
     missing_keys = [k for k in _SUMMARY_REQUIRED_KEYS if k not in summary]
     if missing_keys:
@@ -176,6 +199,24 @@ def accept_trajectories(
             ),
         )
     )
+    if expected_domain is not None:
+        missing_tuples = sorted(set(expected_domain) - on_disk)
+        stray_tuples = sorted(on_disk - set(expected_domain))
+        report.checks.append(
+            AcceptanceCheck(
+                "partition_domain",
+                not missing_tuples and not stray_tuples,
+                (
+                    "on-disk partitions exactly match the protocol's pinned "
+                    f"(collection_id, year) domain of {len(expected_domain)} tuple(s)"
+                    if not missing_tuples and not stray_tuples
+                    else (
+                        f"domain mismatch: missing from disk {missing_tuples}, "
+                        f"stray on disk {stray_tuples}"
+                    )
+                ),
+            )
+        )
     eligible_set = set(eligible)
     # The forced-threshold checks are defined against the ELIGIBLE set: the
     # live register carries null d3_forced_threshold on ineligible rows
@@ -206,6 +247,7 @@ def accept_trajectories(
     metric_set_offenders: list[str] = []
     key_column_offenders: list[str] = []
     forced_offenders: list[str] = []
+    maus_offenders: list[str] = []
     shared_footprint_offenders: list[str] = []
 
     total_rows = 0
@@ -268,6 +310,24 @@ def accept_trajectories(
                 f"{label}: d3_forced_threshold diverges from the register for site(s) "
                 f"{sorted(set(forced_mismatch.astype(str)))[:5]}"
             )
+
+        # The crosswalk anchor: every row's maus_id must match the Tier 1
+        # crosswalk's per-site assignment. Without this, the L17 check
+        # below only compares the trajectory product against itself -- a
+        # SELF-CONSISTENT wrong footprint assignment (site moved onto
+        # another maus_id, values and sharing counts moved with it) would
+        # pass every group-internal comparison.
+        if maus_id_by_site is not None:
+            mapped_maus = frame["site_id"].astype(str).map(maus_id_by_site)
+            maus_mismatch = frame.loc[
+                mapped_maus.isna() | (mapped_maus != frame["maus_id"].astype(str)),
+                "site_id",
+            ]
+            if len(maus_mismatch):
+                maus_offenders.append(
+                    f"{label}: maus_id diverges from the Tier 1 crosswalk for site(s) "
+                    f"{sorted(set(maus_mismatch.astype(str)))[:5]}"
+                )
 
         # L17, exhaustively (never sampled): a (maus_id, metric) group in
         # one partition is every site sharing that footprint. Values must be
@@ -346,6 +406,12 @@ def accept_trajectories(
         shared_footprint_offenders,
         "every shared-footprint group is byte-identical with a correct site count",
     )
+    if maus_id_by_site is not None:
+        aggregate(
+            "maus_crosswalk_consistency",
+            maus_offenders,
+            "every row's maus_id matches the Tier 1 crosswalk's per-site assignment",
+        )
     aggregate(
         "forced_threshold_register_consistency",
         forced_offenders,

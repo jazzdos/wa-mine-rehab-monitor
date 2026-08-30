@@ -47,3 +47,8 @@ row with `context_complete = true` still carries no cause.
 - `silo_cell_id` on outside-grid footprints is centroid-minted, not a
   real grid cell (climate-context caveat, carried forward).
 - E6/E7 remain open (see e4-statewide-extraction.md).
+- The acceptance verdict this product's gate 2 verified against predates
+  the same-day diff-gate strengthening of the E4 battery (domain pin,
+  crosswalk maus anchor, digest bracket); the strengthened battery was
+  re-run post-hoc against the same digest-bound trajectories tree and
+  passed (see e4-statewide-extraction.md honesty flags).
