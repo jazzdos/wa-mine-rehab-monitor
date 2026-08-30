@@ -1,6 +1,6 @@
 # Road map
 
-Current to 2026-08-29. This file is derivative, like the amendments
+Current to 2026-08-30. This file is derivative, like the amendments
 register: the decision and checkpoint records it cites remain
 authoritative and win on any disagreement.
 
@@ -27,7 +27,7 @@ battery: ruff, format, mypy, 1152 tests green (2026-08-29).
 | 2 | ~~**Task 0 forced-threshold path**~~ **Done 2026-08-29**: code landed in `c463a0a`; six-count replay verified (`diag_batch_e_readiness.py --check eligibility`); forced-144 register built at `curated/register/2026-08-29/` — 10,372 eligible / 538 insufficient / 30,833 / 8,421 / 0, total 50,164, `criteria_passed=false` preserved, decision record in the manifest | None — O8 closed 2026-08-25 (replay calls the production function) | `decisions/2026-08-25-batch-e-forced-threshold-entry.md` |
 | 3 | **E4 statewide extraction**: site × year × metric GeoParquet; footprint-keyed reads fanned out to sites; `shared_footprint_site_count` and `valid_support_px` on every row | Ran live 2026-08-29 (curated/trajectories/2026-08-29: 2,458,164 rows, 99 partitions, 94,343 not-computable) and ACCEPTED 2026-08-30 (docs/checkpoints/e4-statewide-extraction.md) | `plans/2026-08-22-batch-e-e4-e5.md` (FINAL) |
 | 4 | **Batch F context**: DBCA-060 fire overlap (three-state, never inferred absence) and SILO climate joined to trajectories. `fetch-silo` (owner-run, not yet run against the real bucket) downloads the SILO open-data grids; `build-climate-context` builds the curated climate context from those grids | Mirror declined, F1 dissolved 2026-08-29 (A10); fetch-dbca-fire + build-fire-context landed AND run live 2026-08-29 (snapshot 149,621 features verified; fire_context.parquet 404,508 rows, 1987-2025); SILO fetched live 2026-08-29 (39 annual grids 1987-2025, digest verify 40 ok/0 bad/0 missing) and climate_context.parquet built (404,508 rows = 10,372 sites x 39 years, 1,053 not-computable disclosed, matching fire_context row count); E4 accepted 2026-08-30 (accept-trajectories: 14/14 checks, 2,458,164 rows / 99 partitions / 10,372 sites, verdict digest-bound to part bytes) and F6 joined live 2026-08-30 (context_join.parquet 414,880 rows = 10,372 x 40 years 1986-2025; 10,372 explicit no_context_row rows for 1986; 398,034 context_complete) | D13 §6 |
-| 5 | **Batch G, re-scoped**: versioned releases, `export-release` command wiring `export_gate.export_public` (closes L10/L11), private QGIS project | Requires accepted Tier 1; web page withdrawn | `decisions/2026-08-25-public-web-page-descope.md` |
+| 5 | **Batch G, QGIS-only**: gate satisfied (E4 accepted 2026-08-30); scope narrowed by owner decision — deliverables are the `build-trajectory-summary` curated GeoPackage (`register_sites` + `site_summary` layers), QML styles, and the private QGIS project; no release package added to `release.PACKAGES`, the release decision is deferred (not taken) | None — gate satisfied; release-package decision deferred by decision, not blocked | `decisions/2026-08-30-batch-g-qgis-only-rescope.md`; A8, A11 |
 | 6 | **Tier 2 deep-dive** (conditional): region chosen by pre-registered ranking; runs only if hard gates pass (≥30 eligible high-confidence sites, calibration cases, compute budget) | May legitimately not run | design §8 D4 |
 
 Parallel items: the Tier 0 public-RC lane completed 2026-08-29 — the
