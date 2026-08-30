@@ -63,6 +63,7 @@ from wa_mine_monitor import (
     trajectories,
     trajectory_extract,
     trajectory_qa,
+    trajectory_summary,
 )
 from wa_mine_monitor.config import ProjectConfig, load_config
 from wa_mine_monitor.http import (
@@ -8683,7 +8684,7 @@ def build_context_join_cmd(config: Path = ConfigOption, date: str = DateOption) 
     verdict_path = acceptance_dir / "acceptance.json"
     verdict_manifest = _digest_verified_manifest(verdict_path)
     verdict = json.loads(verdict_path.read_text(encoding="utf-8"))
-    if not bool(verdict.get("passed")):
+    if verdict.get("passed") is not True:
         typer.echo(
             json.dumps(
                 {
@@ -8918,6 +8919,331 @@ def build_context_join_cmd(config: Path = ConfigOption, date: str = DateOption) 
                 "n_context_complete": int(joined["context_complete"].astype(bool).sum()),
                 "year_min": traj_years[0],
                 "year_max": traj_years[-1],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("build-trajectory-summary")
+def build_trajectory_summary_cmd(config: Path = ConfigOption, date: str = DateOption) -> None:
+    """Build the Batch G per-site trajectory summary GeoPackage for the
+    private QGIS project (design 2026-08-30):
+    `curated/trajectory-summary/<date>/trajectory_summary.gpkg`, layers
+    `register_sites` (all located register sites, categorised by QGIS on
+    `trajectory_status`) and `site_summary` (one point per eligible
+    site: coverage, per-metric latest observed values, fire and climate
+    context, L4/L17 disclosures).
+
+    Downstream consumer of `curated/trajectories`: the same
+    accepted-extraction gates as `build-context-join` (verdict passed,
+    summary sha256 and part bytes covered), plus a register-binding gate
+    (the verdict's `register_dir` must be the very register this summary
+    consumes) and a version-skew gate -- the latest context join must
+    have been built FROM the same trajectories tree this summary
+    consumes. Private curated artifact:
+    it crosses no export boundary and `export_gate` is not involved.
+    """
+    resolved: ProjectConfig = _load_config_or_exit(config)
+    resolved_config = resolved.model_dump(mode="json")
+    git_state = _collect_git_state_disclosing_gaps(_REPO_ROOT)
+    data_root = resolved.run.data_root
+
+    output_dir = data_root / "curated" / "trajectory-summary" / date
+    output_path = output_dir / "trajectory_summary.gpkg"
+    # The dated directory is the sentinel, not just the .gpkg: a stale or
+    # partial `<date>/` left by an interrupted run must refuse too, or
+    # `mkdir(exist_ok=True)` below would build mixed-run contents into an
+    # immutable dated directory (design section 2 gate 1).
+    if output_dir.exists():
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"{output_dir} already exists -- dated curated directories are "
+                        "immutable once written (even partially); move the existing "
+                        "directory aside or choose a new --date"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    _refuse_if_curated_output_already_exists(
+        output_path, config=resolved_config, git_state=git_state
+    )
+
+    # GATE 1 -- latest curated register, D3-eligibility-annotated
+    # (same checks as fetch-silo GATE 3 / extract-trajectories GATE 2).
+    try:
+        register_dir = _latest_curated_dated_dir(
+            data_root / "curated" / "register", label="curated/register"
+        )
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    register_path = register_dir / "register.parquet"
+    register_manifest = _digest_verified_manifest(register_path)
+    register_df = read_table(register_path)
+    for column in ("trajectory_status", "d3_forced_threshold"):
+        if column not in register_df.columns:
+            typer.echo(
+                json.dumps(
+                    {
+                        "refusal": (
+                            f"latest curated register is missing {column!r} -- run "
+                            "apply-d3-threshold first"
+                        ),
+                        "register_path": str(register_path),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            raise typer.Exit(1)
+
+    # GATE 2 -- trajectories tree: summary digest-verified, every part
+    # digest- and schema-verified (build-context-join GATE 1).
+    try:
+        trajectories_dir = _latest_curated_dated_dir(
+            data_root / "curated" / "trajectories", label="curated/trajectories"
+        )
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    summary_path = trajectories_dir / "extraction_summary.json"
+    summary_manifest = _digest_verified_manifest(summary_path)
+    summary_sha256 = summary_manifest["output"]["sha256"]
+    traj_columns = [
+        "site_id",
+        "maus_id",
+        "year",
+        "metric",
+        "value",
+        "computable",
+        "collection_id",
+        "shared_footprint_site_count",
+        "d3_forced_threshold",
+    ]
+    traj_frames: list[pd.DataFrame] = []
+    try:
+        partitions = trajectory_extract.existing_partitions(trajectories_dir)
+        for collection_id, year in sorted(partitions):
+            partition = trajectory_extract.partition_dir(trajectories_dir, collection_id, year)
+            for part in trajectory_extract.verified_parts(
+                partition, expected_schema=trajectories.TRAJECTORY_SCHEMA
+            ):
+                traj_frames.append(pq.read_table(part, columns=traj_columns).to_pandas())
+    except trajectory_extract.TrajectoryExtractError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    traj = pd.concat(traj_frames, ignore_index=True)
+
+    # GATE 3 -- acceptance verdict: passed, covering the SAME summary
+    # and part bytes (build-context-join GATE 2, verbatim discipline).
+    try:
+        acceptance_dir = _latest_curated_dated_dir(
+            data_root / "curated" / "trajectories-acceptance",
+            label="curated/trajectories-acceptance",
+        )
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"{exc} -- run accept-trajectories first: the QGIS summary "
+                        "follows ACCEPTED Batch E extraction"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1) from None
+    verdict_path = acceptance_dir / "acceptance.json"
+    verdict_manifest = _digest_verified_manifest(verdict_path)
+    verdict = json.loads(verdict_path.read_text(encoding="utf-8"))
+    if verdict.get("passed") is not True:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"the trajectory acceptance at {verdict_path} did not pass -- "
+                        "the summary is refused until the extraction is accepted"
+                    ),
+                    "failures": verdict.get("failures", []),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    if verdict.get("extraction_summary_sha256") != summary_sha256:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"the acceptance verdict at {verdict_path} covers a different "
+                        "extraction summary -- run accept-trajectories against the "
+                        "current extraction first"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    try:
+        actual_parts_digest = trajectory_qa.parts_digest(trajectories_dir)
+    except trajectory_qa.TrajectoryQaError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    if verdict.get("parts_digest") != actual_parts_digest:
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"the acceptance verdict at {verdict_path} accepted different "
+                        "part bytes (parts_digest mismatch) -- run accept-trajectories "
+                        "again against the current tree"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    if verdict.get("register_dir") != str(register_dir):
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"the acceptance verdict at {verdict_path} accepted the "
+                        f"extraction against the register at "
+                        f"{verdict.get('register_dir')}, but this summary consumes "
+                        f"{register_dir} -- the register_sites layer and the "
+                        "site_summary disclosures must come from the very register "
+                        "the acceptance inspected; run accept-trajectories against "
+                        "the current register first"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+
+    # GATE 4 -- latest context join, digest-verified, built FROM this
+    # trajectories tree (version-skew gate).
+    try:
+        join_dir = _latest_curated_dated_dir(
+            data_root / "curated" / "context-join", label="curated/context-join"
+        )
+    except register.NoSnapshotFoundError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+    join_path = join_dir / "context_join.parquet"
+    join_manifest = _digest_verified_manifest(join_path)
+    cited_trajectories = join_manifest.get("resolved_args", {}).get("trajectories_dir")
+    if cited_trajectories != str(trajectories_dir):
+        typer.echo(
+            json.dumps(
+                {
+                    "refusal": (
+                        f"the context join at {join_path} was built from "
+                        f"{cited_trajectories}, but this summary consumes "
+                        f"{trajectories_dir} -- rebuild the context join first"
+                    )
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(1)
+    context_df = read_table(join_path)
+
+    # Assemble, validate, write.
+    try:
+        summary_df = trajectory_summary.assemble_summary(
+            register_df=register_df, traj_df=traj, context_df=context_df
+        )
+        eligible_sites = trajectory_extract.select_eligible_sites(register_df)
+        trajectory_summary.validate_summary(summary_df, site_ids=eligible_sites)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        n_unlocated = trajectory_summary.write_summary_gpkg(
+            summary_df=summary_df, register_df=register_df, path=output_path
+        )
+    except trajectory_summary.TrajectorySummaryError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    input_assets = [
+        SourceAsset(
+            uri=str(register_path),
+            sha256=register_manifest["output"]["sha256"],
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(register_dir.name),
+            licence=None,
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(summary_path),
+            sha256=summary_sha256,
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(trajectories_dir.name),
+            licence=None,
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(verdict_path),
+            sha256=verdict_manifest["output"]["sha256"],
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(acceptance_dir.name),
+            licence=None,
+            redistribute_public=False,
+        ),
+        SourceAsset(
+            uri=str(join_path),
+            sha256=join_manifest["output"]["sha256"],
+            collection=None,
+            snapshot_date=dt_date.fromisoformat(join_dir.name),
+            licence=None,
+            redistribute_public=False,
+        ),
+    ]
+    try:
+        manifests.write_run_manifest(
+            output=output_path,
+            inputs=input_assets,
+            config=resolved_config,
+            git_state=git_state,
+            resolved_args={
+                "date": date,
+                "register_dir": str(register_dir),
+                "trajectories_dir": str(trajectories_dir),
+                "acceptance_dir": str(acceptance_dir),
+                "context_join_dir": str(join_dir),
+                "n_register_sites_unlocated": n_unlocated,
+                "layers": [
+                    trajectory_summary.REGISTER_LAYER,
+                    trajectory_summary.SUMMARY_LAYER,
+                ],
+            },
+        )
+    except FileExistsError as exc:
+        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
+        raise typer.Exit(1) from None
+
+    typer.echo(
+        json.dumps(
+            {
+                "output_path": str(output_path),
+                "manifest_path": str(output_path) + manifests.MANIFEST_SUFFIX,
+                "n_eligible_sites": len(summary_df),
+                "n_register_sites": int(register_df.shape[0]),
+                "n_register_sites_unlocated": n_unlocated,
             },
             indent=2,
             sort_keys=True,

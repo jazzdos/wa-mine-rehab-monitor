@@ -33,6 +33,7 @@ for the batches not yet run, with the measurements behind it, is in
 | A8 | 2026-08-25 | Public web page withdrawn; output re-scoped to GeoParquet + private QGIS project | none | `decisions/2026-08-25-public-web-page-descope.md` |
 | A9 | 2026-08-29 | E5 reference corrected to `w3`; pixel-count check waived against a countless reference | none | `decisions/2026-08-29-e5-reference-window-correction.md` |
 | A10 | 2026-08-29 | D13 §6 F1 dissolved; mirror declined; authoritative route only | none | `decisions/2026-08-29-dbca-mirror-declined.md` |
+| A11 | 2026-08-30 | Batch G closes QGIS-only; release-package decision deferred, not taken | none | `decisions/2026-08-30-batch-g-qgis-only-rescope.md` |
 
 **A1 — execution host.** Batch C's measured volume re-derivation
 (597.1 GB windowed, 3.30 TB whole-tile upper bound) excluded the
@@ -155,6 +156,24 @@ two obligations from the dissolved F1: hash the unzipped `.gpkg`
 `CC-BY-4.0` with the CKAN catalogue URL, with a captured evidence file.
 The F4 coverage window is frozen at `[1937, snapshot_year - 1]`. Adds
 limitation L18. No protocol digest affected.
+
+**A11 — Batch G closes QGIS-only.** ROADMAP row 5 previously read Batch
+G as versioned releases (an `export-release` trajectory package) plus a
+private QGIS project. The release decision is not taken in this batch:
+no trajectory, register, or context package is added to
+`release.PACKAGES`, per L10's "only when a release of it is actually
+decided" wording — that decision is deferred, not declined. Deferring
+it also defers the D7 question a public `site_id`-keyed trajectory
+release would raise (MINEDEX row-level records and crosswalk membership
+would reach the export boundary, and `export_gate`'s `source_id`-based
+row gate would not catch a `site_id` column), recorded so it is not
+forgotten if a release is decided later. `export_gate` is not invoked
+anywhere in this batch. Batch G's deliverables narrow to the
+`build-trajectory-summary` curated GeoPackage, its QML styles, the
+`qgis/README.md`, and the owner's interactively-saved `.qgz`. L10 and
+L11's own wording is unchanged — both were already closed/re-scoped
+against the `footprint-areas` package; this amendment narrows ROADMAP
+row 5 only. No protocol digest affected.
 
 ### What was deliberately not amended
 
