@@ -1,0 +1,2540 @@
+diff --git a/docs/ROADMAP.md b/docs/ROADMAP.md
+index dbac5b6..24c52b6 100644
+--- a/docs/ROADMAP.md
++++ b/docs/ROADMAP.md
+@@ -26,7 +26,7 @@ battery: ruff, format, mypy, 910 tests green.
+ | 1 | ~~**E5 engine parity**~~ **PASSED 2026-08-29**: official verdict `curated/huntly-validation/2026-08-29/validation.json`, `passed: true`, zero failures (204,060 rows accounted, 196,560 value-compared, all within `1e-6`/`0.1 pp`); reference corrected w1→w3 with pixel-count waiver (A9) | None — `require_huntly_gate` accepts the verdict; statewide extraction UNLOCKED, O3 closed | `checkpoints/huntly-zonal-validation.md`; A7, A9 |
+ | 2 | ~~**Task 0 forced-threshold path**~~ **Done 2026-08-29**: code landed in `c463a0a`; six-count replay verified (`diag_batch_e_readiness.py --check eligibility`); forced-144 register built at `curated/register/2026-08-29/` — 10,372 eligible / 538 insufficient / 30,833 / 8,421 / 0, total 50,164, `criteria_passed=false` preserved, decision record in the manifest | None — O8 closed 2026-08-25 (replay calls the production function) | `decisions/2026-08-25-batch-e-forced-threshold-entry.md` |
+ | 3 | **E4 statewide extraction**: site × year × metric GeoParquet; footprint-keyed reads fanned out to sites; `shared_footprint_site_count` and `valid_support_px` on every row | Unblocked 2026-08-29 (1 and 2 both done); next critical-path step | `plans/2026-08-22-batch-e-e4-e5.md` (FINAL) |
+-| 4 | **Batch F context**: DBCA-060 fire overlap (three-state, never inferred absence) and SILO climate joined to trajectories. `fetch-silo` (owner-run, not yet run against the real bucket) downloads the SILO open-data grids; `build-climate-context` builds the curated climate context from those grids | DBCA mirror route blocked pending evidence adjudication | D13 §5 |
++| 4 | **Batch F context**: DBCA-060 fire overlap (three-state, never inferred absence) and SILO climate joined to trajectories. `fetch-silo` (owner-run, not yet run against the real bucket) downloads the SILO open-data grids; `build-climate-context` builds the curated climate context from those grids | Mirror declined, F1 dissolved 2026-08-29 (A10); fetch-dbca-fire + build-fire-context landed; live staging + build pending owner run; F6 join still requires E4 | D13 §5 |
+ | 5 | **Batch G, re-scoped**: versioned releases, `export-release` command wiring `export_gate.export_public` (closes L10/L11), private QGIS project | Requires accepted Tier 1; web page withdrawn | `decisions/2026-08-25-public-web-page-descope.md` |
+ | 6 | **Tier 2 deep-dive** (conditional): region chosen by pre-registered ranking; runs only if hard gates pass (≥30 eligible high-confidence sites, calibration cases, compute budget) | May legitimately not run | design §8 D4 |
+ 
+diff --git a/docs/amendments-and-limitations.md b/docs/amendments-and-limitations.md
+index 710c5e9..63660b1 100644
+--- a/docs/amendments-and-limitations.md
++++ b/docs/amendments-and-limitations.md
+@@ -32,6 +32,7 @@ for the batches not yet run, with the measurements behind it, is in
+ | A7 | 2026-08-25 | E5 Huntly gate re-scoped to engine parity on the jarrah pilot cube | none | `decisions/2026-08-25-e5-engine-parity-rescope.md` |
+ | A8 | 2026-08-25 | Public web page withdrawn; output re-scoped to GeoParquet + private QGIS project | none | `decisions/2026-08-25-public-web-page-descope.md` |
+ | A9 | 2026-08-29 | E5 reference corrected to `w3`; pixel-count check waived against a countless reference | none | `decisions/2026-08-29-e5-reference-window-correction.md` |
++| A10 | 2026-08-29 | D13 §6 F1 dissolved; mirror declined; authoritative route only | none | `decisions/2026-08-29-dbca-mirror-declined.md` |
+ 
+ **A1 — execution host.** Batch C's measured volume re-derivation
+ (597.1 GB windowed, 3.30 TB whole-tile upper bound) excluded the
+@@ -139,6 +140,22 @@ parity evidence. Run 1's failing verdict is superseded and its
+ directory deleted; figures preserved in
+ `checkpoints/huntly-zonal-validation.md`. No protocol digest affected.
+ 
++**A10 — DBCA-060 mirror declined; D13 §6 F1 dissolved.** D13 §6 called
++F1 ("adjudicate DBCA-060 mirror provenance and licence evidence") a
++hard precondition on the mirror route. The mirror is never used: an
++AUTHORITATIVE Data WA package for DBCA-060 is already on disk
++(`~/data/jarrah-rehab/raw/dbca-060/2026-07-20/`, zip digests recorded).
++F1 exists solely to authorise the mirror, so with the authoritative
++route taken instead, F1 has nothing left to adjudicate and is
++dissolved, following the 2026-08-26 SILO precedent for dissolving a
++D13 Batch F precondition the actual route made objectless. F3 inherits
++two obligations from the dissolved F1: hash the unzipped `.gpkg`
++(the source digest file covers only the zips), and correct
++`licence.py`'s `dbca_060_fire` entry from a bare `"open"` to
++`CC-BY-4.0` with the CKAN catalogue URL, with a captured evidence file.
++The F4 coverage window is frozen at `[1937, snapshot_year - 1]`. Adds
++limitation L18. No protocol digest affected.
++
+ ### What was deliberately not amended
+ 
+ Batch D's D3 criteria failed on the 2026-08-23 rerun and were left
+@@ -295,6 +312,14 @@ counts reconcile the same way. A zero and a not-computed are never
+ conflated, but a reader who treats the column as a plain integer will
+ misread the nulls.
+ 
++**L18 — DBCA-060 fire records are DBCA's own scope, not statewide
++coverage.** DBCA-060's own scope is fires on DBCA-managed land or
++where DBCA incurred costs; known gaps exist and spatial completeness
++is not modelled. `not_recorded` is therefore a statement about the
++RECORD for a covered year, never about the ground. No output ever
++treats it as a known-negative.
++`decisions/2026-08-29-dbca-mirror-declined.md`.
++
+ ## 3. Open items
+ 
+ | ID | Item | Blocks |
+diff --git a/docs/decisions/2026-08-29-dbca-mirror-declined.md b/docs/decisions/2026-08-29-dbca-mirror-declined.md
+new file mode 100644
+index 0000000..b10e213
+--- /dev/null
++++ b/docs/decisions/2026-08-29-dbca-mirror-declined.md
+@@ -0,0 +1,66 @@
++# DBCA-060 mirror route declined; authoritative package only (2026-08-29)
++
++**Status: authorised by the owner 2026-08-29.** This is amendment **A10**
++in `docs/amendments-and-limitations.md`.
++
++## Decision
++
++The ArcGIS Online mirror route for DBCA-060 stays DECLINED for product
++ingestion, permanently for v1. D13 §6's F1 ("Adjudicate DBCA-060 mirror
++provenance and licence evidence",
++`decisions/2026-08-16-d13-batches-c-g-detailing.md:742-790`) is dissolved
++as objectless: F1 exists solely to authorise the mirror, and an
++AUTHORITATIVE Data WA package is already on disk at
++`~/data/jarrah-rehab/raw/dbca-060/2026-07-20/` (zip digests in its
++`SHA256SUMS.txt`; custodian CRS-provenance in `metadata.txt`). Precedent:
++the 2026-08-26 SILO decision
++(`decisions/2026-08-26-silo-gridded-feed.md`) dissolving D13's
++credentials precondition when the actual route made it objectless — here
++the actual route is the authoritative package already staged, so the
++mirror-adjudication precondition has nothing left to authorise.
++
++## Why the mirror was suspect (recorded for the file)
++
++The mirror is a third-party ArcGIS Online service (org id
++`DN2fPfpggEPlLhP6`, identified as "Stantec" only in a sibling project's
++config comment); no item-owner capture, no licence-text capture, no
++authoritative-versus-mirror diff was ever run. None of that evidence is
++needed when the authoritative package itself is the input — F1's entire
++evidence list (item owner/publisher identity, redistribution grant,
++reproducible authoritative-versus-mirror comparison, freshness policy)
++adjudicates a route this project does not take.
++
++## F3 obligations this decision assigns
++
++1. Compute and record the sha256 of the unzipped `.gpkg` — the source
++   `SHA256SUMS.txt` covers only the two zips, not the extracted
++   GeoPackage that F3/F4 actually read.
++2. Close the licence-evidence gap. `src/wa_mine_monitor/licence.py`'s
++   `dbca_060_fire` entry holds `licence_id="open"`, `licence_url=""`.
++   The CKAN record (dataset id
++   `3ce8a891-b050-4c38-952b-c40ca8bdc042`, verified in jarrah-rehab
++   `docs/research/data-source-verification_2026-07-20.md`) says
++   `license_id: cc-by`, so the entry becomes `CC-BY-4.0` with the
++   catalogue URL, and the live F3 run captures the catalogue page as a
++   digested evidence file.
++
++## Frozen F4 coverage window
++
++**`[1937, snapshot_year - 1]`**, calendar years per `fih_year1`. 1937 is
++the dataset's documented earliest systematic records; the snapshot year
++itself is excluded because the record for the extract year is incomplete
++at extract time. Frozen here, never inferred from the data.
++
++## Limitation L18 (declared here, registered in the amendments file)
++
++DBCA-060's own scope is fires on DBCA-managed land or where DBCA
++incurred costs; known gaps exist and spatial completeness is not
++modelled. `not_recorded` is therefore a statement about the RECORD for a
++covered year, never about the ground. No output ever treats it as a
++known-negative.
++
++## Consequence
++
++Dissolves D13 §6 F1 as objectless. F2 (ArcGIS client/pager) is likewise
++unneeded and stays unbuilt — the mirror route it would serve is
++declined. Batch F proceeds on the authoritative on-disk GeoPackage only.
+diff --git a/docs/licensing-matrix.md b/docs/licensing-matrix.md
+index 08d7a29..cd910b0 100644
+--- a/docs/licensing-matrix.md
++++ b/docs/licensing-matrix.md
+@@ -43,7 +43,7 @@ gate itself can enforce.
+ | MINEDEX (DMIRS-001) | https://catalogue.data.wa.gov.au/dataset/minedex-dmirs-001 (acquired via DASC bundles `https://dasc.dmirs.wa.gov.au/Download/File/3978` SHP and `https://dasc.dmirs.wa.gov.au/Download/File/3981` CSV) | **`CONFLICT:cc-nc-vs-cc-by`** — D7-adjudicated, still closed | **False** (fail-closed) | "Contains data sourced from the Department of Mines, Industry Regulation and Safety (DMIRS), MINEDEX (DMIRS-001). Attribution only; not for public redistribution pending licence resolution." |
+ | Maus et al. global mining polygons, v2 | https://doi.pangaea.de/10.1594/PANGAEA.942325 | CC-BY-SA-4.0 | **True**, share-alike package | "Contains data derived from Maus, V. et al., \"An update on global mining land use\" (PANGAEA.942325), licensed under CC-BY-SA-4.0. This derived work is licensed under CC-BY-SA-4.0." |
+ | Hansen/UMD/Google/USGS/NASA Global Forest Change (`GFC-2024-v1.12`) | https://glad.earthengine.app/view/global-forest-change | CC-BY-4.0, conditional | **True**, conditional on both credit strings | see "Hansen credit strings" below — both required, not interchangeable |
+-| DBCA-060 Fire History | https://catalogue.data.wa.gov.au/dataset/fire-history-dbca-060 | open | **True**, context-only | "Contains fire history data from the Department of Biodiversity, Conservation and Attractions (DBCA), Fire History (DBCA-060)." |
++| DBCA-060 Fire History | https://catalogue.data.wa.gov.au/dataset/fire-history-dbca-060 | CC-BY-4.0 | **True**, context-only | "Contains fire history data from the Department of Biodiversity, Conservation and Attractions (DBCA), Fire History (DBCA-060)." |
+ | SILO Climate Database | https://www.longpaddock.qld.gov.au/silo/ | CC BY 4.0 (gridded, anonymous) | **True** | "Contains climate data sourced from the Queensland Government's SILO climate database (longpaddock.qld.gov.au/silo)." |
+ 
+ ## Snapshot policy
+@@ -172,7 +172,11 @@ rather than presenting them as an unmodified copy.
+   metadata says it can include burns inside mining-rehabilitation areas, so
+   "not recorded" is never treated as a known-negative fire label — every
+   site-year this project derives from it carries `fire_status ∈ {recorded,
+-  not_recorded, unknown}`, never a bare boolean.
++  not_recorded, unknown}`, never a bare boolean. Licence corrected from the
++  provisional "open" 2026-08-29 to CC-BY-4.0: CKAN dataset
++  `3ce8a891-b050-4c38-952b-c40ca8bdc042` records `license_id: cc-by`
++  (jarrah-verified 2026-07-20), evidenced by a digested capture of the
++  catalogue page (`docs/decisions/2026-08-29-dbca-mirror-declined.md`).
+ 
+ ## Hansen credit strings
+ 
+diff --git a/src/wa_mine_monitor/cli.py b/src/wa_mine_monitor/cli.py
+index 223b02c..8fb7064 100644
+--- a/src/wa_mine_monitor/cli.py
++++ b/src/wa_mine_monitor/cli.py
+@@ -14,6 +14,7 @@ import functools
+ import io
+ import json
+ import os
++import shutil
+ import subprocess
+ import zipfile
+ from collections.abc import Callable, Mapping, Sequence
+@@ -29,6 +30,7 @@ import pyarrow as pa
+ import pyarrow.parquet as pq
+ import pyogrio
+ import rasterio  # type: ignore[import-untyped]
++import requests
+ import shapely
+ import typer
+ import yaml
+@@ -44,6 +46,7 @@ from wa_mine_monitor import (
+     dea_raster,
+     dea_volume,
+     export_gate,
++    fire_context,
+     huntly_validation,
+     licence,
+     manifests,
+@@ -66,7 +69,7 @@ from wa_mine_monitor.http import (
+ from wa_mine_monitor.provenance import SourceAsset, collect_git_state, sha256_file
+ from wa_mine_monitor.secrets import redact_secrets, scrub_string_leaves
+ from wa_mine_monitor.source_catalogue import DEA_COLLECTIONS, SourceSpec
+-from wa_mine_monitor.sources import silo, wa_regions
++from wa_mine_monitor.sources import dbca, silo, wa_regions
+ from wa_mine_monitor.sources.dea import (
+     DEA_RETRY_POLICY,
+     CatalogueValidationError,
+@@ -358,6 +361,18 @@ SourceGpkgOption = typer.Option(
+ )
+ 
+ 
++#: `fetch-dbca-fire`'s `--source-dir`: the authoritative DBCA-060 package
++#: directory (a Data WA download this command never fetches itself). No
++#: `exists=True` here -- unlike `SourceGpkgOption` -- because a missing
++#: `--source-dir` is refused with this module's own structured JSON error
++#: (`"stage": "source_package"`), not typer's built-in path validation.
++DbcaSourceDirOption = typer.Option(
++    ...,
++    "--source-dir",
++    help="Authoritative DBCA-060 package directory (Data WA download).",
++)
++
++
+ #: DPIRD-020 via the SLIP public ArcGIS REST layer, pinned 2026-08-21
+ #: (Data WA catalogue record `regional-development-commission-boundaries`,
+ #: licence CC-BY-4.0 re-verified the same day via the CKAN API). The
+@@ -401,6 +416,16 @@ SiteIdOption = typer.Option(
+ )
+ 
+ 
++def _fetch_catalogue_page(url: str) -> bytes:
++    """Download the licence-evidence catalogue page at `url` (network seam,
++    monkeypatchable). Used by `fetch_dbca_fire_cmd` to capture proof of the
++    licence terms displayed at the Data WA catalogue page for DBCA-060 --
++    the snapshot is never finalized without this evidence."""
++    response = requests.get(url, timeout=60)
++    response.raise_for_status()
++    return response.content
++
++
+ def _fetch_region_boundaries_bytes() -> bytes:
+     """Download the pinned DPIRD-020 GeoJSON (network seam, monkeypatchable)."""
+     client = HttpClient()
+@@ -1934,6 +1959,272 @@ def fetch_silo_cmd(
+     )
+ 
+ 
++@app.command("fetch-dbca-fire")
++def fetch_dbca_fire_cmd(
++    config: Path = ConfigOption,
++    date: str = DateOption,
++    mode: str = typer.Option(
++        "authoritative", "--mode", help="authoritative|mirror -- mirror is declined."
++    ),
++    source_dir: Path = DbcaSourceDirOption,
++) -> None:
++    """Stage a dated DBCA-060 fire-history snapshot from an authoritative,
++    already-downloaded Data WA package directory (CC BY 4.0).
++
++    `--mode` accepts only `authoritative`: the ArcGIS mirror route stays
++    declined (`docs/decisions/2026-08-29-dbca-mirror-declined.md`) and
++    `mirror` refuses fail-closed, before any I/O, naming that record.
++
++    `--source-dir` must already hold exactly one `*.gpkg`, a
++    `SHA256SUMS.txt`, and a `metadata.txt` -- this command never downloads
++    anything itself, it only stages and validates a package a human already
++    fetched from Data WA. Every zip entry named in the source
++    `SHA256SUMS.txt` that exists in `--source-dir` is digest-verified
++    before staging; the GeoPackage itself is not covered by those sums (they
++    cover only the zips), so its digest is computed fresh here and recorded
++    in the run manifest.
++
++    Staging copies the GeoPackage plus the source `SHA256SUMS.txt` and
++    `metadata.txt` (renamed `source-SHA256SUMS.txt` / `source-metadata.txt`
++    so they cannot collide with this snapshot's own `metadata.txt` /
++    `SHA256SUMS.txt`) into `<data_root>/raw/dbca_060_fire/<date>/`, then runs
++    `dbca.validate_fire_history_file` before anything is finalized.
++
++    Licence evidence -- the Data WA catalogue page for DBCA-060 -- is
++    fetched and written as `catalogue-page.html` before the snapshot is
++    finalized; the snapshot is NEVER finalized without it, so a fetch
++    failure refuses the run even though staging and validation already
++    passed.
++
++    The stray-file gate (`_refuse_if_unexpected_files`) runs both before
++    staging and before finalizing, mirroring `fetch-silo`'s discipline. The
++    manifest carries two `SourceAsset` inputs: the source GeoPackage (its
++    own resolved file:// URI) and the catalogue page (the Data WA URL),
++    both under `licence.SOURCES["dbca_060_fire"]`.
++    """
++    resolved: ProjectConfig = _load_config_or_exit(config)
++    resolved_config = resolved.model_dump(mode="json")
++
++    if mode != "authoritative":
++        if mode == "mirror":
++            typer.echo(
++                json.dumps(
++                    {
++                        "refusal": (
++                            "--mode mirror -- the ArcGIS mirror route is declined -- see "
++                            "docs/decisions/2026-08-29-dbca-mirror-declined.md"
++                        )
++                    },
++                    indent=2,
++                    sort_keys=True,
++                )
++            )
++        else:
++            typer.echo(
++                json.dumps(
++                    {
++                        "refusal": (
++                            f"--mode {mode!r} is not recognised -- valid modes are "
++                            "'authoritative' or 'mirror'"
++                        )
++                    },
++                    indent=2,
++                    sort_keys=True,
++                )
++            )
++        raise typer.Exit(1) from None
++
++    if not source_dir.is_dir():
++        typer.echo(
++            json.dumps(
++                {"refusal": f"--source-dir {source_dir} does not exist or is not a directory"},
++                indent=2,
++                sort_keys=True,
++            )
++        )
++        raise typer.Exit(1) from None
++
++    gpkgs = sorted(source_dir.glob("*.gpkg"))
++    if len(gpkgs) != 1:
++        typer.echo(
++            json.dumps(
++                {
++                    "refusal": (
++                        f"--source-dir {source_dir} must hold exactly one *.gpkg, found "
++                        f"{[p.name for p in gpkgs]}"
++                    ),
++                    "stage": "source_package",
++                },
++                indent=2,
++                sort_keys=True,
++            )
++        )
++        raise typer.Exit(1) from None
++    source_gpkg = gpkgs[0]
++
++    source_sums_path = source_dir / "SHA256SUMS.txt"
++    source_metadata_path = source_dir / "metadata.txt"
++    for required in (source_sums_path, source_metadata_path):
++        if not required.is_file():
++            typer.echo(
++                json.dumps(
++                    {
++                        "refusal": f"--source-dir {source_dir} is missing {required.name}",
++                        "stage": "source_package",
++                    },
++                    indent=2,
++                    sort_keys=True,
++                )
++            )
++            raise typer.Exit(1) from None
++
++    for line in source_sums_path.read_text().splitlines():
++        line = line.strip()
++        if not line:
++            continue
++        expected_digest, _, name = line.partition("  ")
++        name = name.strip()
++        entry_path = source_dir / name
++        if not entry_path.is_file():
++            continue
++        actual_digest = sha256_file(entry_path)
++        if actual_digest != expected_digest:
++            typer.echo(
++                json.dumps(
++                    {
++                        "refusal": (
++                            f"{name} digest mismatch: SHA256SUMS.txt says {expected_digest}, "
++                            f"actual is {actual_digest}"
++                        ),
++                        "stage": "source_digests",
++                        "file": name,
++                    },
++                    indent=2,
++                    sort_keys=True,
++                )
++            )
++            raise typer.Exit(1) from None
++
++    source = licence.SOURCES["dbca_060_fire"]
++    snapshot_dir = snapshots.create_snapshot_dir(resolved.run.data_root, "dbca_060_fire", date)
++    git_state = _collect_git_state_disclosing_gaps(_REPO_ROOT)
++    _refuse_if_snapshot_already_finalized(snapshot_dir, config=resolved_config, git_state=git_state)
++
++    gpkg_name = source_gpkg.name
++    evidence_name = "catalogue-page.html"
++    expected_names = {
++        "metadata.txt",
++        gpkg_name,
++        evidence_name,
++        "source-SHA256SUMS.txt",
++        "source-metadata.txt",
++    }
++    _refuse_if_unexpected_files(
++        snapshot_dir, expected_names=expected_names, closing_clause="before staging"
++    )
++
++    dest = snapshot_dir / gpkg_name
++    if not dest.exists():
++        shutil.copy2(source_gpkg, dest)
++    shutil.copy2(source_sums_path, snapshot_dir / "source-SHA256SUMS.txt")
++    shutil.copy2(source_metadata_path, snapshot_dir / "source-metadata.txt")
++
++    try:
++        summary = dbca.validate_fire_history_file(dest, snapshot_year=int(date[:4]))
++    except dbca.DbcaError as exc:
++        typer.echo(
++            json.dumps(
++                {"refusal": f"{dest.name} failed validation: {exc}", "stage": "validation"},
++                indent=2,
++                sort_keys=True,
++            )
++        )
++        raise typer.Exit(1) from None
++
++    try:
++        evidence_bytes = _fetch_catalogue_page(source.source_url)
++    except Exception as exc:  # noqa: BLE001 -- surfaced as a structured refusal
++        typer.echo(
++            json.dumps(
++                {
++                    "refusal": (
++                        f"licence-evidence fetch of {source.source_url} failed: {exc} -- "
++                        "the snapshot is never finalized without evidence"
++                    ),
++                    "stage": "licence_evidence",
++                },
++                indent=2,
++                sort_keys=True,
++            )
++        )
++        raise typer.Exit(1) from None
++    evidence_path = snapshot_dir / evidence_name
++    evidence_path.write_bytes(evidence_bytes)
++
++    snapshots.write_snapshot_metadata(
++        snapshot_dir,
++        source=f"{source.title} ({dbca.LAYER_NAME})",
++        endpoint=source.source_url,
++        licence_note=f"{source.licence_id} -- catalogue page: {source.source_url}",
++        purpose="DBCA-060 recorded-fire-overlap context (Batch F F3).",
++    )
++
++    _refuse_if_unexpected_files(
++        snapshot_dir, expected_names=expected_names, closing_clause="before finalizing"
++    )
++
++    sums_path = snapshots.finalize_snapshot(snapshot_dir)
++    n_ok, n_bad, n_missing = snapshots.verify_snapshot(snapshot_dir)
++
++    assets = [
++        SourceAsset(
++            uri=source_gpkg.resolve().as_uri(),
++            sha256=sha256_file(dest),
++            collection=None,
++            snapshot_date=dt_date.fromisoformat(date),
++            licence=source.licence_id,
++            redistribute_public=source.redistribute_public,
++        ),
++        SourceAsset(
++            uri=source.source_url,
++            sha256=sha256_file(evidence_path),
++            collection=None,
++            snapshot_date=dt_date.fromisoformat(date),
++            licence=source.licence_id,
++            redistribute_public=source.redistribute_public,
++        ),
++    ]
++
++    manifests.write_run_manifest(
++        output=sums_path,
++        inputs=assets,
++        config=resolved_config,
++        git_state=git_state,
++        resolved_args={
++            "date": date,
++            "mode": mode,
++            "feature_count": summary.feature_count,
++            "counts_by_type": summary.counts_by_type,
++            "year_min": summary.year_min,
++            "year_max": summary.year_max,
++        },
++    )
++
++    typer.echo(
++        json.dumps(
++            {
++                "snapshot_dir": str(snapshot_dir),
++                "feature_count": summary.feature_count,
++                "counts_by_type": summary.counts_by_type,
++                "verified": {"ok": n_ok, "bad": n_bad, "missing": n_missing},
++            },
++            indent=2,
++            sort_keys=True,
++            default=str,
++        )
++    )
++
++
+ def _csv_zip_member_row_count(zip_path: Path, member_name: str) -> int:
+     """The number of DATA rows (excluding the header) `member_name` carries
+     inside the zip at `zip_path`, counted via `csv.reader` -- deliberately
+@@ -3118,6 +3409,402 @@ def build_climate_context_cmd(
+     )
+ 
+ 
++@app.command("build-fire-context")
++def build_fire_context_cmd(
++    config: Path = ConfigOption,
++    date: str = DateOption,
++    start_year: int = typer.Option(..., "--start-year"),
++    end_year: int = typer.Option(..., "--end-year"),
++) -> None:
++    """Build DBCA-060 fire-history context rows (D13 F4) for every D3-eligible
++    site, one row per `(site_id, year)` for `year` in `[start_year, end_year]`.
++
++    Mirrors `build-climate-context`'s gate structure exactly (GATE 1
++    inverted-range refusal before any I/O; GATE 2 latest verified
++    `raw/dbca_060_fire/<date>/` snapshot; GATE 3 latest D3-eligibility-
++    annotated register; GATE 4 crosswalk + Maus snapshot, sha-tied). Context
++    rows are context only (see `fire_context.py`'s docstring): this command
++    never joins fire history to trajectory rows and never states a cause.
++    `not_recorded` is NEVER a known-negative fire label.
++    """
++    resolved: ProjectConfig = _load_config_or_exit(config)
++    resolved_config = resolved.model_dump(mode="json")
++    git_state = _collect_git_state_disclosing_gaps(_REPO_ROOT)
++    data_root = resolved.run.data_root
++
++    # GATE 1 -- year range, BEFORE any I/O. See `build_climate_context_cmd`'s
++    # identical gate for why an inverted range must never reach `assemble_
++    # rows` and produce a schema-valid, finalized, empty artefact.
++    if start_year > end_year:
++        typer.echo(
++            json.dumps(
++                {
++                    "refusal": (
++                        f"--start-year {start_year} is after --end-year {end_year} -- "
++                        "refusing an inverted year range"
++                    )
++                },
++                indent=2,
++                sort_keys=True,
++            )
++        )
++        raise typer.Exit(1) from None
++
++    output_dir = data_root / "curated" / "fire-context" / date
++    output_path = output_dir / "fire_context.parquet"
++    _refuse_if_curated_output_already_exists(
++        output_path, config=resolved_config, git_state=git_state
++    )
++
++    requested_years = list(range(start_year, end_year + 1))
++
++    # GATE 2 -- the latest DBCA-060 fire snapshot: locate the single *.gpkg
++    # inside it FIRST (refuse if zero or more than one), then digest-verify
++    # the snapshot with that gpkg named in `required_files` -- an unlisted
++    # file dropped in after finalisation otherwise passes verification (same
++    # gate `build_climate_context_cmd` GATE 2 applies to the SILO files it
++    # consumes).
++    try:
++        dbca_snapshot_dir = register.latest_snapshot(data_root, "dbca_060_fire")
++    except register.NoSnapshotFoundError as exc:
++        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
++        raise typer.Exit(1) from None
++
++    gpkgs = sorted(dbca_snapshot_dir.glob("*.gpkg"))
++    if len(gpkgs) != 1:
++        typer.echo(
++            json.dumps(
++                {
++                    "refusal": (
++                        f"{dbca_snapshot_dir} must hold exactly one *.gpkg, found "
++                        f"{[p.name for p in gpkgs]}"
++                    )
++                },
++                indent=2,
++                sort_keys=True,
++            )
++        )
++        raise typer.Exit(1) from None
++    gpkg_path = gpkgs[0]
++
++    dbca_verification = _verify_snapshot_or_refuse(
++        dbca_snapshot_dir, source_id="dbca_060_fire", required_files=(gpkg_path.name,)
++    )
++    snapshot_year = int(dbca_snapshot_dir.name[:4])
++    gpkg_sha256 = sha256_file(gpkg_path)
++    source_version = f"dbca-060-{dbca_snapshot_dir.name}-sha256-{gpkg_sha256[:12]}"
++
++    # GATE 3 -- latest curated register: digest-verified, and must be the
++    # D3-eligibility-annotated register `apply-d3-threshold` writes -- the
++    # same two column checks `build_climate_context_cmd` GATE 3 applies.
++    try:
++        register_dir = _latest_curated_dated_dir(
++            data_root / "curated" / "register", label="curated/register"
++        )
++    except register.NoSnapshotFoundError as exc:
++        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
++        raise typer.Exit(1) from None
++    register_path = register_dir / "register.parquet"
++    register_manifest = _digest_verified_manifest(register_path)
++    register_df = read_table(register_path)
++    if "trajectory_status" not in register_df.columns:
++        typer.echo(
++            json.dumps(
++                {
++                    "refusal": (
++                        "latest curated register is not D3-eligibility-annotated -- run "
++                        "apply-d3-threshold first"
++                    ),
++                    "register_path": str(register_path),
++                },
++                indent=2,
++                sort_keys=True,
++            )
++        )
++        raise typer.Exit(1)
++    if "d3_forced_threshold" not in register_df.columns:
++        typer.echo(
++            json.dumps(
++                {
++                    "refusal": (
++                        "latest curated register predates the d3_forced_threshold column -- "
++                        "run apply-d3-threshold to re-write it"
++                    ),
++                    "register_path": str(register_path),
++                },
++                indent=2,
++                sort_keys=True,
++            )
++        )
++        raise typer.Exit(1)
++
++    eligible = trajectory_extract.select_eligible_sites(register_df)
++
++    # GATE 4 -- crosswalk + Maus snapshot, resolved and sha256-tied exactly
++    # as `build_climate_context_cmd` GATE 4 does.
++    try:
++        crosswalk_dir = _latest_curated_dated_dir(
++            data_root / "curated" / "crosswalk", label="curated/crosswalk"
++        )
++    except register.NoSnapshotFoundError as exc:
++        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
++        raise typer.Exit(1) from None
++    crosswalk_path = crosswalk_dir / "crosswalk.parquet"
++    crosswalk_manifest = _digest_verified_manifest(crosswalk_path)
++    crosswalk_df = read_table(crosswalk_path)
++    tier1_df = crosswalk.tier1_population(crosswalk_df)
++
++    maus_licence_id = licence.SOURCES["maus_v2"].licence_id
++    crosswalk_maus_input = next(
++        (
++            asset
++            for asset in crosswalk_manifest.get("inputs", [])
++            if asset.get("licence") == maus_licence_id
++        ),
++        None,
++    )
++    if crosswalk_maus_input is None:
++        typer.echo(
++            json.dumps(
++                {
++                    "refusal": (
++                        f"{crosswalk_path}'s manifest carries no Maus input (licence "
++                        f"{maus_licence_id!r}) -- cannot verify which Maus snapshot it "
++                        "was built from"
++                    )
++                },
++                indent=2,
++                sort_keys=True,
++            )
++        )
++        raise typer.Exit(1)
++    crosswalk_maus_sha256 = crosswalk_maus_input["sha256"]
++
++    try:
++        maus_snapshot_dir = register.latest_snapshot(data_root, "maus_v2")
++    except register.NoSnapshotFoundError as exc:
++        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
++        raise typer.Exit(1) from None
++    _verify_snapshot_or_refuse(
++        maus_snapshot_dir, source_id="maus_v2", required_files=("wa_extract.gpkg",)
++    )
++    maus_path = maus_snapshot_dir / "wa_extract.gpkg"
++    maus_gpkg_sha256 = sha256_file(maus_path)
++    if maus_gpkg_sha256 != crosswalk_maus_sha256:
++        typer.echo(
++            json.dumps(
++                {
++                    "refusal": (
++                        f"latest maus_v2 raw snapshot ({maus_path}) hashes "
++                        f"{maus_gpkg_sha256[:12]}..., but the crosswalk's manifest records "
++                        f"Maus sha256 {crosswalk_maus_sha256[:12]}... -- the latest raw Maus "
++                        "snapshot is not the one the crosswalk was built from"
++                    ),
++                    "maus_gpkg_sha256": maus_gpkg_sha256,
++                    "crosswalk_maus_gpkg_sha256": crosswalk_maus_sha256,
++                },
++                indent=2,
++                sort_keys=True,
++            )
++        )
++        raise typer.Exit(1)
++    try:
++        maus_source_gdf = gpd.read_file(maus_path)
++        maus_gdf = maus_source_gdf[["maus_id", "geometry"]].to_crs(crosswalk.TARGET_CRS)
++    except (pyogrio.errors.DataSourceError, OSError) as exc:
++        typer.echo(
++            json.dumps({"refusal": str(exc), "maus_gpkg": str(maus_path)}, indent=2, sort_keys=True)
++        )
++        raise typer.Exit(1) from None
++    except KeyError as exc:
++        typer.echo(
++            json.dumps(
++                {
++                    "refusal": f"wa_extract.gpkg is missing the expected column {exc}",
++                    "maus_gpkg": str(maus_path),
++                },
++                indent=2,
++                sort_keys=True,
++            )
++        )
++        raise typer.Exit(1) from None
++    maus_geom_by_id: dict[str, Any] = dict(
++        zip(maus_gdf["maus_id"].astype(str), maus_gdf.geometry, strict=True)
++    )
++
++    # Site->Maus tie-break, reproduced EXACTLY from `build_climate_context_
++    # cmd` (mirrors `register.py`'s own eligibility tie-break: stable sort
++    # by `["site_id", "maus_id"]`, `drop_duplicates(keep="first")` -- the
++    # lexicographically SMALLEST `maus_id` per site).
++    tier1_dedup = tier1_df.sort_values(
++        ["site_id", "maus_id"], na_position="last", kind="stable"
++    ).drop_duplicates(subset="site_id", keep="first")
++    maus_id_by_site: dict[str, str] = dict(
++        zip(tier1_dedup["site_id"].astype(str), tier1_dedup["maus_id"].astype(str), strict=True)
++    )
++
++    # An eligible site absent from the Tier 1 crosswalk population is
++    # refused by name, not silently dropped: `assemble_rows`' row-count
++    # guarantee reconciles against `site_maus_pairs`, which by then has
++    # already excluded the missing site, so it cannot catch this itself.
++    # `no_footprint` is reserved for step 6's empty/invalid geometry below --
++    # this is a DELIBERATE integrity gate, never downgraded to a per-row
++    # unknown.
++    site_maus_pairs: list[tuple[str, str]] = []
++    for site in eligible:
++        maus_id = maus_id_by_site.get(site)
++        if maus_id is None:
++            typer.echo(
++                json.dumps(
++                    {
++                        "refusal": (
++                            f"eligible site {site!r} is not in the Tier 1 crosswalk "
++                            f"population ({crosswalk_path}) -- an eligible site must have a "
++                            "high-confidence Maus match"
++                        )
++                    },
++                    indent=2,
++                    sort_keys=True,
++                )
++            )
++            raise typer.Exit(1)
++        site_maus_pairs.append((site, maus_id))
++
++    missing_geometry = sorted({m for _s, m in site_maus_pairs} - set(maus_geom_by_id))
++    if missing_geometry:
++        typer.echo(
++            json.dumps(
++                {
++                    "refusal": (
++                        f"maus_id(s) {missing_geometry} (from eligible sites) are absent "
++                        f"from the latest Maus snapshot ({maus_path})"
++                    )
++                },
++                indent=2,
++                sort_keys=True,
++            )
++        )
++        raise typer.Exit(1)
++
++    # Per distinct maus_id, reproject the single footprint geometry to
++    # EPSG:4283 (the fire layer's own CRS) -- an empty or invalid geometry
++    # becomes a per-row `unknown`/`no_footprint`, never a run abort.
++    distinct_maus_ids = sorted({m for _s, m in site_maus_pairs})
++    footprints_4283 = gpd.GeoSeries(
++        [maus_geom_by_id[m] for m in distinct_maus_ids], crs=crosswalk.TARGET_CRS
++    ).to_crs("EPSG:4283")
++
++    no_footprint_by_maus: dict[str, str] = {}
++    counts_by_maus_year: dict[tuple[str, int], int] = {}
++    for maus_id, geom in zip(distinct_maus_ids, footprints_4283, strict=True):
++        if geom.is_empty or not geom.is_valid:
++            no_footprint_by_maus[maus_id] = "footprint geometry empty or invalid"
++            continue
++        year_counts = dbca.fire_year_counts_for_footprint(gpkg_path, geom)
++        for year, count in year_counts.items():
++            if start_year <= year <= end_year:
++                counts_by_maus_year[(maus_id, year)] = count
++
++    try:
++        rows_df = fire_context.assemble_rows(
++            site_maus_pairs=site_maus_pairs,
++            counts_by_maus_year=counts_by_maus_year,
++            no_footprint_by_maus=no_footprint_by_maus,
++            years=requested_years,
++            snapshot_year=snapshot_year,
++            snapshot_date=dbca_snapshot_dir.name,
++            source_version=source_version,
++        )
++    except fire_context.FireContextError as exc:
++        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
++        raise typer.Exit(1) from None
++
++    fire_context.validate_row_counts(
++        rows_df, n_pairs=len(site_maus_pairs), n_years=end_year - start_year + 1
++    )
++
++    output_dir.mkdir(parents=True, exist_ok=True)
++    _write_table_or_refuse(rows_df, output_path, fire_context.FIRE_CONTEXT_SCHEMA)
++
++    dbca_source = licence.SOURCES["dbca_060_fire"]
++    input_assets = [
++        SourceAsset(
++            uri=str(gpkg_path.resolve().as_uri()),
++            sha256=gpkg_sha256,
++            collection=None,
++            snapshot_date=dt_date.fromisoformat(dbca_snapshot_dir.name),
++            licence=dbca_source.licence_id,
++            redistribute_public=dbca_source.redistribute_public,
++        ),
++        SourceAsset(
++            uri=str(register_path),
++            sha256=register_manifest["output"]["sha256"],
++            collection=None,
++            snapshot_date=dt_date.fromisoformat(register_dir.name),
++            licence=licence.SOURCES["dmirs_001_minedex"].licence_id,
++            redistribute_public=False,
++        ),
++        SourceAsset(
++            uri=str(crosswalk_path),
++            sha256=crosswalk_manifest["output"]["sha256"],
++            collection=None,
++            snapshot_date=dt_date.fromisoformat(crosswalk_dir.name),
++            licence=None,
++            redistribute_public=False,
++        ),
++        SourceAsset(
++            uri=str(maus_path),
++            sha256=maus_gpkg_sha256,
++            collection=None,
++            snapshot_date=dt_date.fromisoformat(maus_snapshot_dir.name),
++            licence=maus_licence_id,
++            redistribute_public=False,
++        ),
++    ]
++
++    status_counts = {
++        str(status): int(count) for status, count in rows_df["fire_status"].value_counts().items()
++    }
++
++    try:
++        manifests.write_run_manifest(
++            output=output_path,
++            inputs=input_assets,
++            config=resolved_config,
++            git_state=git_state,
++            resolved_args={
++                "date": date,
++                "start_year": start_year,
++                "end_year": end_year,
++                "register_dir": str(register_dir),
++                "crosswalk_dir": str(crosswalk_dir),
++                "maus_snapshot_dir": str(maus_snapshot_dir),
++                "dbca_snapshot_dir": str(dbca_snapshot_dir),
++                "dbca_snapshot_verification": dbca_verification,
++                "n_sites": len({s for s, _m in site_maus_pairs}),
++                "n_rows": len(rows_df),
++                "status_counts": status_counts,
++            },
++        )
++    except FileExistsError as exc:
++        typer.echo(json.dumps({"refusal": str(exc)}, indent=2, sort_keys=True))
++        raise typer.Exit(1) from None
++
++    typer.echo(
++        json.dumps(
++            {
++                "output_path": str(output_path),
++                "manifest_path": str(output_path) + manifests.MANIFEST_SUFFIX,
++                "rows": len(rows_df),
++                "status_counts": status_counts,
++            },
++            indent=2,
++            sort_keys=True,
++            default=str,
++        )
++    )
++
++
+ @app.command("fetch-dea-catalogue")
+ def fetch_dea_catalogue(
+     config: Path = ConfigOption,
+diff --git a/src/wa_mine_monitor/fire_context.py b/src/wa_mine_monitor/fire_context.py
+new file mode 100644
+index 0000000..827f1f4
+--- /dev/null
++++ b/src/wa_mine_monitor/fire_context.py
+@@ -0,0 +1,224 @@
++"""Fire-context row assembly: DBCA-060 fire history displayed beside
++trajectory rows.
++
++**Claim boundary (verbatim, repeated at every layer that touches fire
++context).** These are context rows displayed beside trajectories; no
++causal attribution is generated here or anywhere in this project. Fire
++history is context only, never a cause of rehabilitation status, and it
++is never a compliance or performance finding. The F6 trajectory join
++(out of scope here) is the only place this project ever puts a
++trajectory and a fire row side by side for a reader to draw an
++inference from -- and even there it states explicitly that it has not
++determined one. This module never joins fire history to trajectory rows
++and never says why a trajectory moved.
++
++**`not_recorded` is a statement about the record, never the ground**
++(limitation L18). DBCA-060's own scope is fires on DBCA-managed land or
++where DBCA incurred costs; spatial completeness is not modelled, so the
++absence of a fire record for a site-year says nothing about whether a
++fire actually occurred there. `not_recorded` is NEVER a known-negative
++fire label.
++
++**Pure, and why that split exists.** Every read (the DBCA-060
++GeoPackage, the crosswalk, the site register, the Maus footprint
++snapshot) and every refusal that follows from a read belongs to the CLI
++command that will call this module (Task 7). This module receives
++already-computed inputs -- per-(maus_id, year) fire counts, no-footprint
++reasons -- as plain mappings and turns them into schema-conformant rows.
++That split makes `assemble_rows` testable with dicts and no filesystem.
++
++**Row-count invariant.** `assemble_rows` returns exactly one row per
++`(site_id, year)` pair for every entry in `site_maus_pairs` crossed with
++every year in `years` -- unconditionally, whether or not that site-year
++is computable. A row is the caller's record that fire context was
++CONSIDERED for that site-year, not that it succeeded; dropping rows
++would make "no row" ambiguous between "not evaluated" and "evaluated,
++unknown" and silently shrink every downstream frame that joins on
++`(site_id, year)`.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Mapping, Sequence
++
++import pandas as pd
++import pyarrow as pa
++
++from wa_mine_monitor.sources import dbca
++
++FIRE_CONTEXT_SCHEMA = pa.schema(
++    [
++        pa.field("site_id", pa.string(), nullable=False),
++        pa.field("maus_id", pa.string(), nullable=False),
++        pa.field("year", pa.int32(), nullable=False),
++        pa.field("fire_status", pa.string(), nullable=False),
++        pa.field("fire_record_count", pa.int32(), nullable=True),
++        pa.field("fire_source_version", pa.string(), nullable=False),
++        pa.field("fire_coverage_status", pa.string(), nullable=False),
++        pa.field("fire_snapshot_date", pa.string(), nullable=False),
++        pa.field("not_computable_reason", pa.string(), nullable=True),
++    ]
++)
++
++#: The only three permitted `fire_status` values.
++FIRE_STATUS_RECORDED = "recorded"
++FIRE_STATUS_NOT_RECORDED = "not_recorded"
++FIRE_STATUS_UNKNOWN = "unknown"
++
++#: The only three permitted `fire_coverage_status` values.
++COVERAGE_COVERED = "covered"
++COVERAGE_OUTSIDE_WINDOW = "outside_window"
++COVERAGE_NO_FOOTPRINT = "no_footprint"
++
++
++class FireContextError(ValueError):
++    """Fire-context assembly refused a structurally invalid input."""
++
++
++def coverage_window(snapshot_year: int) -> tuple[int, int]:
++    """Frozen DBCA-060 coverage window `[1937, snapshot_year - 1]`
++    (decision 2026-08-29). Separate from and narrower than `dbca.YEAR_MIN`,
++    which is only a validation-time sanity bound.
++    """
++    return (dbca.COVERAGE_START_YEAR, snapshot_year - 1)
++
++
++def assemble_rows(
++    *,
++    site_maus_pairs: Sequence[tuple[str, str]],
++    counts_by_maus_year: Mapping[tuple[str, int], int],
++    no_footprint_by_maus: Mapping[str, str],
++    years: Sequence[int],
++    snapshot_year: int,
++    snapshot_date: str,
++    source_version: str,
++) -> pd.DataFrame:
++    """Assemble `FIRE_CONTEXT_SCHEMA`-conformant rows, one per
++    `(site_id, year)` for every pair in `site_maus_pairs` crossed with
++    every year in `years`.
++
++    Per site-year, in this exact precedence order:
++
++    1. `maus_id in no_footprint_by_maus` -- `unknown`, `no_footprint`
++       coverage, `not_computable_reason` = that entry, `fire_record_count`
++       null, for EVERY year of that site.
++    2. `counts_by_maus_year.get((maus_id, year), 0) > 0` -- `recorded`;
++       `covered` if the year is inside `coverage_window(snapshot_year)`,
++       else `outside_window` (a record outside the window is still a
++       record); `fire_record_count` = the count; reason null.
++    3. count == 0 and the year is inside the window -- `not_recorded`,
++       `covered`, `fire_record_count` = 0, reason null.
++    4. count == 0 and the year is outside the window -- `unknown`,
++       `outside_window`, count null, `not_computable_reason` states the
++       window was not covered.
++
++    Raises `FireContextError` on empty `years`, empty `site_maus_pairs`,
++    or a negative count in `counts_by_maus_year`.
++
++    A `maus_id` missing from `no_footprint_by_maus` but also missing from
++    the caller's Maus/crosswalk data is NOT this function's concern -- an
++    un-crosswalked eligible site or a `maus_id` absent from the Maus
++    snapshot is a CLI-level integrity refusal (climate-context
++    precedent), never encoded here; `maus_id` stays non-nullable.
++    """
++    if not years:
++        raise FireContextError("years is empty -- assemble_rows requires at least one year")
++    if not site_maus_pairs:
++        raise FireContextError(
++            "site_maus_pairs is empty -- assemble_rows requires at least one (site_id, maus_id) pair"
++        )
++    for key, count in counts_by_maus_year.items():
++        if count < 0:
++            raise FireContextError(
++                f"counts_by_maus_year[{key!r}] = {count} -- fire record counts cannot be negative"
++            )
++
++    window_lo, window_hi = coverage_window(snapshot_year)
++    outside_window_reason = f"year outside the declared coverage window [{window_lo}, {window_hi}]"
++
++    rows: list[dict[str, object]] = []
++    for site_id, maus_id in site_maus_pairs:
++        no_footprint_reason = no_footprint_by_maus.get(maus_id)
++        for year in years:
++            base_row = {
++                "site_id": site_id,
++                "maus_id": maus_id,
++                "year": year,
++                "fire_source_version": source_version,
++                "fire_snapshot_date": snapshot_date,
++            }
++
++            if no_footprint_reason is not None:
++                rows.append(
++                    {
++                        **base_row,
++                        "fire_status": FIRE_STATUS_UNKNOWN,
++                        "fire_record_count": None,
++                        "fire_coverage_status": COVERAGE_NO_FOOTPRINT,
++                        "not_computable_reason": no_footprint_reason,
++                    }
++                )
++                continue
++
++            count = counts_by_maus_year.get((maus_id, year), 0)
++            in_window = window_lo <= year <= window_hi
++
++            if count > 0:
++                rows.append(
++                    {
++                        **base_row,
++                        "fire_status": FIRE_STATUS_RECORDED,
++                        "fire_record_count": count,
++                        "fire_coverage_status": COVERAGE_COVERED
++                        if in_window
++                        else COVERAGE_OUTSIDE_WINDOW,
++                        "not_computable_reason": None,
++                    }
++                )
++                continue
++
++            if in_window:
++                rows.append(
++                    {
++                        **base_row,
++                        "fire_status": FIRE_STATUS_NOT_RECORDED,
++                        "fire_record_count": 0,
++                        "fire_coverage_status": COVERAGE_COVERED,
++                        "not_computable_reason": None,
++                    }
++                )
++            else:
++                rows.append(
++                    {
++                        **base_row,
++                        "fire_status": FIRE_STATUS_UNKNOWN,
++                        "fire_record_count": None,
++                        "fire_coverage_status": COVERAGE_OUTSIDE_WINDOW,
++                        "not_computable_reason": outside_window_reason,
++                    }
++                )
++
++    frame = pd.DataFrame(rows, columns=list(FIRE_CONTEXT_SCHEMA.names))
++    frame["year"] = frame["year"].astype("int32")
++    frame["fire_record_count"] = frame["fire_record_count"].astype("Int32")
++    return frame
++
++
++def validate_row_counts(frame: pd.DataFrame, *, n_pairs: int, n_years: int) -> None:
++    """Raise `FireContextError` unless `frame` has exactly `n_pairs *
++    n_years` rows and its `fire_status` value counts sum to that same
++    row count (the D13 F4 reconciliation acceptance: recorded +
++    not_recorded + unknown == rows == selected sites x requested years).
++    """
++    expected = n_pairs * n_years
++    actual = len(frame)
++    if actual != expected:
++        raise FireContextError(
++            f"fire-context frame has {actual} rows, expected {n_pairs} pairs x {n_years} years = {expected}"
++        )
++
++    status_sum = int(frame["fire_status"].value_counts().sum())
++    if status_sum != actual:
++        raise FireContextError(
++            f"fire_status value counts sum to {status_sum}, expected {actual} -- reconciliation failed"
++        )
+diff --git a/src/wa_mine_monitor/licence.py b/src/wa_mine_monitor/licence.py
+index 5fbf55e..28bd301 100644
+--- a/src/wa_mine_monitor/licence.py
++++ b/src/wa_mine_monitor/licence.py
+@@ -262,8 +262,8 @@ SOURCES: dict[str, SourceLicence] = {
+         source_id="dbca_060_fire",
+         title="DBCA-060 Fire History",
+         source_url="https://catalogue.data.wa.gov.au/dataset/fire-history-dbca-060",
+-        licence_id="open",
+-        licence_url="",
++        licence_id="CC-BY-4.0",
++        licence_url="https://creativecommons.org/licenses/by/4.0/",
+         attribution_text=(
+             "Contains fire history data from the Department of Biodiversity, "
+             "Conservation and Attractions (DBCA), Fire History (DBCA-060)."
+@@ -277,7 +277,11 @@ SOURCES: dict[str, SourceLicence] = {
+             "establishes absence of fire, per CLAUDE.md's absence-of-a-record "
+             "rule. Every site-year this project derives from DBCA-060 carries "
+             "`fire_status in {recorded, not_recorded, unknown}`, never a bare "
+-            "boolean."
++            "boolean. Licence corrected from the provisional 'open' "
++            "2026-08-29: CKAN dataset 3ce8a891-b050-4c38-952b-c40ca8bdc042 "
++            "records license_id cc-by (jarrah-verified 2026-07-20); the "
++            "staged snapshot carries a digested capture of the catalogue "
++            "page (see decisions/2026-08-29-dbca-mirror-declined.md)."
+         ),
+     ),
+     "silo": SourceLicence(
+diff --git a/src/wa_mine_monitor/sources/dbca.py b/src/wa_mine_monitor/sources/dbca.py
+new file mode 100644
+index 0000000..3d01247
+--- /dev/null
++++ b/src/wa_mine_monitor/sources/dbca.py
+@@ -0,0 +1,155 @@
++"""DBCA-060 fire history: constants, validation, and attribute scan.
++
++Claim boundary (see AGENTS.md and
++`docs/decisions/2026-08-29-dbca-mirror-declined.md`): fire history is
++context only, never a cause of rehabilitation status, and it is never a
++compliance or performance finding. `not_recorded` is a statement about
++the record -- DBCA-060's own scope is fires on DBCA-managed land or
++where DBCA incurred costs, so spatial completeness is not modelled --
++and it is NEVER treated as a known-negative fire label (limitation
++L18, `docs/amendments-and-limitations.md`).
++
++This module covers only the pieces the F3 acquisition step needs before
++it stages the GeoPackage: the layer/field/vocabulary constants, and a
++validation pass that scans attributes only (never geometry -- the real
++GDA94 file is 2.1 GB) before the file is trusted downstream.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from pathlib import Path
++
++import geopandas as gpd
++import pyogrio
++from shapely.geometry.base import BaseGeometry
++
++LAYER_NAME = "DBCA_Fire_History_DBCA_060"
++SOURCE_CRS = "EPSG:4283"
++FIRE_TYPES = frozenset({"WF", "PB", "999"})
++REQUIRED_FIELDS = ("fih_master_key", "fih_fire_type", "fih_year1")
++
++#: Hard sanity bounds on `fih_year1` -- validation-time only. The frozen
++#: F4 coverage window [COVERAGE_START_YEAR, snapshot_year - 1] is a
++#: SEPARATE, narrower concept (decision record 2026-08-29).
++YEAR_MIN = 1900
++COVERAGE_START_YEAR = 1937
++
++
++class DbcaError(ValueError):
++    """DBCA-060 validation or read refused."""
++
++
++@dataclass(frozen=True)
++class FireHistorySummary:
++    """Attribute-scan result for one validated DBCA-060 GeoPackage."""
++
++    feature_count: int
++    counts_by_type: dict[str, int]
++    year_min: int
++    year_max: int
++    crs: str
++
++
++def _normalised_code(value: object) -> str:
++    """Normalise a raw `fih_fire_type` value for the vocabulary check.
++
++    The real GDA94 file carries one raw lowercase `wf`; a null value
++    normalises to the empty string, which also fails the vocabulary
++    check rather than being silently accepted.
++    """
++    return "" if value is None else str(value).strip().upper()
++
++
++def validate_fire_history_file(path: Path, *, snapshot_year: int) -> FireHistorySummary:
++    """Validate a staged DBCA-060 GeoPackage and scan its attributes.
++
++    Refuses (`DbcaError`) on: the fire-history layer being absent; the
++    layer's CRS not being EPSG:4283; any required field missing; zero
++    features; any normalised `fih_fire_type` outside `FIRE_TYPES`; or
++    any `fih_year1` null, below `YEAR_MIN`, or above `snapshot_year`.
++    Never loads geometry -- the real file is 2.1 GB.
++    """
++    layers = [name for name, *_ in pyogrio.list_layers(path)]
++    if LAYER_NAME not in layers:
++        raise DbcaError(f"layer {LAYER_NAME!r} not found in {path}; layers present: {layers}")
++
++    info = pyogrio.read_info(path, layer=LAYER_NAME)
++    crs = info["crs"]
++    if crs != SOURCE_CRS:
++        raise DbcaError(f"expected CRS {SOURCE_CRS}, got {crs!r} for {path}")
++
++    fields = set(info["fields"])
++    missing = [f for f in REQUIRED_FIELDS if f not in fields]
++    if missing:
++        raise DbcaError(f"required field(s) missing from {LAYER_NAME}: {missing}")
++
++    feature_count = int(info["features"])
++    if feature_count == 0:
++        raise DbcaError(f"{LAYER_NAME} in {path} has 0 features")
++
++    attrs = pyogrio.read_dataframe(
++        path,
++        layer=LAYER_NAME,
++        read_geometry=False,
++        columns=["fih_fire_type", "fih_year1"],
++    )
++
++    normalised = attrs["fih_fire_type"].map(_normalised_code)
++    unexpected = sorted(set(normalised) - FIRE_TYPES)
++    if unexpected:
++        raise DbcaError(f"unexpected fih_fire_type code(s) in {path}: {unexpected}")
++
++    years = attrs["fih_year1"]
++    if years.isna().any():
++        raise DbcaError(f"fih_year1 has null value(s) in {path}")
++
++    year_min = int(years.min())
++    year_max = int(years.max())
++    if year_min < YEAR_MIN:
++        raise DbcaError(f"fih_year1 {year_min} is below the minimum {YEAR_MIN}")
++    if year_max > snapshot_year:
++        raise DbcaError(f"fih_year1 {year_max} is after the snapshot year {snapshot_year}")
++
++    counts_by_type = {code: int(count) for code, count in normalised.value_counts().items()}
++    counts_by_type = dict(sorted(counts_by_type.items()))
++
++    return FireHistorySummary(
++        feature_count=feature_count,
++        counts_by_type=counts_by_type,
++        year_min=year_min,
++        year_max=year_max,
++        crs=crs,
++    )
++
++
++def fire_year_counts_for_footprint(
++    gpkg_path: Path,
++    footprint_4283: BaseGeometry,
++) -> dict[int, int]:
++    """Count intersecting fire polygons per `fih_year1` for one footprint.
++
++    Reads ONLY the footprint's bbox window from the GeoPackage
++    (`pyogrio` bbox pushdown onto the layer's r-tree) -- the statewide
++    file is 2.1 GB and must never be loaded whole. bbox prefilter, then
++    an exact `.intersects` test (touching-only bboxes are not
++    intersections). All fire types count (WF, PB and 999 are all
++    recorded fires).
++    """
++    frame = gpd.read_file(
++        gpkg_path,
++        layer=LAYER_NAME,
++        bbox=tuple(footprint_4283.bounds),
++        columns=["fih_year1"],
++        engine="pyogrio",
++    )
++    if frame.empty:
++        return {}
++
++    intersecting = frame[frame.geometry.intersects(footprint_4283)]
++    if intersecting.empty:
++        return {}
++
++    return {
++        int(year): int(count) for year, count in intersecting["fih_year1"].value_counts().items()
++    }
+diff --git a/tests/sources/test_dbca.py b/tests/sources/test_dbca.py
+new file mode 100644
+index 0000000..281ed64
+--- /dev/null
++++ b/tests/sources/test_dbca.py
+@@ -0,0 +1,511 @@
++"""Tests for `sources/dbca.py`: DBCA-060 fire history validation.
++
++Every GeoPackage input is a tiny synthetic fixture written with
++geopandas in the test itself. Nothing here touches the network or the
++real 2.1 GB GeoPackage.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import zipfile
++from pathlib import Path
++
++import geopandas as gpd
++import pandas as pd
++import pytest
++from shapely.geometry import Polygon
++from typer.testing import CliRunner
++
++from wa_mine_monitor import cli as cli_module
++from wa_mine_monitor import snapshots
++from wa_mine_monitor.cli import app
++from wa_mine_monitor.sources import dbca
++
++LAYER = dbca.LAYER_NAME
++runner = CliRunner()
++
++
++def _square(x: float, y: float, side: float = 0.01) -> Polygon:
++    return Polygon([(x, y), (x + side, y), (x + side, y + side), (x, y + side)])
++
++
++def write_fire_gpkg(
++    path: Path,
++    rows: list[dict],
++    *,
++    layer: str = LAYER,
++    crs: str = "EPSG:4283",
++) -> Path:
++    frame = gpd.GeoDataFrame(
++        {
++            "fih_master_key": [r.get("key", f"K{i}") for i, r in enumerate(rows)],
++            "fih_fire_type": [r.get("fire_type", "WF") for r in rows],
++            "fih_year1": pd.array([r.get("year", 2000) for r in rows], dtype="int64"),
++            "geometry": [r.get("geom", _square(116.0, -32.0)) for r in rows],
++        },
++        crs=crs,
++    )
++    frame.to_file(path, driver="GPKG", layer=layer)
++    return path
++
++
++def test_validate_accepts_a_conformant_file_and_reports_counts(tmp_path: Path) -> None:
++    path = write_fire_gpkg(
++        tmp_path / "fire.gpkg",
++        [
++            {"fire_type": "WF", "year": 1990},
++            {"fire_type": "PB", "year": 1990},
++            {"fire_type": "999", "year": 2001},
++        ],
++    )
++    summary = dbca.validate_fire_history_file(path, snapshot_year=2026)
++    assert summary.feature_count == 3
++    assert summary.counts_by_type == {"999": 1, "PB": 1, "WF": 1}
++    assert summary.year_min == 1990
++    assert summary.year_max == 2001
++    assert summary.crs == "EPSG:4283"
++
++
++def test_validate_refuses_missing_layer(tmp_path: Path) -> None:
++    path = write_fire_gpkg(tmp_path / "fire.gpkg", [{}], layer="WRONG_LAYER")
++    with pytest.raises(dbca.DbcaError, match="layer"):
++        dbca.validate_fire_history_file(path, snapshot_year=2026)
++
++
++def test_validate_refuses_wrong_crs(tmp_path: Path) -> None:
++    path = write_fire_gpkg(tmp_path / "fire.gpkg", [{}], crs="EPSG:4326")
++    with pytest.raises(dbca.DbcaError, match="4283"):
++        dbca.validate_fire_history_file(path, snapshot_year=2026)
++
++
++def test_validate_tripwires_on_an_unexpected_fire_type_code(tmp_path: Path) -> None:
++    path = write_fire_gpkg(tmp_path / "fire.gpkg", [{"fire_type": "MR"}])
++    with pytest.raises(dbca.DbcaError, match="MR"):
++        dbca.validate_fire_history_file(path, snapshot_year=2026)
++
++
++def test_validate_normalises_case_and_whitespace_variants(tmp_path: Path) -> None:
++    # The real GDA94 file carries one raw lowercase `wf` (jarrah census).
++    path = write_fire_gpkg(tmp_path / "fire.gpkg", [{"fire_type": " wf "}])
++    summary = dbca.validate_fire_history_file(path, snapshot_year=2026)
++    assert summary.counts_by_type == {"WF": 1}
++
++
++def test_validate_refuses_a_year_outside_bounds(tmp_path: Path) -> None:
++    path = write_fire_gpkg(tmp_path / "fire.gpkg", [{"year": 1850}])
++    with pytest.raises(dbca.DbcaError, match="1850"):
++        dbca.validate_fire_history_file(path, snapshot_year=2026)
++
++
++def test_validate_refuses_a_null_year(tmp_path: Path) -> None:
++    path = tmp_path / "fire.gpkg"
++    frame = gpd.GeoDataFrame(
++        {
++            "fih_master_key": ["K0"],
++            "fih_fire_type": ["WF"],
++            "fih_year1": pd.array([None], dtype="float64"),
++            "geometry": [_square(116.0, -32.0)],
++        },
++        crs="EPSG:4283",
++    )
++    frame.to_file(path, driver="GPKG", layer=LAYER)
++    with pytest.raises(dbca.DbcaError, match="null"):
++        dbca.validate_fire_history_file(path, snapshot_year=2026)
++
++
++def test_validate_refuses_a_year_after_the_snapshot(tmp_path: Path) -> None:
++    path = write_fire_gpkg(tmp_path / "fire.gpkg", [{"year": 2027}])
++    with pytest.raises(dbca.DbcaError, match="2027"):
++        dbca.validate_fire_history_file(path, snapshot_year=2026)
++
++
++def test_validate_refuses_an_empty_layer(tmp_path: Path) -> None:
++    path = write_fire_gpkg(tmp_path / "fire.gpkg", [])
++    with pytest.raises(dbca.DbcaError, match="0 features"):
++        dbca.validate_fire_history_file(path, snapshot_year=2026)
++
++
++def test_validate_refuses_a_missing_required_field(tmp_path: Path) -> None:
++    path = tmp_path / "fire.gpkg"
++    frame = gpd.GeoDataFrame(
++        {
++            "fih_master_key": ["K0"],
++            "fih_fire_type": ["WF"],
++            "geometry": [_square(116.0, -32.0)],
++        },
++        crs="EPSG:4283",
++    )
++    frame.to_file(path, driver="GPKG", layer=LAYER)
++    with pytest.raises(dbca.DbcaError, match="fih_year1"):
++        dbca.validate_fire_history_file(path, snapshot_year=2026)
++
++
++# ---------------------------------------------------------------------------
++# CLI: `fetch-dbca-fire`
++# ---------------------------------------------------------------------------
++
++
++def _write_config(tmp_path: Path, data_root: Path) -> Path:
++    cfg_file = tmp_path / "c.yaml"
++    cfg_file.write_text(
++        f'run:\n  data_root: "{data_root}"\n  redistribute_public: false\n'
++        "sources:\n  minedex_public_export_blocked: true\n"
++    )
++    return cfg_file
++
++
++def _stub_git_state(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setattr(
++        cli_module,
++        "collect_git_state",
++        lambda repo_root: {"sha": "testsha", "dirty": False, "diff": ""},
++    )
++
++
++def _sha256_bytes(data: bytes) -> str:
++    return hashlib.sha256(data).hexdigest()
++
++
++def _seed_source_dir(
++    tmp_path: Path,
++    *,
++    fire_rows: list[dict] | None = None,
++    write_sums: bool = True,
++    bad_digest: bool = False,
++) -> Path:
++    """A minimal authoritative DBCA-060 package directory: one fixture
++    GeoPackage, a small `extras.zip`, `metadata.txt`, and (unless
++    disabled) a `SHA256SUMS.txt` covering the zip's real digest."""
++    source_dir = tmp_path / "source-package"
++    source_dir.mkdir()
++    write_fire_gpkg(
++        source_dir / "fire.gpkg",
++        fire_rows if fire_rows is not None else [{"fire_type": "WF", "year": 1990}],
++    )
++    extras_zip = source_dir / "extras.zip"
++    with zipfile.ZipFile(extras_zip, "w") as zf:
++        zf.writestr("readme.txt", "extra material")
++    (source_dir / "metadata.txt").write_text("source metadata\n")
++    if write_sums:
++        digest = "0" * 64 if bad_digest else _sha256_bytes(extras_zip.read_bytes())
++        (source_dir / "SHA256SUMS.txt").write_text(f"{digest}  extras.zip\n")
++    return source_dir
++
++
++def test_fetch_dbca_fire_refuses_mirror_mode_before_any_io(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    data_root = tmp_path / "data"
++    cfg_file = _write_config(tmp_path, data_root)
++    _stub_git_state(monkeypatch)
++    source_dir = _seed_source_dir(tmp_path)
++
++    result = runner.invoke(
++        app,
++        [
++            "fetch-dbca-fire",
++            "--config",
++            str(cfg_file),
++            "--date",
++            "2026-08-29",
++            "--mode",
++            "mirror",
++            "--source-dir",
++            str(source_dir),
++        ],
++    )
++    assert result.exit_code == 1
++    payload = json.loads(result.output)
++    assert "mirror route is declined" in payload["refusal"]
++    assert not data_root.exists()
++
++
++def test_fetch_dbca_fire_stages_validates_and_finalizes(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    data_root = tmp_path / "data"
++    cfg_file = _write_config(tmp_path, data_root)
++    _stub_git_state(monkeypatch)
++    source_dir = _seed_source_dir(
++        tmp_path,
++        fire_rows=[
++            {"fire_type": "WF", "year": 1990},
++            {"fire_type": "PB", "year": 2001},
++        ],
++    )
++    monkeypatch.setattr(cli_module, "_fetch_catalogue_page", lambda url: b"<html>CC BY 4.0</html>")
++
++    result = runner.invoke(
++        app,
++        [
++            "fetch-dbca-fire",
++            "--config",
++            str(cfg_file),
++            "--date",
++            "2026-08-29",
++            "--mode",
++            "authoritative",
++            "--source-dir",
++            str(source_dir),
++        ],
++    )
++    assert result.exit_code == 0, result.output
++    payload = json.loads(result.output)
++    assert payload["feature_count"] == 2
++    assert payload["counts_by_type"] == {"PB": 1, "WF": 1}
++
++    snapshot_dir = data_root / "raw" / "dbca_060_fire" / "2026-08-29"
++    assert (snapshot_dir / "fire.gpkg").is_file()
++    assert (snapshot_dir / "catalogue-page.html").is_file()
++    assert (snapshot_dir / "metadata.txt").is_file()
++    assert (snapshot_dir / "SHA256SUMS.txt").is_file()
++    assert (snapshot_dir / "source-SHA256SUMS.txt").is_file()
++    assert (snapshot_dir / "source-metadata.txt").is_file()
++
++    _n_ok, n_bad, n_missing = snapshots.verify_snapshot(snapshot_dir)
++    assert (n_bad, n_missing) == (0, 0)
++
++    manifest = json.loads((snapshot_dir / "SHA256SUMS.txt.run_manifest.json").read_text())
++    assert len(manifest["inputs"]) == 2
++    assert manifest["resolved_args"]["counts_by_type"] == {"PB": 1, "WF": 1}
++
++
++def test_fetch_dbca_fire_refuses_source_dir_without_sums(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    data_root = tmp_path / "data"
++    cfg_file = _write_config(tmp_path, data_root)
++    _stub_git_state(monkeypatch)
++    source_dir = _seed_source_dir(tmp_path, write_sums=False)
++
++    result = runner.invoke(
++        app,
++        [
++            "fetch-dbca-fire",
++            "--config",
++            str(cfg_file),
++            "--date",
++            "2026-08-29",
++            "--source-dir",
++            str(source_dir),
++        ],
++    )
++    assert result.exit_code == 1
++    payload = json.loads(result.output)
++    assert payload["stage"] == "source_package"
++    assert not data_root.exists()
++
++
++def test_fetch_dbca_fire_refuses_source_digest_mismatch(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    data_root = tmp_path / "data"
++    cfg_file = _write_config(tmp_path, data_root)
++    _stub_git_state(monkeypatch)
++    source_dir = _seed_source_dir(tmp_path, bad_digest=True)
++
++    result = runner.invoke(
++        app,
++        [
++            "fetch-dbca-fire",
++            "--config",
++            str(cfg_file),
++            "--date",
++            "2026-08-29",
++            "--source-dir",
++            str(source_dir),
++        ],
++    )
++    assert result.exit_code == 1
++    payload = json.loads(result.output)
++    assert payload["stage"] == "source_digests"
++    assert not data_root.exists()
++
++
++def test_fetch_dbca_fire_refuses_invalid_gpkg_before_finalize(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    data_root = tmp_path / "data"
++    cfg_file = _write_config(tmp_path, data_root)
++    _stub_git_state(monkeypatch)
++    source_dir = _seed_source_dir(tmp_path, fire_rows=[{"fire_type": "MR"}])
++
++    result = runner.invoke(
++        app,
++        [
++            "fetch-dbca-fire",
++            "--config",
++            str(cfg_file),
++            "--date",
++            "2026-08-29",
++            "--source-dir",
++            str(source_dir),
++        ],
++    )
++    assert result.exit_code == 1
++    payload = json.loads(result.output)
++    assert payload["stage"] == "validation"
++
++    snapshot_dir = data_root / "raw" / "dbca_060_fire" / "2026-08-29"
++    assert not (snapshot_dir / "SHA256SUMS.txt").exists()
++
++
++def test_fetch_dbca_fire_refuses_when_evidence_fetch_fails(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    data_root = tmp_path / "data"
++    cfg_file = _write_config(tmp_path, data_root)
++    _stub_git_state(monkeypatch)
++    source_dir = _seed_source_dir(tmp_path)
++
++    def _boom(url: str) -> bytes:
++        raise RuntimeError("network refused")
++
++    monkeypatch.setattr(cli_module, "_fetch_catalogue_page", _boom)
++
++    result = runner.invoke(
++        app,
++        [
++            "fetch-dbca-fire",
++            "--config",
++            str(cfg_file),
++            "--date",
++            "2026-08-29",
++            "--source-dir",
++            str(source_dir),
++        ],
++    )
++    assert result.exit_code == 1
++    payload = json.loads(result.output)
++    assert payload["stage"] == "licence_evidence"
++
++    snapshot_dir = data_root / "raw" / "dbca_060_fire" / "2026-08-29"
++    assert not (snapshot_dir / "SHA256SUMS.txt").exists()
++
++
++def test_fetch_dbca_fire_refuses_a_finalized_snapshot(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    data_root = tmp_path / "data"
++    cfg_file = _write_config(tmp_path, data_root)
++    _stub_git_state(monkeypatch)
++    source_dir = _seed_source_dir(tmp_path)
++    monkeypatch.setattr(cli_module, "_fetch_catalogue_page", lambda url: b"<html>CC BY 4.0</html>")
++
++    cli_args = [
++        "fetch-dbca-fire",
++        "--config",
++        str(cfg_file),
++        "--date",
++        "2026-08-29",
++        "--source-dir",
++        str(source_dir),
++    ]
++    first = runner.invoke(app, cli_args)
++    assert first.exit_code == 0, first.output
++
++    second = runner.invoke(app, cli_args)
++    assert second.exit_code == 1
++    payload = json.loads(second.output)
++    snapshot_dir = data_root / "raw" / "dbca_060_fire" / "2026-08-29"
++    assert str(snapshot_dir) in payload["refusal"]
++
++
++# ---------------------------------------------------------------------------
++# `fire_year_counts_for_footprint`
++# ---------------------------------------------------------------------------
++
++
++def test_fire_year_counts_counts_intersections_per_year(tmp_path: Path) -> None:
++    footprint = _square(116.0, -32.0, side=0.02)
++    path = write_fire_gpkg(
++        tmp_path / "fire.gpkg",
++        [
++            {"fire_type": "WF", "year": 1990, "geom": _square(116.0, -32.0)},
++            {"fire_type": "PB", "year": 1990, "geom": _square(116.005, -32.005)},
++            {"fire_type": "999", "year": 2001, "geom": _square(116.001, -32.001)},
++            {"fire_type": "WF", "year": 2015, "geom": _square(120.0, -35.0)},
++        ],
++    )
++    counts = dbca.fire_year_counts_for_footprint(path, footprint)
++    assert counts == {1990: 2, 2001: 1}
++
++
++def test_fire_year_counts_excludes_bbox_overlap_without_intersection(tmp_path: Path) -> None:
++    # Footprint is a small square at (116.0, -32.0). This fire polygon's
++    # bbox overlaps the footprint's bbox, but the polygon itself (an
++    # L-shape carved away from the footprint's corner) does not
++    # intersect the footprint geometry.
++    footprint = _square(116.0, -32.0, side=0.01)
++    from shapely.geometry import Polygon as _Polygon
++
++    non_intersecting = _Polygon(
++        [
++            (116.01, -32.01),
++            (116.02, -32.01),
++            (116.02, -32.0),
++            (116.015, -32.0),
++            (116.015, -32.005),
++            (116.01, -32.005),
++        ]
++    )
++    path = write_fire_gpkg(
++        tmp_path / "fire.gpkg",
++        [{"fire_type": "WF", "year": 1990, "geom": non_intersecting}],
++    )
++    counts = dbca.fire_year_counts_for_footprint(path, footprint)
++    assert counts == {}
++
++
++def test_fire_year_counts_returns_empty_for_no_intersections(tmp_path: Path) -> None:
++    footprint = _square(116.0, -32.0)
++    path = write_fire_gpkg(
++        tmp_path / "fire.gpkg",
++        [{"fire_type": "WF", "year": 1990, "geom": _square(120.0, -35.0)}],
++    )
++    counts = dbca.fire_year_counts_for_footprint(path, footprint)
++    assert counts == {}
++
++
++def test_fire_year_counts_counts_all_fire_types(tmp_path: Path) -> None:
++    footprint = _square(116.0, -32.0)
++    path = write_fire_gpkg(
++        tmp_path / "fire.gpkg",
++        [
++            {"fire_type": "WF", "year": 1990, "geom": _square(116.0, -32.0)},
++            {"fire_type": "PB", "year": 1991, "geom": _square(116.0, -32.0)},
++            {"fire_type": "999", "year": 1992, "geom": _square(116.0, -32.0)},
++        ],
++    )
++    counts = dbca.fire_year_counts_for_footprint(path, footprint)
++    assert counts == {1990: 1, 1991: 1, 1992: 1}
++
++
++def test_fetch_dbca_fire_refuses_stray_files_before_staging(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    data_root = tmp_path / "data"
++    cfg_file = _write_config(tmp_path, data_root)
++    _stub_git_state(monkeypatch)
++    source_dir = _seed_source_dir(tmp_path)
++
++    snapshot_dir = snapshots.create_snapshot_dir(data_root, "dbca_060_fire", "2026-08-29")
++    (snapshot_dir / "stray.part").write_text("junk")
++
++    result = runner.invoke(
++        app,
++        [
++            "fetch-dbca-fire",
++            "--config",
++            str(cfg_file),
++            "--date",
++            "2026-08-29",
++            "--source-dir",
++            str(source_dir),
++        ],
++    )
++    assert result.exit_code == 1
++    payload = json.loads(result.output)
++    assert "before staging" in payload["refusal"]
+diff --git a/tests/test_fire_context.py b/tests/test_fire_context.py
+new file mode 100644
+index 0000000..8f646bf
+--- /dev/null
++++ b/tests/test_fire_context.py
+@@ -0,0 +1,671 @@
++"""Tests for `wa_mine_monitor.fire_context` -- pure row assembly -- and for
++the `build-fire-context` CLI command that reads real DBCA-060/register/
++crosswalk/Maus inputs and calls it.
++"""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import geopandas as gpd
++import pandas as pd
++import pyarrow as pa
++import pytest
++from shapely.geometry import Polygon
++from typer.testing import CliRunner
++
++from tests.sources.test_dbca import write_fire_gpkg
++from wa_mine_monitor import cli as cli_module
++from wa_mine_monitor import crosswalk, fire_context, licence, manifests, register, snapshots
++from wa_mine_monitor.cli import app
++from wa_mine_monitor.provenance import SourceAsset, sha256_file
++from wa_mine_monitor.tables import write_table
++
++
++def test_coverage_window_is_frozen_at_1937_to_snapshot_minus_one() -> None:
++    assert fire_context.coverage_window(2026) == (1937, 2025)
++
++
++def test_one_row_per_site_year_pair_always() -> None:
++    df = fire_context.assemble_rows(
++        site_maus_pairs=[("S1", "M1"), ("S2", "M2")],
++        counts_by_maus_year={},
++        no_footprint_by_maus={},
++        years=[2020, 2021, 2022],
++        snapshot_year=2026,
++        snapshot_date="2026-08-26",
++        source_version="v1",
++    )
++    assert len(df) == 6
++    assert set(zip(df["site_id"], df["year"])) == {
++        ("S1", 2020),
++        ("S1", 2021),
++        ("S1", 2022),
++        ("S2", 2020),
++        ("S2", 2021),
++        ("S2", 2022),
++    }
++
++
++def test_rule_1_no_footprint_wins_for_every_year_of_that_site() -> None:
++    df = fire_context.assemble_rows(
++        site_maus_pairs=[("S1", "M1")],
++        counts_by_maus_year={("M1", 2020): 3},
++        no_footprint_by_maus={"M1": "empty geometry"},
++        years=[2020, 2021],
++        snapshot_year=2026,
++        snapshot_date="2026-08-26",
++        source_version="v1",
++    )
++    assert len(df) == 2
++    for _, row in df.iterrows():
++        assert row["fire_status"] == fire_context.FIRE_STATUS_UNKNOWN
++        assert row["fire_coverage_status"] == fire_context.COVERAGE_NO_FOOTPRINT
++        assert row["not_computable_reason"] == "empty geometry"
++        assert pd.isna(row["fire_record_count"])
++
++
++def test_rule_2_recorded_inside_window_is_covered() -> None:
++    df = fire_context.assemble_rows(
++        site_maus_pairs=[("S1", "M1")],
++        counts_by_maus_year={("M1", 2020): 2},
++        no_footprint_by_maus={},
++        years=[2020],
++        snapshot_year=2026,
++        snapshot_date="2026-08-26",
++        source_version="v1",
++    )
++    row = df.iloc[0]
++    assert row["fire_status"] == fire_context.FIRE_STATUS_RECORDED
++    assert row["fire_coverage_status"] == fire_context.COVERAGE_COVERED
++    assert row["fire_record_count"] == 2
++    assert pd.isna(row["not_computable_reason"])
++
++
++def test_rule_2_recorded_outside_window_is_still_recorded() -> None:
++    df = fire_context.assemble_rows(
++        site_maus_pairs=[("S1", "M1")],
++        counts_by_maus_year={("M1", 2030): 1},
++        no_footprint_by_maus={},
++        years=[2030],
++        snapshot_year=2026,
++        snapshot_date="2026-08-26",
++        source_version="v1",
++    )
++    row = df.iloc[0]
++    assert row["fire_status"] == fire_context.FIRE_STATUS_RECORDED
++    assert row["fire_coverage_status"] == fire_context.COVERAGE_OUTSIDE_WINDOW
++    assert row["fire_record_count"] == 1
++    assert pd.isna(row["not_computable_reason"])
++
++
++def test_rule_3_zero_count_inside_window_is_not_recorded() -> None:
++    df = fire_context.assemble_rows(
++        site_maus_pairs=[("S1", "M1")],
++        counts_by_maus_year={},
++        no_footprint_by_maus={},
++        years=[2020],
++        snapshot_year=2026,
++        snapshot_date="2026-08-26",
++        source_version="v1",
++    )
++    row = df.iloc[0]
++    assert row["fire_status"] == fire_context.FIRE_STATUS_NOT_RECORDED
++    assert row["fire_coverage_status"] == fire_context.COVERAGE_COVERED
++    assert row["fire_record_count"] == 0
++    assert pd.isna(row["not_computable_reason"])
++
++
++def test_rule_4_zero_count_outside_window_is_unknown() -> None:
++    df = fire_context.assemble_rows(
++        site_maus_pairs=[("S1", "M1")],
++        counts_by_maus_year={},
++        no_footprint_by_maus={},
++        years=[2030],
++        snapshot_year=2026,
++        snapshot_date="2026-08-26",
++        source_version="v1",
++    )
++    row = df.iloc[0]
++    assert row["fire_status"] == fire_context.FIRE_STATUS_UNKNOWN
++    assert row["fire_coverage_status"] == fire_context.COVERAGE_OUTSIDE_WINDOW
++    assert pd.isna(row["fire_record_count"])
++    assert row["not_computable_reason"] == "year outside the declared coverage window [1937, 2025]"
++
++
++def test_empty_years_raises() -> None:
++    with pytest.raises(fire_context.FireContextError):
++        fire_context.assemble_rows(
++            site_maus_pairs=[("S1", "M1")],
++            counts_by_maus_year={},
++            no_footprint_by_maus={},
++            years=[],
++            snapshot_year=2026,
++            snapshot_date="2026-08-26",
++            source_version="v1",
++        )
++
++
++def test_empty_site_maus_pairs_raises() -> None:
++    with pytest.raises(fire_context.FireContextError):
++        fire_context.assemble_rows(
++            site_maus_pairs=[],
++            counts_by_maus_year={},
++            no_footprint_by_maus={},
++            years=[2020],
++            snapshot_year=2026,
++            snapshot_date="2026-08-26",
++            source_version="v1",
++        )
++
++
++def test_negative_count_raises() -> None:
++    with pytest.raises(fire_context.FireContextError):
++        fire_context.assemble_rows(
++            site_maus_pairs=[("S1", "M1")],
++            counts_by_maus_year={("M1", 2020): -1},
++            no_footprint_by_maus={},
++            years=[2020],
++            snapshot_year=2026,
++            snapshot_date="2026-08-26",
++            source_version="v1",
++        )
++
++
++def test_column_order_matches_schema() -> None:
++    df = fire_context.assemble_rows(
++        site_maus_pairs=[("S1", "M1")],
++        counts_by_maus_year={},
++        no_footprint_by_maus={},
++        years=[2020],
++        snapshot_year=2026,
++        snapshot_date="2026-08-26",
++        source_version="v1",
++    )
++    assert list(df.columns) == list(fire_context.FIRE_CONTEXT_SCHEMA.names)
++
++
++def test_reconciliation_passes_on_assembled_output() -> None:
++    df = fire_context.assemble_rows(
++        site_maus_pairs=[("S1", "M1"), ("S2", "M2")],
++        counts_by_maus_year={("M1", 2020): 2},
++        no_footprint_by_maus={"M2": "no footprint"},
++        years=[2020, 2021],
++        snapshot_year=2026,
++        snapshot_date="2026-08-26",
++        source_version="v1",
++    )
++    fire_context.validate_row_counts(df, n_pairs=2, n_years=2)
++
++
++def test_reconciliation_fails_on_row_dropped_frame() -> None:
++    df = fire_context.assemble_rows(
++        site_maus_pairs=[("S1", "M1"), ("S2", "M2")],
++        counts_by_maus_year={("M1", 2020): 2},
++        no_footprint_by_maus={},
++        years=[2020, 2021],
++        snapshot_year=2026,
++        snapshot_date="2026-08-26",
++        source_version="v1",
++    )
++    mutated = df.iloc[:-1]
++    with pytest.raises(fire_context.FireContextError):
++        fire_context.validate_row_counts(mutated, n_pairs=2, n_years=2)
++
++
++# ---------------------------------------------------------------------------
++# `build-fire-context` CLI
++# ---------------------------------------------------------------------------
++
++runner = CliRunner()
++
++
++def _write_config(tmp_path: Path, data_root: Path) -> Path:
++    cfg_file = tmp_path / "c.yaml"
++    cfg_file.write_text(
++        f'run:\n  data_root: "{data_root}"\n  redistribute_public: false\n'
++        "sources:\n  minedex_public_export_blocked: true\n"
++    )
++    return cfg_file
++
++
++def _stub_git_state(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setattr(
++        cli_module,
++        "collect_git_state",
++        lambda repo_root: {"sha": "testsha", "dirty": False, "diff": ""},
++    )
++
++
++def _footprint_box(lon: float = 116.005, lat: float = -31.995, delta: float = 0.02) -> Polygon:
++    """A footprint box that fully contains `write_fire_gpkg`'s default
++    fixture fire square (`_square(116.0, -32.0, side=0.01)`)."""
++    return Polygon(
++        [
++            (lon - delta, lat - delta),
++            (lon + delta, lat - delta),
++            (lon + delta, lat + delta),
++            (lon - delta, lat + delta),
++        ]
++    )
++
++
++def _eligible_register_row(site_id: str, *, lon: float, lat: float, **overrides: object) -> dict:
++    row: dict[str, object] = {
++        "site_id": site_id,
++        "site_name": f"Site {site_id}",
++        "commodity": "Bauxite",
++        "stage": "Operating",
++        "owners_at_snapshot": "Acme",
++        "snapshot_date": "2026-08-10",
++        "lon": lon,
++        "lat": lat,
++        "n_tenements_intersecting": 0,
++        "inclusion_status": "operating",
++        "n_dea_gm_ls5t_epochs": None,
++        "n_dea_gm_ls7e_epochs": None,
++        "n_dea_gm_ls8cls9c_epochs": None,
++        "n_dea_fc_pc_epochs": None,
++        "effective_pixel_support_px": 200,
++        "d3_threshold_px": 144,
++        "d3_eligible": True,
++        "trajectory_status": "eligible",
++        "d3_forced_threshold": True,
++    }
++    row.update(overrides)
++    return row
++
++
++def _seed_eligible_register(data_root: Path, date_str: str, rows: list[dict]) -> Path:
++    output_dir = data_root / "curated" / "register" / date_str
++    output_dir.mkdir(parents=True)
++    df = pd.DataFrame(rows)[list(register.ELIGIBLE_REGISTER_SCHEMA.names)]
++    path = output_dir / "register.parquet"
++    write_table(df, path, register.ELIGIBLE_REGISTER_SCHEMA)
++    manifests.write_run_manifest(
++        output=path,
++        inputs=[SourceAsset(uri="test://fixture", sha256=None)],
++        config={"run": {"data_root": str(data_root)}},
++        git_state={"sha": "testsha", "dirty": False, "diff": ""},
++    )
++    return output_dir
++
++
++def _crosswalk_row(site_id: str, maus_id: str, *, confidence: str = "high") -> dict:
++    return {
++        "site_id": site_id,
++        "maus_id": maus_id,
++        "match_method": crosswalk.MATCH_POINT_IN_POLYGON,
++        "distance_m": 0.0,
++        "confidence": confidence,
++        "ambiguity_n": 1,
++        "shared_by_n": 1,
++        "manual_review_status": "unreviewed",
++    }
++
++
++def _seed_crosswalk(data_root: Path, date_str: str, rows: list[dict], *, maus_sha256: str) -> Path:
++    output_dir = data_root / "curated" / "crosswalk" / date_str
++    output_dir.mkdir(parents=True)
++    df = pd.DataFrame(rows)[list(crosswalk.CROSSWALK_SCHEMA.names)]
++    path = output_dir / "crosswalk.parquet"
++    write_table(df, path, crosswalk.CROSSWALK_SCHEMA)
++    manifests.write_run_manifest(
++        output=path,
++        inputs=[
++            SourceAsset(
++                uri="test://maus",
++                sha256=maus_sha256,
++                licence=licence.SOURCES["maus_v2"].licence_id,
++                redistribute_public=True,
++            )
++        ],
++        config={"run": {"data_root": str(data_root)}},
++        git_state={"sha": "testsha", "dirty": False, "diff": ""},
++    )
++    return output_dir
++
++
++def _seed_maus_extract(
++    data_root: Path, date_str: str, geoms: dict[str, Polygon], *, finalize: bool = True
++) -> tuple[Path, str]:
++    snapshot_dir = snapshots.create_snapshot_dir(data_root, "maus_v2", date_str)
++    gdf = gpd.GeoDataFrame(
++        {"maus_id": list(geoms.keys())}, geometry=list(geoms.values()), crs="EPSG:4326"
++    )
++    gdf.to_file(snapshot_dir / "wa_extract.gpkg", driver="GPKG", layer="wa_extract")
++    snapshots.write_snapshot_metadata(
++        snapshot_dir,
++        source="Maus et al. v2 WA extract",
++        endpoint="https://example.test/maus",
++        licence_note="CC-BY-SA-4.0",
++        purpose="test fixture",
++    )
++    if finalize:
++        snapshots.finalize_snapshot(snapshot_dir)
++    gpkg_sha256 = sha256_file(snapshot_dir / "wa_extract.gpkg")
++    return snapshot_dir, gpkg_sha256
++
++
++def _seed_dbca_snapshot(
++    data_root: Path,
++    date_str: str,
++    fire_rows: list[dict],
++    *,
++    finalize: bool = True,
++    gpkg_name: str = "fire.gpkg",
++    write_gpkg_before_finalize: bool = True,
++) -> Path:
++    snapshot_dir = snapshots.create_snapshot_dir(data_root, "dbca_060_fire", date_str)
++    if write_gpkg_before_finalize:
++        write_fire_gpkg(snapshot_dir / gpkg_name, fire_rows)
++    snapshots.write_snapshot_metadata(
++        snapshot_dir,
++        source="DBCA-060 Fire History",
++        endpoint="https://catalogue.data.wa.gov.au/dataset/fire-history-dbca-060",
++        licence_note="CC-BY-4.0",
++        purpose="test fixture",
++    )
++    if finalize:
++        snapshots.finalize_snapshot(snapshot_dir)
++    if not write_gpkg_before_finalize:
++        write_fire_gpkg(snapshot_dir / gpkg_name, fire_rows)
++    return snapshot_dir
++
++
++def _seed_fire_world(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++    *,
++    register_rows: list[dict],
++    crosswalk_rows: list[dict],
++    maus_geoms: dict[str, Polygon],
++    fire_rows: list[dict],
++    dbca_date: str = "2026-08-29",
++    finalize_dbca: bool = True,
++    dbca_gpkg_before_finalize: bool = True,
++) -> tuple[Path, Path]:
++    data_root = tmp_path / "data"
++    cfg_file = _write_config(tmp_path, data_root)
++    _stub_git_state(monkeypatch)
++    _seed_dbca_snapshot(
++        data_root,
++        dbca_date,
++        fire_rows,
++        finalize=finalize_dbca,
++        write_gpkg_before_finalize=dbca_gpkg_before_finalize,
++    )
++    _, maus_sha256 = _seed_maus_extract(data_root, "2026-08-14", maus_geoms)
++    _seed_eligible_register(data_root, "2026-08-15", register_rows)
++    _seed_crosswalk(data_root, "2026-08-16", crosswalk_rows, maus_sha256=maus_sha256)
++    return cfg_file, data_root
++
++
++_STANDARD_REGISTER_ROWS = [_eligible_register_row("S1", lon=116.005, lat=-31.995)]
++_STANDARD_CROSSWALK_ROWS = [_crosswalk_row("S1", "MAUS001")]
++_STANDARD_MAUS_GEOMS = {"MAUS001": _footprint_box()}
++
++
++def _invoke_build(cfg_file: Path, *, date: str, start_year: int, end_year: int):
++    return runner.invoke(
++        app,
++        [
++            "build-fire-context",
++            "--config",
++            str(cfg_file),
++            "--date",
++            date,
++            "--start-year",
++            str(start_year),
++            "--end-year",
++            str(end_year),
++        ],
++    )
++
++
++def test_build_fire_context_cli_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++    cfg_file, data_root = _seed_fire_world(
++        tmp_path,
++        monkeypatch,
++        register_rows=_STANDARD_REGISTER_ROWS,
++        crosswalk_rows=_STANDARD_CROSSWALK_ROWS,
++        maus_geoms=_STANDARD_MAUS_GEOMS,
++        fire_rows=[
++            {"year": 1990},
++            {"year": 1990},
++            {"year": 2001},
++        ],
++    )
++    result = _invoke_build(cfg_file, date="2026-08-30", start_year=1989, end_year=2002)
++    assert result.exit_code == 0, result.output
++    payload = json.loads(result.output)
++
++    output_path = data_root / "curated" / "fire-context" / "2026-08-30" / "fire_context.parquet"
++    assert output_path.is_file()
++    assert payload["output_path"] == str(output_path)
++    assert payload["rows"] == 14
++
++    written = pd.read_parquet(output_path)
++    assert len(written) == 14
++    row_1990 = written[written["year"] == 1990].iloc[0]
++    assert row_1990["fire_status"] == fire_context.FIRE_STATUS_RECORDED
++    assert row_1990["fire_record_count"] == 2
++    assert row_1990["fire_coverage_status"] == fire_context.COVERAGE_COVERED
++
++    row_2001 = written[written["year"] == 2001].iloc[0]
++    assert row_2001["fire_status"] == fire_context.FIRE_STATUS_RECORDED
++    assert row_2001["fire_record_count"] == 1
++
++    other_rows = written[~written["year"].isin([1990, 2001])]
++    assert (other_rows["fire_status"] == fire_context.FIRE_STATUS_NOT_RECORDED).all()
++    assert (other_rows["fire_record_count"] == 0).all()
++    assert (other_rows["fire_coverage_status"] == fire_context.COVERAGE_COVERED).all()
++
++    status_sum = sum(payload["status_counts"].values())
++    assert status_sum == 14
++
++    manifest_path = Path(str(output_path) + manifests.MANIFEST_SUFFIX)
++    assert manifest_path.is_file()
++    manifest = json.loads(manifest_path.read_text())
++    dbca_asset_uris = [asset for asset in manifest["inputs"] if asset.get("licence") == "CC-BY-4.0"]
++    assert len(dbca_asset_uris) == 1
++
++
++def test_build_fire_context_marks_prewindow_years_unknown(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    cfg_file, _data_root = _seed_fire_world(
++        tmp_path,
++        monkeypatch,
++        register_rows=_STANDARD_REGISTER_ROWS,
++        crosswalk_rows=_STANDARD_CROSSWALK_ROWS,
++        maus_geoms=_STANDARD_MAUS_GEOMS,
++        fire_rows=[{"year": 1990}],
++    )
++    result = _invoke_build(cfg_file, date="2026-08-30", start_year=1936, end_year=1937)
++    assert result.exit_code == 0, result.output
++    written = pd.read_parquet(json.loads(result.output)["output_path"])
++
++    row_1936 = written[written["year"] == 1936].iloc[0]
++    assert row_1936["fire_status"] == fire_context.FIRE_STATUS_UNKNOWN
++    assert row_1936["fire_coverage_status"] == fire_context.COVERAGE_OUTSIDE_WINDOW
++
++    row_1937 = written[written["year"] == 1937].iloc[0]
++    assert row_1937["fire_status"] == fire_context.FIRE_STATUS_NOT_RECORDED
++    assert row_1937["fire_coverage_status"] == fire_context.COVERAGE_COVERED
++
++
++def test_build_fire_context_snapshot_year_excluded_from_window(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    cfg_file, _data_root = _seed_fire_world(
++        tmp_path,
++        monkeypatch,
++        register_rows=_STANDARD_REGISTER_ROWS,
++        crosswalk_rows=_STANDARD_CROSSWALK_ROWS,
++        maus_geoms=_STANDARD_MAUS_GEOMS,
++        fire_rows=[{"year": 1990}],
++        dbca_date="2026-08-29",
++    )
++    result = _invoke_build(cfg_file, date="2026-08-30", start_year=2026, end_year=2026)
++    assert result.exit_code == 0, result.output
++    written = pd.read_parquet(json.loads(result.output)["output_path"])
++    row_2026 = written.iloc[0]
++    assert row_2026["fire_status"] == fire_context.FIRE_STATUS_UNKNOWN
++    assert row_2026["fire_coverage_status"] == fire_context.COVERAGE_OUTSIDE_WINDOW
++
++
++def test_build_fire_context_recorded_wins_outside_window(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    cfg_file, _data_root = _seed_fire_world(
++        tmp_path,
++        monkeypatch,
++        register_rows=_STANDARD_REGISTER_ROWS,
++        crosswalk_rows=_STANDARD_CROSSWALK_ROWS,
++        maus_geoms=_STANDARD_MAUS_GEOMS,
++        fire_rows=[{"year": 2026}],
++        dbca_date="2026-08-29",
++    )
++    result = _invoke_build(cfg_file, date="2026-08-30", start_year=2026, end_year=2026)
++    assert result.exit_code == 0, result.output
++    written = pd.read_parquet(json.loads(result.output)["output_path"])
++    row_2026 = written.iloc[0]
++    assert row_2026["fire_status"] == fire_context.FIRE_STATUS_RECORDED
++    assert row_2026["fire_coverage_status"] == fire_context.COVERAGE_OUTSIDE_WINDOW
++    assert row_2026["fire_record_count"] == 1
++
++
++def test_build_fire_context_invalid_footprint_is_unknown_not_abort(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    invalid_geom = Polygon([(0, 0), (1, 1), (1, 0), (0, 1)])
++    assert not invalid_geom.is_valid
++    cfg_file, _data_root = _seed_fire_world(
++        tmp_path,
++        monkeypatch,
++        register_rows=_STANDARD_REGISTER_ROWS,
++        crosswalk_rows=_STANDARD_CROSSWALK_ROWS,
++        maus_geoms={"MAUS001": invalid_geom},
++        fire_rows=[{"year": 1990}],
++    )
++    result = _invoke_build(cfg_file, date="2026-08-30", start_year=1989, end_year=1990)
++    assert result.exit_code == 0, result.output
++    written = pd.read_parquet(json.loads(result.output)["output_path"])
++    assert (written["fire_status"] == fire_context.FIRE_STATUS_UNKNOWN).all()
++    assert (written["fire_coverage_status"] == fire_context.COVERAGE_NO_FOOTPRINT).all()
++    assert written["fire_record_count"].isna().all()
++
++
++def test_build_fire_context_refuses_inverted_range(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    cfg_file, data_root = _seed_fire_world(
++        tmp_path,
++        monkeypatch,
++        register_rows=_STANDARD_REGISTER_ROWS,
++        crosswalk_rows=_STANDARD_CROSSWALK_ROWS,
++        maus_geoms=_STANDARD_MAUS_GEOMS,
++        fire_rows=[{"year": 1990}],
++    )
++    result = _invoke_build(cfg_file, date="2026-08-30", start_year=2002, end_year=1989)
++    assert result.exit_code == 1
++    payload = json.loads(result.output)
++    assert "inverted year range" in payload["refusal"]
++    assert not (data_root / "curated" / "fire-context").exists()
++
++
++def test_build_fire_context_refuses_existing_output(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    cfg_file, _data_root = _seed_fire_world(
++        tmp_path,
++        monkeypatch,
++        register_rows=_STANDARD_REGISTER_ROWS,
++        crosswalk_rows=_STANDARD_CROSSWALK_ROWS,
++        maus_geoms=_STANDARD_MAUS_GEOMS,
++        fire_rows=[{"year": 1990}],
++    )
++    first = _invoke_build(cfg_file, date="2026-08-30", start_year=1989, end_year=1990)
++    assert first.exit_code == 0, first.output
++    second = _invoke_build(cfg_file, date="2026-08-30", start_year=1989, end_year=1990)
++    assert second.exit_code == 1
++    payload = json.loads(second.output)
++    assert "refusal" in payload
++
++
++def test_build_fire_context_refuses_unverified_snapshot(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    cfg_file, _data_root = _seed_fire_world(
++        tmp_path,
++        monkeypatch,
++        register_rows=_STANDARD_REGISTER_ROWS,
++        crosswalk_rows=_STANDARD_CROSSWALK_ROWS,
++        maus_geoms=_STANDARD_MAUS_GEOMS,
++        fire_rows=[{"year": 1990}],
++        finalize_dbca=False,
++    )
++    result = _invoke_build(cfg_file, date="2026-08-30", start_year=1989, end_year=1990)
++    assert result.exit_code == 1
++    payload = json.loads(result.output)
++    assert "refusal" in payload
++
++
++def test_build_fire_context_refuses_gpkg_dropped_in_after_finalize(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    cfg_file, _data_root = _seed_fire_world(
++        tmp_path,
++        monkeypatch,
++        register_rows=_STANDARD_REGISTER_ROWS,
++        crosswalk_rows=_STANDARD_CROSSWALK_ROWS,
++        maus_geoms=_STANDARD_MAUS_GEOMS,
++        fire_rows=[{"year": 1990}],
++        dbca_gpkg_before_finalize=False,
++    )
++    result = _invoke_build(cfg_file, date="2026-08-30", start_year=1989, end_year=1990)
++    assert result.exit_code == 1
++    payload = json.loads(result.output)
++    assert "refusal" in payload
++    assert "fire.gpkg" in payload["refusal"] or "never hashed" in payload["refusal"]
++
++
++def test_build_fire_context_refuses_non_d3_register(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    data_root = tmp_path / "data"
++    cfg_file = _write_config(tmp_path, data_root)
++    _stub_git_state(monkeypatch)
++    _seed_dbca_snapshot(data_root, "2026-08-29", [{"year": 1990}])
++    _, maus_sha256 = _seed_maus_extract(data_root, "2026-08-14", _STANDARD_MAUS_GEOMS)
++
++    # A register lacking `d3_forced_threshold` -- seeded by hand rather than
++    # via `_eligible_register_row`/`_seed_eligible_register`, which always
++    # write that column.
++    row = _eligible_register_row("S1", lon=116.005, lat=-31.995)
++    del row["d3_forced_threshold"]
++    output_dir = data_root / "curated" / "register" / "2026-08-15"
++    output_dir.mkdir(parents=True)
++    schema_names = [
++        n for n in register.ELIGIBLE_REGISTER_SCHEMA.names if n != "d3_forced_threshold"
++    ]
++    df = pd.DataFrame([row])[schema_names]
++    path = output_dir / "register.parquet"
++    schema = pa.schema(
++        [f for f in register.ELIGIBLE_REGISTER_SCHEMA if f.name != "d3_forced_threshold"]
++    )
++    write_table(df, path, schema)
++    manifests.write_run_manifest(
++        output=path,
++        inputs=[SourceAsset(uri="test://fixture", sha256=None)],
++        config={"run": {"data_root": str(data_root)}},
++        git_state={"sha": "testsha", "dirty": False, "diff": ""},
++    )
++    _seed_crosswalk(data_root, "2026-08-16", _STANDARD_CROSSWALK_ROWS, maus_sha256=maus_sha256)
++
++    result = _invoke_build(cfg_file, date="2026-08-30", start_year=1989, end_year=1990)
++    assert result.exit_code == 1
++    payload = json.loads(result.output)
++    assert "d3_forced_threshold" in payload["refusal"]
+diff --git a/tests/test_licence.py b/tests/test_licence.py
+index 6218fc4..19972a3 100644
+--- a/tests/test_licence.py
++++ b/tests/test_licence.py
+@@ -433,3 +433,12 @@ def test_silo_licence_records_the_anonymous_gridded_route() -> None:
+     assert "anonymous" in entry.notes.lower()
+     assert entry.redistribute_public is True
+     assert "SILO" in entry.attribution_text
++
++
++def test_dbca_060_fire_entry_is_cc_by_with_catalogue_evidence() -> None:
++    entry = SOURCES["dbca_060_fire"]
++    assert entry.licence_id == "CC-BY-4.0"
++    assert entry.licence_url == "https://creativecommons.org/licenses/by/4.0/"
++    assert entry.redistribute_public is True
++    assert "3ce8a891-b050-4c38-952b-c40ca8bdc042" in entry.notes
++    assert "NEVER a known-negative" in entry.notes
